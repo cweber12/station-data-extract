@@ -424,8 +424,48 @@ def _span_days(index) -> float:
     return (index[-1] - index[0]).total_seconds() / 86400.0
 
 
+def _plot_width_detail(span_days: float, cm_per_day: float = CM_PER_DAY):
+    """(drawn width, requested width, clamp) -- clamp is None, 'min' or 'max'."""
+    want = span_days * cm_per_day
+    if want > MAX_W:
+        return MAX_W, want, "max"
+    if want < MIN_W:
+        return MIN_W, want, "min"
+    return round(want, 1), want, None
+
+
 def _plot_width(span_days: float, cm_per_day: float = CM_PER_DAY) -> float:
-    return round(min(max(span_days * cm_per_day, MIN_W), MAX_W), 1)
+    return _plot_width_detail(span_days, cm_per_day)[0]
+
+
+def _drawn_cm_per_day(span_days: float, cm_per_day: float = CM_PER_DAY) -> float:
+    width = _plot_width(span_days, cm_per_day)
+    return width / span_days if span_days else float("inf")
+
+
+def chart_scale_note(result, cm_per_day: float = CM_PER_DAY) -> str | None:
+    """A sentence when the chart is NOT drawn at the requested scale, else None.
+
+    MIN_W and MAX_W are guards -- one stops a short record being a sliver, the
+    other stops Excel choking on an absurd object -- but when either binds, the
+    chart is no longer at the scale that was asked for. Staying quiet about
+    that would leave two workbooks both claiming the same cm/day and not
+    actually comparable, which is the one thing the control exists to provide.
+    """
+    span = _span_days(result.data.index)
+    width, want, clamp = _plot_width_detail(span, cm_per_day)
+    if clamp is None:
+        return None
+    drawn = width / span if span else float("inf")
+    if clamp == "max":
+        return (f"Chart scale reduced to fit: {cm_per_day:g} cm/day across "
+                f"{span:.2f} days needs {want:,.0f} cm, beyond the "
+                f"{MAX_W:,.0f} cm limit. Drawn at {drawn:.2f} cm/day, so "
+                f"points sit closer together than the setting implies.")
+    return (f"Chart scale raised to fit: {cm_per_day:g} cm/day across "
+            f"{span:.2f} days is only {want:.1f} cm, under the {MIN_W:.0f} cm "
+            f"minimum. Drawn at {drawn:.2f} cm/day, so the chart is more "
+            f"magnified than the setting implies.")
 
 
 def _layout(x, w):
@@ -800,8 +840,13 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None,
         ("min samples per bin", result.min_samples),
         ("rows written", len(result.data)),
         # Presentation, but it belongs here: two workbooks of the same series
-        # are only comparable by eye if they were drawn at the same scale.
-        ("chart scale (cm/day)", round(cm_per_day, 3)),
+        # are only comparable by eye if they were drawn at the same scale --
+        # so the scale actually DRAWN is recorded, not just the one requested.
+        # 2 dp, not 3: the drawn figure is derived from a width rounded to
+        # 0.1 cm for Excel, and at 3 dp that rounding shows up as a spurious
+        # 3.6 -> 3.601 that reads as a scale change when nothing changed.
+        ("chart scale requested (cm/day)", round(cm_per_day, 2)),
+        ("chart scale drawn (cm/day)", round(_drawn_cm_per_day(span, cm_per_day), 2)),
         ("chart plot width (cm)", _plot_width(span, cm_per_day)),
         ("window start (local)",
          result.data.index[0].tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
@@ -814,10 +859,17 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None,
         ("series dropped",
          "; ".join(result.dropped) if result.dropped else "none"),
     ]
+    scale_note = chart_scale_note(result, cm_per_day)
+    if scale_note:
+        rows.append(("chart scale WARNING", scale_note))
     r = 3
     for k, v in rows:
         ws.cell(row=r, column=1, value=k).font = HEAD
-        ws.cell(row=r, column=2, value=v).font = BODY
+        cell = ws.cell(row=r, column=2, value=v)
+        cell.font = BODY
+        if k.endswith("WARNING"):
+            cell.fill = WARNFILL
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
         r += 1
 
     # ---- clock check verdicts ---------------------------------------------

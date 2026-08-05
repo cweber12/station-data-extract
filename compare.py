@@ -1356,13 +1356,22 @@ class App(tk.Tk):
                         f"r={r['r_at_best_lag']:+.3f}  "
                         f"(alt {r['ambiguous_alt_h']:+.2f} h)")
 
+            # The width guards can override the requested scale. Say so in all
+            # three places, so a chart that is not at the scale it was asked
+            # for never passes for one that is.
+            notes = []
+            scale_note = ex.chart_scale_note(res, opts.cm_per_day)
+            if scale_note:
+                self.write_log("NOTE: " + scale_note)
+                notes.append(scale_note)
+
             out_dir = self.outputs_dir
             out_dir.mkdir(parents=True, exist_ok=True)
             out = out_dir / ex.default_output_name(cols, opts.interval)
             ex.write_workbook(res, ROOT, out, lag_table, ref, study=self.study,
                               cm_per_day=opts.cm_per_day)
             self.write_log(f"Wrote {out}")
-            self._post("done", (out, list(res.dropped)))
+            self._post("done", (out, list(res.dropped), notes))
         except Exception as exc:
             msg = "".join(traceback.format_exception_only(
                 type(exc), exc)).strip()
@@ -1371,9 +1380,11 @@ class App(tk.Tk):
         finally:
             self._post("enable_go", None)
 
-    def done(self, path: Path, dropped=()):
+    def done(self, path: Path, dropped=(), notes=()):
         extra = ("\n\nDropped (no usable values):\n  " + "\n  ".join(dropped)
                  if dropped else "")
+        if notes:
+            extra += "\n\n" + "\n\n".join(notes)
         if messagebox.askyesno("Done",
                                f"Wrote {path.name}{extra}\n\nOpen it now?"):
             self.open_path(path)
@@ -1434,9 +1445,9 @@ class App(tk.Tk):
                     self.status.set("Failed -- see log below.")
                     messagebox.showerror("Failed", payload)
                 elif kind == "done":
-                    out, dropped = payload
+                    out, dropped, notes = payload
                     self.status.set(f"Wrote {out.name}")
-                    self.done(out, dropped)
+                    self.done(out, dropped, notes)
                 elif kind == "refill":
                     self.rescan()
         except queue.Empty:
