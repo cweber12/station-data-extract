@@ -375,12 +375,23 @@ def _add_line_series(ch, ws, col_ix, nrows, smooth=False):
         ch.series.append(ser)
 
 
-# Horizontal scale. Width grows linearly with the number of plotted points, so
-# the gap between adjacent points is constant no matter what interval you pick:
-# a 30-minute build over a given range comes out four times wider than a 2-hour
-# one. MIN_W only kicks in for very short records, MAX_W keeps Excel from
-# choking on an absurd object.
-CM_PER_POINT = 0.15
+# Horizontal scale. Width is a function of ELAPSED TIME, not of how many points
+# happen to land in it, so one window comes out one width whatever interval is
+# chosen.
+#
+# It used to be points x 0.15 cm, which made the width a function of the
+# interval: over 45 days a 3 h build was 54 cm and a 30 min build was 324 cm.
+# Putting those side by side compares magnifications, not curves, so the
+# question "which interval reads best here" could not actually be asked.
+#
+# 3.6 cm/day is what a 1 h build produced under the old rule (1,080 points x
+# 0.15 cm across 45 days), so 1 h charts keep the scale they had and every
+# other interval joins them on it.
+#
+# MIN_W only kicks in for very short records; MAX_W keeps Excel from choking on
+# an absurd object. Either one binding silently breaks the constant-scale
+# promise -- nothing says so yet. TODO(verify): report it.
+CM_PER_DAY = 3.6
 MIN_W, MAX_W = 30.0, 800.0
 
 AXIS_COL_W = 15.0                    # frozen column -- wide enough for the
@@ -406,8 +417,15 @@ def _cols_to_cm(*widths) -> float:
 AXIS_W = _cols_to_cm(AXIS_COL_W)
 
 
-def _plot_width(n_points: int) -> float:
-    return round(min(max(n_points * CM_PER_POINT, MIN_W), MAX_W), 1)
+def _span_days(index) -> float:
+    """Elapsed time covered by the plot, in days."""
+    if len(index) < 2:
+        return 0.0
+    return (index[-1] - index[0]).total_seconds() / 86400.0
+
+
+def _plot_width(span_days: float, cm_per_day: float = CM_PER_DAY) -> float:
+    return round(min(max(span_days * cm_per_day, MIN_W), MAX_W), 1)
 
 
 def _layout(x, w):
@@ -572,7 +590,7 @@ def _panel_title(ws, row, label, gcols, col):
 def _write_chart_sheets(wb, result, cols, data_ws, norm_ws):
     """chart_raw stacks one panel per data type; chart_zscore stays combined."""
     n = len(result.data)
-    width = _plot_width(n)
+    width = _plot_width(_span_days(result.data.index))
     units = sorted({result.units.get(c, "") for c in cols if result.units.get(c)})
     mixed = len(units) > 1
     x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
@@ -699,7 +717,8 @@ def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
     _write_header(ws, "Stratification index", subtitle, 2)
 
     n = len(result.data)
-    width = _plot_width(n)
+    # Same window, same scale -- this panel has to line up with chart_raw's.
+    width = _plot_width(_span_days(result.data.index))
     x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
     frame = result.data[derived]
     idx = [3 + cols.index(c) for c in derived]
