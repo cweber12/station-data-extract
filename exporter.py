@@ -389,8 +389,9 @@ def _add_line_series(ch, ws, col_ix, nrows, smooth=False):
 # other interval joins them on it.
 #
 # MIN_W only kicks in for very short records; MAX_W keeps Excel from choking on
-# an absurd object. Either one binding silently breaks the constant-scale
-# promise -- nothing says so yet. TODO(verify): report it.
+# an absurd object. Either one binding breaks the constant-scale promise, so
+# when one does chart_scale_note() reports it in the log, the dialog and the
+# provenance sheet -- a workbook must never claim a scale it was not drawn at.
 CM_PER_DAY = 3.6
 MIN_W, MAX_W = 30.0, 800.0
 
