@@ -355,13 +355,17 @@ def _style_value_axis(ch, frame, cols, title, pin_left=False):
                         pin_left=pin_left)
 
 
-def _add_line_series(ch, ws, col_ix, nrows, smooth=False):
+def _add_line_series(ch, ws, col_ix, nrows, hexes, smooth=False):
     """One straight-line series per column, no markers.
 
     `col_ix` is the list of sheet column indices to plot, in legend order. It
-    is a list rather than a start-plus-count because a chart now carries one
-    unit group, and a group is an arbitrary subset of the sheet's columns --
+    is a list rather than a start-plus-count because a chart carries one unit
+    group, and a group is an arbitrary subset of the sheet's columns --
     salinity can sit between two temperatures.
+
+    `hexes` is the matching list of colours. Passed in rather than taken from
+    position, because position is per-chart and a series has to keep one
+    colour across every sheet it appears on.
     """
     xref = Reference(ws, min_col=1, min_row=2, max_row=nrows + 1)
     for i, c in enumerate(col_ix):
@@ -370,9 +374,20 @@ def _add_line_series(ch, ws, col_ix, nrows, smooth=False):
         ser.smooth = smooth
         ser.marker = Marker(symbol="none")
         ser.graphicalProperties = GraphicalProperties(
-            ln=LineProperties(solidFill=SERIES_COLORS[i % len(SERIES_COLORS)],
-                              w=17000, cap="rnd"))
+            ln=LineProperties(solidFill=hexes[i], w=17000, cap="rnd"))
         ch.series.append(ser)
+
+
+def _series_colors(cols) -> dict:
+    """One colour per series, fixed by its position in the SELECTION.
+
+    Colour is the only thing tying a line on the raw panel to the same line on
+    the z-score sheet, so it cannot be assigned per chart. Once chart_raw split
+    into one panel per data type, per-chart assignment gave the first series of
+    every panel the same colour and moved series between colours from sheet to
+    sheet -- two different lies at once.
+    """
+    return {c: SERIES_COLORS[i % len(SERIES_COLORS)] for i, c in enumerate(cols)}
 
 
 # Horizontal scale. Width is a function of ELAPSED TIME, not of how many points
@@ -484,7 +499,8 @@ def _chrome(ch):
     return ch
 
 
-def _axis_chart(source_ws, col_ix, nrows, y_title, frame, y_cols, x_lo):
+def _axis_chart(source_ws, col_ix, nrows, y_title, frame, y_cols, x_lo,
+                hexes):
     """
     The y-axis only. Sits in the frozen columns so it stays put while the wide
     plot scrolls. The series are parked off to the side of the data so nothing
@@ -494,7 +510,7 @@ def _axis_chart(source_ws, col_ix, nrows, y_title, frame, y_cols, x_lo):
     ch.title = None
     ch.legend = None
     ch.height, ch.width = CHART_H, AXIS_W
-    _add_line_series(ch, source_ws, col_ix, nrows)
+    _add_line_series(ch, source_ws, col_ix, nrows, hexes)
     _style_common(ch)
     _style_value_axis(ch, frame, y_cols, y_title, pin_left=True)
     ch.x_axis.delete = True
@@ -504,12 +520,13 @@ def _axis_chart(source_ws, col_ix, nrows, y_title, frame, y_cols, x_lo):
     return _chrome(ch)
 
 
-def _plot_chart(source_ws, col_ix, nrows, index, frame, y_cols, width):
+def _plot_chart(source_ws, col_ix, nrows, index, frame, y_cols, width,
+                hexes):
     """The wide, scrolling half. No title, no legend, no y-axis labels."""
     ch = ScatterChart()
     ch.title = None
     ch.height, ch.width = CHART_H, width
-    _add_line_series(ch, source_ws, col_ix, nrows)
+    _add_line_series(ch, source_ws, col_ix, nrows, hexes)
     _style_common(ch)
     ch.legend = None
     _style_value_axis(ch, frame, y_cols, None)
@@ -553,13 +570,15 @@ def _write_header(ws, title, subtitle, col):
     ws.row_dimensions[2].height = 13
 
 
-def _cell_legend(ws, cols, units, mixed, row, start_col, geometry=None):
+def _cell_legend(ws, cols, units, mixed, row, start_col, geometry=None,
+                 colors=None):
     """
     A conventional horizontal legend, laid out in cells below the plot and to
     the right of the frozen axis, so it scrolls with the chart. Each entry gets
     a narrow swatch column plus however many default-width columns its label
     needs, so nothing wraps and nothing collides.
     """
+    colors = colors or _series_colors(cols)
     ws.row_dimensions[row].height = LEGEND_ROW_PT
     col = start_col
     for i, c in enumerate(cols):
@@ -567,8 +586,10 @@ def _cell_legend(ws, cols, units, mixed, row, start_col, geometry=None):
                               (geometry or {}).get(c, ""))
         ws.column_dimensions[get_column_letter(col)].width = SWATCH_W
         sw = ws.cell(row=row, column=col)
+        # The swatch must match the line it stands for, on every sheet.
         sw.fill = PatternFill("solid",
-                              fgColor=SERIES_COLORS[i % len(SERIES_COLORS)])
+                              fgColor=colors[c] if c in colors
+                              else SERIES_COLORS[i % len(SERIES_COLORS)])
 
         cell = ws.cell(row=row, column=col + 1, value=label)
         cell.font = Font(name="Arial", size=9)
@@ -648,6 +669,9 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws,
     z_ix = {c: 2 + i for i, c in enumerate(cols)}
 
     groups = _unit_groups(result, cols)
+    # One colour per series for the whole workbook, so a line keeps its
+    # identity from the raw panel to the z-score sheet to the legends.
+    colors = _series_colors(cols)
 
     subtitle = (f"{result.interval} {result.aggregation} \u00b7 "
                 f"{lo:%Y-%m-%d %H:%M} to {hi:%Y-%m-%d %H:%M} local \u00b7 "
@@ -669,15 +693,16 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws,
         idx = [raw_ix[c] for c in gcols]
         _panel_title(ws, row, label, gcols, 2)
         top = row + 1
+        ghex = [colors[c] for c in gcols]
         ws.add_chart(_axis_chart(data_ws, idx, n, label,
-                                 result.data, gcols, x_lo), f"A{top}")
+                                 result.data, gcols, x_lo, ghex), f"A{top}")
         ws.add_chart(_plot_chart(data_ws, idx, n, result.data.index,
-                                 result.data, gcols, width), f"B{top}")
+                                 result.data, gcols, width, ghex), f"B{top}")
         # `mixed` is False within a panel: every series here shares a unit and
         # the panel title already states it, so repeating it on each entry is
         # noise.
         lrow = top + CHART_ROWS + 1
-        _cell_legend(ws, gcols, result.units, False, lrow, 2, geometry)
+        _cell_legend(ws, gcols, result.units, False, lrow, 2, geometry, colors)
         row = lrow + PANEL_GAP_ROWS
     made.append("chart_raw")
 
@@ -692,11 +717,12 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws,
     ws.freeze_panes = "B1"
     _write_header(ws, "Standardised (z-score)", subtitle, 2)
     zidx = [z_ix[c] for c in cols]
+    zhex = [colors[c] for c in cols]
     ws.add_chart(_axis_chart(norm_ws, zidx, n, "standard deviations",
-                             zframe, cols, x_lo), f"A{CHART_TOP_ROW}")
+                             zframe, cols, x_lo, zhex), f"A{CHART_TOP_ROW}")
     ws.add_chart(_plot_chart(norm_ws, zidx, n, result.data.index,
-                             zframe, cols, width), f"B{CHART_TOP_ROW}")
-    _cell_legend(ws, cols, result.units, mixed, legend_row, 2, geometry)
+                             zframe, cols, width, zhex), f"B{CHART_TOP_ROW}")
+    _cell_legend(ws, cols, result.units, mixed, legend_row, 2, geometry, colors)
     made.append("chart_zscore")
 
     # ---- stratification: its own panel, because it is a different quantity --
@@ -764,14 +790,17 @@ def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
     x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
     frame = result.data[derived]
     idx = [3 + cols.index(c) for c in derived]
+    # Same colours as everywhere else -- the index appears on chart_raw too.
+    colors = _series_colors(cols)
+    dhex = [colors[c] for c in derived]
 
     ws.add_chart(_axis_chart(data_ws, idx, n,
                              "temperature difference [degC]", frame, derived,
-                             x_lo), f"A{CHART_TOP_ROW}")
+                             x_lo, dhex), f"A{CHART_TOP_ROW}")
     ws.add_chart(_plot_chart(data_ws, idx, n, result.data.index,
-                             frame, derived, width), f"B{CHART_TOP_ROW}")
+                             frame, derived, width, dhex), f"B{CHART_TOP_ROW}")
     _cell_legend(ws, derived, result.units, False, legend_row, 2,
-                 getattr(result, "geometry", None))
+                 getattr(result, "geometry", None), colors)
 
     r = legend_row + 2
     ws.cell(row=r, column=2, value=(
