@@ -104,7 +104,10 @@ def open_session_log(root: Path):
     d = Path(root) / LOG_DIRNAME
     try:
         d.mkdir(parents=True, exist_ok=True)
-        path = d / f"session-{datetime.now():%Y%m%d-%H%M%S}.log"
+        # The pid disambiguates two launches inside the same second, which
+        # would otherwise interleave into one file and make the crash look
+        # like it happened in a session that had already exited cleanly.
+        path = d / f"session-{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}.log"
         _LOG_FILE = open(path, "a", encoding="utf-8", buffering=1)
     except OSError:
         _LOG_FILE = None
@@ -119,6 +122,7 @@ def open_session_log(root: Path):
                 f"{datetime.now(LOCAL_TZ):%Y-%m-%d %H:%M:%S %Z} ===")
     session_log(f"python {sys.version.split()[0]}  tcl {tk.TclVersion}  "
                 f"tk {tk.TkVersion}  pid {os.getpid()}")
+    install_tcl_panic_hook()
 
     try:
         old = sorted(d.glob("session-*.log"))[:-KEEP_LOGS]
@@ -133,6 +137,86 @@ def close_session_log(reason: str = "clean exit") -> None:
     """Mark the session as having ended on purpose. A log missing this line
     is the signature of a crash, which is the whole point of writing it."""
     session_log(f"=== {reason} ===")
+
+
+# Must outlive the process: ctypes keeps no reference to a callback object, so
+# letting this be collected would leave Tcl holding a dangling pointer -- a way
+# of causing exactly the kind of crash it exists to diagnose.
+_PANIC_PROC = None
+
+# Tcl builds _tkinter might have loaded, newest first. Only a DLL ALREADY in
+# the process is ever hooked.
+_TCL_DLLS = ("tcl90.dll", "tcl9.0.dll", "tcl87t.dll", "tcl86t.dll", "tcl86.dll")
+
+
+def install_tcl_panic_hook() -> bool:
+    """Capture the Tcl panic message before the process dies.
+
+    A Tcl panic is usually a one-line diagnosis -- "Tcl_AsyncDelete: async
+    handler deleted by the wrong thread" names the bug outright. Tcl writes it
+    to stderr, but a GUI started from a shortcut has no stderr, which is why
+    the 2026-08-05 crash left a fault address and nothing else. Tcl_SetPanicProc
+    redirects it into the session log instead.
+
+    Deliberately minimal, because it runs with the process already in whatever
+    state caused the panic:
+
+      - raw os.write to the descriptor, never session_log(). session_log takes
+        _LOG_LOCK, and if the panic interrupted a thread that already held it
+        this would block forever -- turning a crash into a freeze, which is
+        strictly worse than the crash.
+      - nothing is dereferenced. Tcl calls the panic proc variadically with up
+        to eight arguments; this reads the first four registers, so any it was
+        not actually passed hold whatever was left there. They are printed as
+        hex and never followed.
+      - it returns normally, so Tcl's own abort path still runs and
+        faulthandler still dumps the stacks after this line.
+    """
+    global _PANIC_PROC
+    if _LOG_FILE is None or not sys.platform.startswith("win"):
+        return False
+    try:
+        fd = _LOG_FILE.fileno()
+        import ctypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetModuleHandleW.restype = ctypes.c_void_p
+        k32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+
+        # Naming a DLL that is NOT already loaded would load a second, separate
+        # copy of Tcl and set the panic proc on the wrong interpreter, leaving
+        # the real one just as silent as before.
+        name = next((n for n in _TCL_DLLS if k32.GetModuleHandleW(n)), None)
+        if name is None:
+            return False
+
+        tcl = ctypes.CDLL(name)
+        proto = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p,
+                                 ctypes.c_void_p, ctypes.c_void_p)
+
+        def on_panic(fmt, a1=None, a2=None, a3=None):
+            try:
+                text = (fmt or b"<no message>").decode("utf-8", "replace")
+                out = "\nTcl_Panic: " + text + "\n"
+                if "%" in text:
+                    # Unsubstituted: the arguments are raw pointers and this
+                    # is no place to be dereferencing them.
+                    raw = " ".join(f"0x{v:x}" for v in (a1, a2, a3) if v)
+                    out += f"Tcl_Panic raw args: {raw}\n"
+                os.write(fd, out.encode("utf-8", "replace"))
+            except Exception:
+                pass
+
+        tcl.Tcl_SetPanicProc.argtypes = [proto]
+        tcl.Tcl_SetPanicProc.restype = None
+        _PANIC_PROC = proto(on_panic)
+        tcl.Tcl_SetPanicProc(_PANIC_PROC)
+        session_log(f"tcl panic hook armed on {name}")
+        return True
+    except Exception as e:
+        _PANIC_PROC = None
+        session_log(f"tcl panic hook NOT armed: {type(e).__name__}: {e}")
+        return False
 
 
 def enable_dpi_awareness():
