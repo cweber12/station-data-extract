@@ -216,6 +216,51 @@ def detect_unit(header: str) -> str:
     return ""
 
 
+# The two feeds spell the same unit differently. A study's cache carries the CF
+# form it was pulled with (`m s-1`, `1e-3`, `degree_true`); the legacy workbook's
+# headers were sniffed into the short form (`m/s`, `PSU`, `deg`). Those are the
+# same unit, and anything that groups series on the literal string would put
+# wind speed on two separate axes purely because of how it was spelled.
+#
+# Only spellings that are UNAMBIGUOUSLY the same unit go in here. A wrong merge
+# is worse than no merge -- it silently draws two different quantities against
+# one scale, which is the thing the no-dual-axis rule exists to prevent -- so
+# anything not listed passes through untouched.
+UNIT_ALIASES = {
+    "m s-1": "m/s",
+    "1e-3": "PSU",          # CF practical-salinity spelling
+    "degree_true": "deg",
+    "degrees_true": "deg",
+    "degree_c": "degC",
+    "degree_celsius": "degC",
+    "degree_f": "degF",
+    "mg.l-1": "mg/L",
+    "microg.l-1": "ug/L",
+}
+
+# `1` is CF for "dimensionless", not for "pH". It means pH in THIS dataset only
+# because pH is the sole dimensionless variable the stations report, so the
+# mapping is applied only when the column says so itself. A dimensionless
+# column that is not pH keeps `1` and lands in its own group, which is the
+# honest answer.
+# TODO(verify): revisit if a second dimensionless variable is ever ingested.
+_PH_COLUMN = re.compile(r"\bph\b|_ph_|(^|[._])ph($|[._])", re.I)
+
+
+def canonical_unit(unit: str, column: str = "") -> str:
+    """Collapse equivalent unit spellings to one form, for grouping.
+
+    `column` is consulted only to resolve the dimensionless `1`; it never
+    overrides a unit the feed actually stated.
+    """
+    u = (unit or "").strip()
+    if not u:
+        return ""
+    if u == "1":
+        return "pH" if _PH_COLUMN.search(column or "") else "1"
+    return UNIT_ALIASES.get(u.lower(), u)
+
+
 def detect_time_column(headers) -> tuple[str | None, str | None, str]:
     """Return (column, basis, trust). Preference order encodes the trust rule."""
     for pat, basis, trust in TIME_PREFERENCE:
