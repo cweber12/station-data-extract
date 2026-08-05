@@ -587,10 +587,11 @@ def _panel_title(ws, row, label, gcols, col):
     ws.row_dimensions[row].height = 15
 
 
-def _write_chart_sheets(wb, result, cols, data_ws, norm_ws):
+def _write_chart_sheets(wb, result, cols, data_ws, norm_ws,
+                        cm_per_day: float = CM_PER_DAY):
     """chart_raw stacks one panel per data type; chart_zscore stays combined."""
     n = len(result.data)
-    width = _plot_width(_span_days(result.data.index))
+    width = _plot_width(_span_days(result.data.index), cm_per_day)
     units = sorted({result.units.get(c, "") for c in cols if result.units.get(c)})
     mixed = len(units) > 1
     x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
@@ -659,7 +660,7 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws):
 
     # ---- stratification: its own panel, because it is a different quantity --
     made += _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
-                                        legend_row)
+                                        legend_row, cm_per_day)
 
     # ---- scatter: square, self-contained ----------------------------------
     if len(cols) >= 2:
@@ -697,7 +698,7 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws):
 
 
 def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
-                                legend_row):
+                                legend_row, cm_per_day: float = CM_PER_DAY):
     """A separate panel for SST(46254) - T(autoss).
 
     It gets its own sheet rather than a second axis on the raw chart: it is a
@@ -718,7 +719,7 @@ def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
 
     n = len(result.data)
     # Same window, same scale -- this panel has to line up with chart_raw's.
-    width = _plot_width(_span_days(result.data.index))
+    width = _plot_width(_span_days(result.data.index), cm_per_day)
     x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
     frame = result.data[derived]
     idx = [3 + cols.index(c) for c in derived]
@@ -740,7 +741,8 @@ def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
     return ["chart_stratification"]
 
 
-def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None):
+def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None,
+                            cm_per_day: float = CM_PER_DAY):
     ws = wb.create_sheet("provenance")
     ws.cell(row=1, column=1, value="How this file was made").font = TITLE
 
@@ -790,12 +792,17 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None):
     else:
         rows += [("source folder", str((root / "sources").resolve()))]
 
+    span = _span_days(result.data.index)
     rows += [
         ("interval", result.interval),
         ("aggregation", result.aggregation),
         ("overlap rule", result.overlap),
         ("min samples per bin", result.min_samples),
         ("rows written", len(result.data)),
+        # Presentation, but it belongs here: two workbooks of the same series
+        # are only comparable by eye if they were drawn at the same scale.
+        ("chart scale (cm/day)", round(cm_per_day, 3)),
+        ("chart plot width (cm)", _plot_width(span, cm_per_day)),
         ("window start (local)",
          result.data.index[0].tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
          if len(result.data) else "-"),
@@ -905,7 +912,9 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None):
 
 
 def write_workbook(result, root: Path, out_path: Path,
-                   lag_table=None, lag_reference=None, study=None) -> Path:
+                   lag_table=None, lag_reference=None, study=None,
+                   cm_per_day: float | None = None) -> Path:
+    cm_per_day = CM_PER_DAY if not cm_per_day else float(cm_per_day)
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -913,8 +922,8 @@ def write_workbook(result, root: Path, out_path: Path,
     norm_ws = _write_zscore_sheet(wb, result, cols)
     _write_counts_sheet(wb, result, cols)
     _write_stats_sheet(wb, result, cols, lag_table, lag_reference)
-    charts = _write_chart_sheets(wb, result, cols, data_ws, norm_ws)
-    _write_provenance_sheet(wb, result, root, lag_reference, study)
+    charts = _write_chart_sheets(wb, result, cols, data_ws, norm_ws, cm_per_day)
+    _write_provenance_sheet(wb, result, root, lag_reference, study, cm_per_day)
 
     order = ([wb[c] for c in charts]
              + [wb["data"], wb["stats"], wb["counts"],

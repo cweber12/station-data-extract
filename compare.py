@@ -1042,6 +1042,24 @@ class App(tk.Tk):
             variable=self.strat).grid(row=5, column=0, columnspan=2,
                                       sticky="w", pady=(2, 0))
 
+        # Presentation, not averaging -- it changes how the same numbers are
+        # drawn, never which numbers they are.
+        c = ttk.LabelFrame(p, text="Chart", padding=8)
+        c.pack(fill="x", pady=(0, 10))
+        ttk.Label(c, text="Width (cm/day)").grid(row=0, column=0, sticky="w",
+                                                 pady=3)
+        self.cm_per_day = tk.DoubleVar(value=ex.CM_PER_DAY)
+        ttk.Spinbox(c, from_=0.2, to=60.0, increment=0.2,
+                    textvariable=self.cm_per_day,
+                    width=10).grid(row=0, column=1, sticky="w")
+        ttk.Label(c, text=("Horizontal scale. Set by elapsed time, not by the\n"
+                           "interval, so the same number gives the same width\n"
+                           "at 30 min as at 3 h — which is what makes two\n"
+                           "intervals comparable."),
+                  foreground="#666",
+                  font=("Segoe UI", 8)).grid(row=1, column=0, columnspan=2,
+                                             sticky="w", pady=(4, 0))
+
         w = ttk.LabelFrame(p, text="Window (local, optional)", padding=8)
         w.pack(fill="x", pady=(0, 10))
         ttk.Label(w, text="Start").grid(row=0, column=0, sticky="w", pady=3)
@@ -1223,6 +1241,15 @@ class App(tk.Tk):
                 continue
         raise ValueError(f"cannot read date: {text!r}")
 
+    def _read_cm_per_day(self) -> float:
+        """Main thread only. A non-positive scale would collapse every chart
+        onto MIN_W, which looks like the width control being ignored."""
+        v = float(self.cm_per_day.get())
+        if v <= 0:
+            raise ValueError(f"chart width must be greater than 0 cm/day, "
+                             f"not {v}")
+        return v
+
     def generate(self):
         if not self.selected:
             messagebox.showinfo("Nothing selected",
@@ -1251,11 +1278,16 @@ class App(tk.Tk):
                 do_lag=bool(self.do_lag.get()),
                 lag_ref=self.lag_ref.get(),
                 lag_hours=float(self.lag_hours.get()),
+                cm_per_day=self._read_cm_per_day(),
                 selected=list(self.selected),
             )
-        except ValueError as e:
+        except (ValueError, tk.TclError) as e:
+            # TclError, not just ValueError: a Spinbox holding text that is not
+            # a number makes IntVar/DoubleVar.get() raise TclError, and that
+            # went uncaught before -- it escaped into the button handler and
+            # left Generate greyed out with no explanation.
             self.go.configure(state="normal")
-            self.status.set("Check the window dates.")
+            self.status.set("Check the options.")
             messagebox.showerror("Bad input", str(e))
             return
 
@@ -1268,6 +1300,7 @@ class App(tk.Tk):
                     f"overlap={opts.overlap} min_samples={opts.min_samples} "
                     f"convert={opts.convert} strat={opts.stratification} "
                     f"lag={opts.do_lag}/{opts.lag_hours}h "
+                    f"cm_per_day={opts.cm_per_day} "
                     f"window={opts.start}..{opts.end}")
         for _t, c in opts.selected:
             session_log(f"    series: {c.label}  unit={c.unit or '-'}  "
@@ -1326,7 +1359,8 @@ class App(tk.Tk):
             out_dir = self.outputs_dir
             out_dir.mkdir(parents=True, exist_ok=True)
             out = out_dir / ex.default_output_name(cols, opts.interval)
-            ex.write_workbook(res, ROOT, out, lag_table, ref, study=self.study)
+            ex.write_workbook(res, ROOT, out, lag_table, ref, study=self.study,
+                              cm_per_day=opts.cm_per_day)
             self.write_log(f"Wrote {out}")
             self._post("done", (out, list(res.dropped)))
         except Exception as exc:
