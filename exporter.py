@@ -641,6 +641,21 @@ def _unit_groups(result, cols):
     return out
 
 
+def _scatter_pair(result, cols):
+    """(x, y), unit -- the first two series sharing a unit, or (None, None).
+
+    A scatter asserts that two quantities can be plotted against one another.
+    That is only true when they measure the same thing, so the pair is drawn
+    from a single unit group rather than from the head of the selection.
+    Derived columns are excluded for the same reason they get their own panel:
+    a temperature difference is not a temperature.
+    """
+    for label, gcols in _unit_groups(result, cols):
+        if len(gcols) >= 2 and not label.endswith("(derived)"):
+            return (gcols[0], gcols[1]), label
+    return None, None
+
+
 def _panel_title(ws, row, label, gcols, col):
     letter = get_column_letter(col)
     ws[f"{letter}{row}"] = (f"{label}  \u00b7  {len(gcols)} "
@@ -730,35 +745,52 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws,
                                         legend_row, cm_per_day)
 
     # ---- scatter: square, self-contained ----------------------------------
-    if len(cols) >= 2:
+    # Only two series that SHARE A UNIT go on it. It used to take the first two
+    # selected columns whatever they were, so picking temperature and wave
+    # height produced a scatter of degC against metres -- a picture that will
+    # happily show a trend line between two quantities that cannot have one.
+    pair, punit = _scatter_pair(result, cols)
+    if pair is not None:
         ws = wb.create_sheet("chart_scatter")
         ws.sheet_view.showGridLines = False
-        _write_header(ws, f"{cols[0]} vs {cols[1]}", subtitle, 1)
+        xcol, ycol = pair
+        xunit = result.units.get(xcol, "")
+        yunit = result.units.get(ycol, "")
+        _write_header(ws, f"{xcol} vs {ycol}", subtitle, 1)
         sc = ScatterChart()
         sc.title = None
         sc.height, sc.width = 15, 15
-        ser = Series(Reference(data_ws, min_col=4, min_row=2, max_row=n + 1),
-                     Reference(data_ws, min_col=3, min_row=2, max_row=n + 1))
+        # Reference the columns these two series actually occupy. They used to
+        # be hardcoded to data columns 3 and 4, i.e. whichever two series were
+        # selected first.
+        xi, yi = 3 + cols.index(xcol), 3 + cols.index(ycol)
+        ser = Series(Reference(data_ws, min_col=yi, min_row=2, max_row=n + 1),
+                     Reference(data_ws, min_col=xi, min_row=2, max_row=n + 1))
         ser.smooth = False
         ser.marker = Marker(symbol="circle", size=4)
         ser.marker.graphicalProperties = GraphicalProperties(
-            solidFill=SERIES_COLORS[0], ln=LineProperties(noFill=True))
+            solidFill=colors[ycol], ln=LineProperties(noFill=True))
         ser.graphicalProperties = GraphicalProperties(ln=LineProperties(noFill=True))
         sc.series.append(ser)
         sc.legend = None
         _style_common(sc)
-        _style_value_axis(sc, result.data, [cols[1]],
-                          f"{cols[1]} [{result.units.get(cols[1], '')}]")
-        xv = result.data[cols[0]].to_numpy(dtype="float64")
+        _style_value_axis(sc, result.data, [ycol],
+                          f"{ycol} [{yunit}]" if yunit else ycol)
+        xv = result.data[xcol].to_numpy(dtype="float64")
         xv = xv[~np.isnan(xv)]
         if xv.size:
             pad = (xv.max() - xv.min()) * 0.08 or 1
             sc.x_axis.scaling.min = round(float(xv.min()) - pad, 2)
             sc.x_axis.scaling.max = round(float(xv.max()) + pad, 2)
         sc.x_axis.number_format = "0.0"
-        _set_axis_title(sc.x_axis,
-                        f"{cols[0]} [{result.units.get(cols[0], '')}]")
+        _set_axis_title(sc.x_axis, f"{xcol} [{xunit}]" if xunit else xcol)
         ws.add_chart(_chrome(sc), f"A{CHART_TOP_ROW}")
+        r = CHART_TOP_ROW + int(np.ceil(15 / ROW_CM)) + 1
+        ws.cell(row=r, column=1, value=(
+            f"Both axes are {UNIT_AXIS_LABELS.get(punit, punit)}. Series in "
+            f"different units are not plotted against each other here: a "
+            f"straight line through temperature and wave period would still "
+            f"look like a relationship, and would not be one.")).font = NOTE
         made.append("chart_scatter")
 
     return made
