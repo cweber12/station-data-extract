@@ -15,7 +15,7 @@ study can accumulate several tools' output for one site and one time window:
           manifest.json         detail record for the station pull
           validation.json       clock checks, coverage, cross-station sanity
           cache/observations.parquet
-          workbook/             optional refreshed Excel snapshot
+          files/                copies of whatever the user attached
           outputs/              generated comparison workbooks
         hf-radar/             <- another tool's namespace, later
         cudem/
@@ -58,7 +58,7 @@ MANIFEST_NAME = "manifest.json"
 VALIDATION_NAME = "validation.json"
 STUDY_META_NAME = "study.json"
 CACHE_DIRNAME = "cache"
-WORKBOOK_DIRNAME = "workbook"
+FILES_DIRNAME = "files"
 OUTPUTS_DIRNAME = "outputs"
 OBSERVATIONS_NAME = "observations.parquet"
 
@@ -150,8 +150,8 @@ class StudyInfo:
         return self.producer_dir / CACHE_DIRNAME
 
     @property
-    def workbook_dir(self) -> Path:
-        return self.producer_dir / WORKBOOK_DIRNAME
+    def files_dir(self) -> Path:
+        return self.producer_dir / FILES_DIRNAME
 
     @property
     def outputs_dir(self) -> Path:
@@ -211,8 +211,10 @@ def load_study(path: Path, producer: str = PRODUCER) -> StudyInfo:
     if not checks:
         summary = "no clock check recorded"
     elif failed:
-        summary = "; ".join(f"{c.get('signal')} offset {c.get('offset_hours'):+.2f} h"
-                            for c in failed)
+        # Say WHY. "offset -1.08 h" on a 3-day window reads as a broken clock,
+        # when the real answer is that 3 days cannot support a harmonic fit.
+        summary = "; ".join(
+            f"{c.get('signal')}: {c.get('reason') or 'failed'}" for c in failed)
     else:
         summary = f"{len(checks)} clock check(s) passed"
 
@@ -296,6 +298,7 @@ def _clock_checks(df: pd.DataFrame, cfg: StationConfig) -> list[dict]:
             continue
         out.append({
             "signal": v.signal, "role": sig.get("role"), "station": key,
+            "reason": v.reason, "inconclusive": v.inconclusive,
             "n_days": v.n_days,
             "observed_peak_hour_utc": round(v.observed_peak_hour_utc, 3),
             "expected_peak_hour_utc": round(v.expected_peak_hour_utc, 3),
@@ -405,7 +408,13 @@ def validate(df: pd.DataFrame, cfg: StationConfig) -> dict:
     coverage = _coverage(df)
     cross = _cross_station(df, cfg)
 
-    clock_ok = bool(clock) and all(c.get("ok") for c in clock)
+    # An inconclusive clock check -- too short a window, too flat a signal -- is
+    # not a failure of the data. It means the test could not run. Marking such a
+    # study "failed_validation" sends someone hunting a timezone bug that is not
+    # there. Only a MEASURED offset outside tolerance fails a study.
+    conclusive_failures = [c for c in clock
+                           if not c.get("ok") and not c.get("inconclusive")]
+    clock_ok = bool(clock) and not conclusive_failures
     status = STATUS_OK if (clock_ok and schema["ok"] and cross.get("ok")) \
         else STATUS_FAILED
 
@@ -456,68 +465,89 @@ def _gather(cfg: StationConfig, start: dt.datetime, end: dt.datetime,
     return out[CANONICAL_COLUMNS], problems
 
 
-def _local_sources(repo_root: Path, cfg: StationConfig, fetched: dt.datetime,
-                   log=print) -> pd.DataFrame:
-    """The yellow buoy logger export -- a local file, not a feed.
+def _attached_files(attachments, dest_dir: Path, cfg: StationConfig,
+                    fetched: dt.datetime, log=print
+                    ) -> tuple[pd.DataFrame, list[dict], list[str]]:
+    """Read the files the user attached, and copy each into the study.
 
-    Its `Date-Time (PDT)` column is honestly labelled: HOBOconnect writes local
-    wall time with the configured zone. Converted here via zoneinfo, never by
-    adding a constant.
+    Nothing is picked up implicitly -- no file becomes part of a study unless
+    someone chose it at creation time. A copy is stored inside the study so the
+    snapshot stays self-contained: the original can move or change afterwards
+    without altering what this study was built from.
+
+    `attachments` is a sequence of paths, or of (path, station) pairs.
     """
-    from zoneinfo import ZoneInfo
+    from ingest import userfiles
     from ingest.config import empty_frame
 
-    path = repo_root / "sources" / "yellow_buoy_temps.xlsx"
-    if not path.is_file():
-        return empty_frame()
-    try:
-        df = pd.read_excel(path, sheet_name="Data")
-    except Exception as e:
-        log(f"  yellow buoy: unreadable ({e})")
-        return empty_frame()
+    frames, records, problems = [], [], []
+    if not attachments:
+        return empty_frame(), records, problems
 
-    tcol = next((c for c in df.columns if isinstance(c, str)
-                 and "date" in c.lower() and "time" in c.lower()), None)
-    vcol = next((c for c in df.columns if isinstance(c, str)
-                 and "tidbit" in c.lower()), None)
-    if tcol is None or vcol is None:
-        log("  yellow buoy: expected columns not found")
-        return empty_frame()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for item in attachments:
+        if isinstance(item, (tuple, list)):
+            src, station = Path(item[0]), (item[1] or None)
+        else:
+            src, station = Path(item), None
+        station = station or userfiles.default_station(src)
 
-    local = ZoneInfo(cfg.defaults.get("timezone_display", "America/Los_Angeles"))
-    idx = pd.to_datetime(df[tcol], errors="coerce")
-    time_utc = (pd.DatetimeIndex(idx)
-                .tz_localize(local, ambiguous="NaT", nonexistent="NaT")
-                .tz_convert("UTC"))
-    degf = pd.to_numeric(df[vcol], errors="coerce")
-    st = cfg.station("yellow_buoy")
+        if not src.is_file():
+            problems.append(f"attached file missing: {src}")
+            log(f"  MISSING: {src}")
+            continue
+        try:
+            frame, record = userfiles.read(src, cfg, station=station,
+                                           fetched_utc=fetched, log=log)
+        except Exception as e:
+            problems.append(f"{src.name}: {e}")
+            log(f"  {src.name}: FAILED {e}")
+            continue
 
-    out = pd.DataFrame({
-        "time_utc": time_utc,
-        "station": "yellow_buoy",
-        "variable": "sea_water_temperature",
-        "value": (degf - 32.0) * 5.0 / 9.0,      # canonical degC, converted once
-        "unit": "degC",
-        "qc_flag": pd.Series([pd.NA] * len(df), dtype="Int64"),
-        "depth_m": st.depth_m,
-        "reference_frame": st.reference_frame,
-        "source": f"local:{path.name}",
-        "fetched_utc": fetched,
-    }).dropna(subset=["time_utc", "value"])
-    log(f"  yellow buoy: {len(out):,} rows")
-    return out[CANONICAL_COLUMNS]
+        copy = dest_dir / src.name
+        try:
+            shutil.copy2(src, copy)
+        except Exception as e:
+            problems.append(f"{src.name}: could not copy into the study ({e})")
+
+        record.update({
+            "original_path": str(src),
+            "stored": f"{PRODUCER}/{FILES_DIRNAME}/{src.name}",
+            "sha256": sha256_file(copy) if copy.is_file() else None,
+            "bytes": copy.stat().st_size if copy.is_file() else None,
+        })
+        records.append(record)
+        if record.get("error"):
+            problems.append(f"{src.name}: {record['error']}")
+        if not frame.empty:
+            frames.append(frame)
+
+    if not frames:
+        return empty_frame(), records, problems
+    return (pd.concat(frames, ignore_index=True)[CANONICAL_COLUMNS],
+            records, problems)
 
 
 def create_study(repo_root: Path, label: str, *,
                    studies_root: Path | None = None,
-                   refresh: bool = True,
+                   files=(),
                    window_days: int | None = None,
                    log=print) -> StudyInfo:
     """Create studies/<id>/, ingest, validate, write metadata. Returns the info.
 
-    `refresh=True` also runs an Excel COM refresh of the Power Query workbook and
-    snapshots it into the study. `refresh=False` skips Excel entirely -- the
-    Python ingest is the primary path and does not need it.
+    A study has exactly two kinds of source:
+
+      1. the sensor feeds, pulled by script over `window_days`
+      2. `files` -- whatever the user attached, Excel or CSV
+
+    `files` accepts paths, or (path, station) pairs to name the station a file
+    belongs to. Each is copied into <study>/station-data/files/ so the snapshot
+    is self-contained.
+
+    The Power Query workbook is deliberately NOT part of a study: it pulls the
+    same ERDDAP and CO-OPS data these scripts do, so snapshotting it stored
+    several megabytes of the same numbers a second time. It remains in sources/
+    as a workbook to use directly, maintained by ingest/mashup.py.
     """
     repo_root = Path(repo_root).resolve()
     cfg = load_config(repo_root)
@@ -555,58 +585,17 @@ def create_study(repo_root: Path, label: str, *,
 
     problems: list[str] = []
 
-    # ---- 1. optional Excel refresh + workbook snapshot --------------------
-    refresh_meta: dict[str, Any] = {}
-    workbook_rec: dict[str, Any] | None = None
-    src_xlsx = repo_root / "sources" / "ja_jolla_sensors.xlsx"
-    if refresh and src_xlsx.is_file():
-        try:
-            from ingest.refresh import refresh_and_snapshot
-            dest = prod / WORKBOOK_DIRNAME / src_xlsx.name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            log("  refreshing Excel workbook (this takes tens of seconds) ...")
-            refresh_meta = refresh_and_snapshot(src_xlsx, dest) or {}
-            workbook_rec = {
-                "path": str(src_xlsx.relative_to(repo_root)).replace("\\", "/"),
-                "snapshot": f"{PRODUCER}/{WORKBOOK_DIRNAME}/{dest.name}",
-                "sha256": sha256_file(dest),
-                "source_sha256": sha256_file(src_xlsx),
-                "mtime_utc": _iso(dt.datetime.fromtimestamp(
-                    src_xlsx.stat().st_mtime, dt.timezone.utc)),
-                "m_version": refresh_meta.get("m_version"),
-                "fetched_utc": refresh_meta.get("fetched_utc"),
-                "p_StartUTC": refresh_meta.get("p_StartUTC"),
-                "p_EndUTC": refresh_meta.get("p_EndUTC"),
-            }
-        except Exception as e:
-            problems.append(f"excel refresh: {e}")
-            log(f"  Excel refresh failed ({e}); continuing with the Python ingest")
-    elif src_xlsx.is_file():
-        # No refresh requested: copy the workbook as-is so the snapshot is whole.
-        try:
-            dest = prod / WORKBOOK_DIRNAME / src_xlsx.name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_xlsx, dest)
-            workbook_rec = {
-                "path": str(src_xlsx.relative_to(repo_root)).replace("\\", "/"),
-                "snapshot": f"{PRODUCER}/{WORKBOOK_DIRNAME}/{dest.name}",
-                "sha256": sha256_file(dest),
-                "source_sha256": sha256_file(src_xlsx),
-                "mtime_utc": _iso(dt.datetime.fromtimestamp(
-                    src_xlsx.stat().st_mtime, dt.timezone.utc)),
-                "m_version": None, "fetched_utc": None,
-                "p_StartUTC": None, "p_EndUTC": None,
-                "note": "copied without refresh (refresh=False)",
-            }
-        except Exception as e:
-            problems.append(f"workbook copy: {e}")
-
-    # ---- 2. Python ingest -------------------------------------------------
+    # ---- 1. sensor feeds ---------------------------------------------------
     log(f"  window {days} d: {_iso(start)} -> {_iso(end)}")
     df, fetch_problems = _gather(cfg, start, end, now, log=log)
     problems += fetch_problems
 
-    local = _local_sources(repo_root, cfg, now, log=log)
+    # ---- 2. attached files -------------------------------------------------
+    if files:
+        log(f"  reading {len(files)} attached file(s) ...")
+    local, file_records, file_problems = _attached_files(
+        files, prod / FILES_DIRNAME, cfg, now, log=log)
+    problems += file_problems
     if not local.empty:
         df = (pd.concat([df, local], ignore_index=True) if not df.empty else local)
         df = df.sort_values(["station", "variable", "time_utc"]).reset_index(drop=True)
@@ -662,7 +651,7 @@ def create_study(repo_root: Path, label: str, *,
         "ingest": {"mode": "python",
                    "sources": sorted(df["source"].unique().tolist()) if not df.empty else [],
                    "problems": problems},
-        "source_workbook": workbook_rec,
+        "source_files": file_records,
         "config_snapshot": cfg.raw,
         "series": series,
         "validation": val,
@@ -693,16 +682,21 @@ def _main(argv=None):
     ap.add_argument("--label", default="session")
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     ap.add_argument("--studies-root", type=Path, default=None)
-    ap.add_argument("--refresh", action="store_true",
-                    help="also refresh the Excel workbook via COM")
+    ap.add_argument("--file", action="append", default=[], metavar="PATH",
+                    help="attach an Excel/CSV file; repeatable. "
+                         "Use PATH::station to name the station it belongs to.")
     ap.add_argument("--days", type=int, default=None)
     args = ap.parse_args(argv)
 
     proot = args.studies_root or default_studies_root(args.root)
 
     if args.command == "create":
+        attachments = []
+        for spec in args.file:
+            path, _, station = str(spec).partition("::")
+            attachments.append((Path(path), station or None))
         info = create_study(args.root, args.label, studies_root=proot,
-                              refresh=args.refresh, window_days=args.days)
+                              files=attachments, window_days=args.days)
         print(f"\n{info.study_id}  {info.status}")
         print(f"  {info.path}")
         print(f"  {info.n_rows:,} rows, stations: {', '.join(info.stations)}")

@@ -640,7 +640,7 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None):
     ws.cell(row=1, column=1, value="How this file was made").font = TITLE
 
     man = (study.manifest if study is not None else {}) or {}
-    wbrec = man.get("source_workbook") or {}
+    attached = man.get("source_files") or []
     val = man.get("validation") or {}
 
     rows = [
@@ -663,15 +663,25 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None):
             ("QC policy", (val.get("qc_policy")
                            or man.get("qc_policy") or "-")),
         ]
-        if wbrec:
-            rows += [
-                ("source workbook", wbrec.get("path", "-")),
-                ("workbook sha256", (wbrec.get("sha256") or "-")[:32] + "..."),
-                ("workbook fetched (UTC)", wbrec.get("fetched_utc") or "not recorded"),
-                ("workbook p_StartUTC", wbrec.get("p_StartUTC") or "not recorded"),
-                ("workbook p_EndUTC", wbrec.get("p_EndUTC") or "not recorded"),
-                ("workbook m_version", wbrec.get("m_version") or "not recorded"),
-            ]
+        rows += [("attached files",
+                  f"{len(attached)} file(s)" if attached else "none")]
+        for rec in attached:
+            sha = (rec.get("sha256") or "-")[:16]
+            rows.append((f"  {rec.get('file', '?')}",
+                         f"station={rec.get('station', '?')}  "
+                         f"rows={rec.get('n_rows', 0):,}  sha256={sha}..."))
+            rows.append((f"    from", rec.get("original_path", "-")))
+            for sh in rec.get("sheets", []):
+                # State the time basis explicitly. For an attached file the
+                # header is the only evidence there is, and for an ambiguous
+                # one an assumption was made -- say which.
+                basis = sh.get("time_kind", "?")
+                if sh.get("assumed_timezone"):
+                    basis += f" -> {sh['assumed_timezone']}"
+                if sh.get("time_kind") == "ambiguous":
+                    basis += "  (ASSUMED: the column named no zone)"
+                rows.append((f"    sheet {sh.get('sheet', '?')}",
+                             f"time={sh.get('time_column', '?')}  {basis}"))
     else:
         rows += [("source folder", str((root / "sources").resolve()))]
 

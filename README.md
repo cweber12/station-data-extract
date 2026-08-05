@@ -13,7 +13,7 @@ C:\Projects\la-jolla-buoy\
 │           ├── manifest.json          what was pulled, from where, with what QC
 │           ├── validation.json        clock checks, coverage, cross-station sanity
 │           ├── cache\observations.parquet    the canonical long frame
-│           ├── workbook\              optional refreshed .xlsx snapshot
+│           ├── files\                 copies of the files you attached
 │           └── outputs\               workbooks generated against THIS study
 ├── archive\cache\observations.parquet  every study, deduped
 ├── station-data-extract\          <- this repo (code only)
@@ -25,6 +25,45 @@ Studies sit **above** the repo so the sibling extractors can read the same
 snapshot, and so one study can eventually hold station data, HF radar and DEM
 output for a single site and time window. `study.json` is the shared metadata
 file; each tool writes its own subdirectory beside it.
+
+## What a study is made of
+
+Exactly two kinds of source, and nothing is picked up implicitly:
+
+1. **Sensor feeds**, pulled by script over the configured window — NDBC and
+   SCCOOS via ERDDAP, water level via CO-OPS.
+2. **Files you attach** at creation time — Excel or CSV, as many as you like.
+
+Each attached file is **copied into the study**, so the snapshot stays
+self-contained: the original can move or change afterwards without altering what
+the study was built from. The manifest records the original path, a sha256, and
+exactly which column became which variable.
+
+**The Power Query workbook is deliberately not part of a study.** It pulls the
+same ERDDAP and CO-OPS data these scripts do, so snapshotting it stored several
+megabytes of the same numbers twice. It stays in `sources/` as a workbook to open
+and use directly, maintained by `ingest/mashup.py` — see the bottom of this file.
+
+### Attaching a file
+
+In the launcher's **New study** tab, click **Add…** and pick one or more files.
+Each row shows what was detected; double-click it to set which station the file
+belongs to. Use a name from `config/stations.yaml` to inherit that station's
+depth and reference frame — anything else is recorded with an unknown frame
+rather than a guessed one.
+
+Time zones get the same scepticism as everything else here. The header is the
+only evidence an arbitrary spreadsheet offers, so the reader classifies it:
+
+| header looks like | treated as | recorded trust |
+|---|---|---|
+| `time_utc` | UTC | verified |
+| `Date-Time (PDT)`, `time (local)` | local wall time via `zoneinfo` | local |
+| contains `UTC` / `GMT` | UTC | unverified |
+| a bare `time` or `date` | **assumed** local, and said so | assumed |
+
+Whatever it decides goes into the manifest and onto the provenance sheet, so a
+reader can see what was assumed instead of reverse-engineering it.
 
 ## The one thing to know
 
@@ -64,9 +103,9 @@ with the pier at **r ≈ 0.72**, leading it by about an hour.
 A launcher opens first with three modes:
 
 1. **New study** — pull every configured source over the window in
-   `config/stations.yaml`, normalise to the canonical long frame, run the clock
-   check, write an immutable study folder. Shows a live log; it takes tens of
-   seconds.
+   `config/stations.yaml`, optionally **attach your own Excel/CSV files**,
+   normalise everything to the canonical long frame, run the clock check, and
+   write an immutable study folder. Shows a live log; it takes tens of seconds.
 2. **Analyze current data** — open the newest study. With no studies yet you
    can still scan `sources/` the old way; legacy `time (UTC)` columns are loaded
    but flagged **unverified** in amber and recorded as such on the provenance
@@ -81,8 +120,9 @@ A launcher opens first with three modes:
 ### Without the GUI
 
 ```powershell
-python study.py create --label baseline        # Python ingest, no Excel needed
+python study.py create --label baseline        # sensor feeds only
 python study.py create --label full --days 365 # a deeper window
+python study.py create --label buoy     --file "sources/yellow_buoy_temps.xlsx::yellow_buoy"   # attach a file
 python study.py list
 python archive.py                                # rebuild the merged archive
 python -m ingest.erddap --feed ndbc --days 10    # probe a feed

@@ -403,12 +403,16 @@ def build_catalog(root: Path, *, sources_dirname: str = SOURCES_DIRNAME,
 def build_catalog_study(study, config_root: Path | None = None,
                           label_prefix: str | None = None
                           ) -> dict[str, list[TableInfo]]:
-    """Catalogue a study: cache/*.parquet first, then any workbook snapshot.
+    """Catalogue a study from its canonical cache.
+
+    ONLY `cache/*.parquet` is scanned. The attached files under `files/` are
+    copies kept for provenance, and they have ALREADY been normalised into that
+    cache. Cataloguing them again would list every attached series twice -- once
+    canonical, once raw -- and invite someone to correlate a series with itself.
 
     `label_prefix` is set when two studies are open at once, so a series from
     each can carry its study label and stay distinguishable.
     """
-    geometry = _geometry_map(config_root)
     catalog: dict[str, list[TableInfo]] = {}
 
     for p in sorted(study.cache_dir.glob("*.parquet")):
@@ -416,20 +420,6 @@ def build_catalog_study(study, config_root: Path | None = None,
         if tabs:
             key = f"{label_prefix}: {p.name}" if label_prefix else p.name
             catalog[key] = tabs
-
-    if study.workbook_dir.is_dir():
-        for p in sorted(study.workbook_dir.glob("*.xlsx")):
-            if p.name.startswith("~$"):
-                continue
-            try:
-                tabs = scan_workbook(p, geometry)
-            except Exception:
-                continue
-            if tabs:
-                for t in tabs:
-                    t.study_label = label_prefix
-                key = f"{label_prefix}: {p.name}" if label_prefix else p.name
-                catalog[key] = tabs
 
     return catalog
 

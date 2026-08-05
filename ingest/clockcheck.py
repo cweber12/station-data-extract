@@ -40,12 +40,25 @@ class ClockVerdict:
     offset_hours: float          # + means the column runs AHEAD of true UTC
     amplitude: float
     ok: bool
+    reason: str = ""             # why it failed; empty when ok
+
+    @property
+    def inconclusive(self) -> bool:
+        """Not enough evidence to judge -- which is NOT the same as a bad clock.
+
+        A short window or a flat signal means the harmonic fit has nothing to
+        work with. Reporting that as a timezone error sends people hunting for
+        a bug that is not there.
+        """
+        return not self.ok and self.reason.startswith(("too few days",
+                                                       "signal too weak"))
 
     def __str__(self) -> str:
-        flag = "OK " if self.ok else "FAIL"
-        return (f"[{flag}] {self.signal:<34} peak {self.observed_peak_hour_utc:5.2f} UTC "
+        flag = "OK " if self.ok else ("?? " if self.inconclusive else "FAIL")
+        base = (f"[{flag}] {self.signal:<34} peak {self.observed_peak_hour_utc:5.2f} UTC "
                 f"(expect {self.expected_peak_hour_utc:5.2f})  "
                 f"offset {self.offset_hours:+.2f} h  amp {self.amplitude:.2f}")
+        return base if self.ok else f"{base}  -- {self.reason}"
 
 
 def _phase_of_max(times: pd.Series, values: pd.Series, harmonic: int) -> tuple[float, float]:
@@ -90,8 +103,20 @@ def verify_utc(times, values, signal: str, longitude_deg: float,
     period = 24 / harmonic
     off = (obs - exp + period / 2) % period - period / 2     # wrap to +/- half a period
 
-    ok = (n_days >= min_days) and (amp > 0.05) and (abs(off) <= tolerance_h)
-    return ClockVerdict(signal, n_days, obs, exp, off, amp, ok)
+    # Distinguish "the clock is wrong" from "there is not enough here to tell".
+    # Both fail, but only the first is a data problem.
+    if n_days < min_days:
+        reason = (f"too few days for a harmonic fit: {n_days} < {min_days}. "
+                  f"Not evidence of a bad clock -- widen the window.")
+    elif not amp > 0.05:
+        reason = (f"signal too weak to fit: amplitude {amp:.3f}. "
+                  f"Not evidence of a bad clock.")
+    elif abs(off) > tolerance_h:
+        reason = (f"offset {off:+.2f} h exceeds the {tolerance_h} h tolerance. "
+                  f"Do not ingest this column as UTC.")
+    else:
+        reason = ""
+    return ClockVerdict(signal, n_days, obs, exp, off, amp, not reason, reason)
 
 
 def assert_utc(times, values, signal, longitude_deg, **kw) -> ClockVerdict:

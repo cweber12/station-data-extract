@@ -309,19 +309,90 @@ class StudyChooser(tk.Toplevel):
         ttk.Label(row, text="days back from now",
                   foreground="#777").pack(side="left", padx=6)
 
-        self.refresh_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            f, variable=self.refresh_var,
-            text="Also refresh the Excel workbook (needs Excel; slow)"
-        ).pack(anchor="w", pady=(10, 2))
-        ttk.Label(f, wraplength=520, foreground="#777", text=(
-            "Optional. The Python ingest does not need Excel. Leave this off "
-            "unless you want a refreshed .xlsx snapshot inside the study.")
-        ).pack(anchor="w", padx=(20, 0))
+        # ---- attached files -------------------------------------------------
+        box = ttk.LabelFrame(f, text="Attach data files (optional)", padding=8)
+        box.pack(fill="both", expand=True, pady=(12, 0))
+        ttk.Label(box, wraplength=500, foreground="#555", text=(
+            "Excel or CSV. Each file is copied into the study, so the snapshot "
+            "stays self-contained. Double-click a row to name the station it "
+            "belongs to.")).pack(anchor="w", pady=(0, 6))
+
+        cols = ("station", "detected")
+        self.files_tree = ttk.Treeview(box, columns=cols, show="tree headings",
+                                       height=5, selectmode="extended")
+        self.files_tree.heading("#0", text="file")
+        self.files_tree.column("#0", width=190, stretch=True)
+        self.files_tree.heading("station", text="station")
+        self.files_tree.column("station", width=110, stretch=False)
+        self.files_tree.heading("detected", text="detected")
+        self.files_tree.column("detected", width=210, stretch=False)
+        self.files_tree.pack(side="left", fill="both", expand=True)
+        self.files_tree.bind("<Double-1>", self._rename_file_station)
+        self.files_tree.tag_configure("bad", foreground="#b00020")
+
+        side = ttk.Frame(box); side.pack(side="left", fill="y", padx=(8, 0))
+        ttk.Button(side, text="Add…", command=self._add_files).pack(fill="x")
+        ttk.Button(side, text="Remove",
+                   command=self._remove_files).pack(fill="x", pady=(6, 0))
+
+        # path -> station, in insertion order
+        self.attached: dict[str, str] = {}
 
         ttk.Button(f, text="Create study",
-                   command=self._create).pack(anchor="w", pady=(16, 0), ipady=4)
+                   command=self._create).pack(anchor="w", pady=(12, 0), ipady=4)
         return f
+
+    # ---- attachment handling ------------------------------------------------
+
+    def _add_files(self):
+        from tkinter import filedialog
+        from ingest import userfiles
+
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Attach data files",
+            filetypes=[("Excel or CSV", "*.xlsx *.xlsm *.xls *.csv *.txt *.tsv"),
+                       ("Excel", "*.xlsx *.xlsm *.xls"),
+                       ("CSV / text", "*.csv *.txt *.tsv"),
+                       ("All files", "*.*")])
+        for p in paths:
+            if p in self.attached:
+                continue
+            station = userfiles.default_station(Path(p))
+            self.attached[p] = station
+            # Probe now, so a file that cannot be read says so BEFORE the pull
+            # rather than 90 seconds into it.
+            try:
+                probe = userfiles.probe(Path(p), station)
+                detected, bad = probe.summary(), not probe.usable
+            except Exception as e:
+                detected, bad = f"ERROR {e}", True
+            self.files_tree.insert(
+                "", "end", iid=p, text=Path(p).name,
+                values=(station, detected.split(": ", 1)[-1]),
+                tags=("bad",) if bad else ())
+
+    def _remove_files(self):
+        for iid in self.files_tree.selection():
+            self.attached.pop(iid, None)
+            self.files_tree.delete(iid)
+
+    def _rename_file_station(self, _event=None):
+        from tkinter import simpledialog
+        sel = self.files_tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        current = self.attached.get(iid, "")
+        name = simpledialog.askstring(
+            "Station name",
+            f"Which station does {Path(iid).name} belong to?\n\n"
+            "Use a name from config/stations.yaml to inherit its depth and\n"
+            "reference frame; anything else is recorded as an unknown frame.",
+            initialvalue=current, parent=self)
+        if not name:
+            return
+        self.attached[iid] = name.strip()
+        self.files_tree.set(iid, "station", name.strip())
 
     def _default_days(self) -> int:
         try:
@@ -337,7 +408,7 @@ class StudyChooser(tk.Toplevel):
         # dies without ever calling finish() -- leaving this dialog up forever.
         label = self.label_var.get().strip() or "session"
         days = int(self.days_var.get())
-        refresh = bool(self.refresh_var.get())
+        files = [(Path(p), station) for p, station in self.attached.items()]
 
         dlg = ProgressDialog(self, "Creating study")
         dlg.call_when_done(lambda payload: self._create_done(payload, dlg))
@@ -346,7 +417,7 @@ class StudyChooser(tk.Toplevel):
             try:
                 info = st.create_study(
                     ROOT, label, studies_root=self.studies_root,
-                    refresh=refresh, window_days=days, log=dlg.log)
+                    files=files, window_days=days, log=dlg.log)
             except Exception as e:
                 dlg.log(f"\nFAILED: {e}")
                 dlg.finish("Failed")
