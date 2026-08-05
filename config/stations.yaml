@@ -176,7 +176,7 @@ stations:
       THE CLOCK ANCHOR. The only station here reporting both air temperature and
       barometric pressure, which is what makes an independent timezone check
       possible -- air temperature peaks ~2 h after local solar noon, the S2
-      pressure tide peaks ~10:00 and ~22:00 local solar. Every project is
+      pressure tide peaks ~10:00 and ~22:00 local solar. Every study is
       validated against this station. See ingest/clockcheck.py.
       NDBC TIDE is empty here; water level comes from the CO-OPS API instead.
 

@@ -635,24 +635,24 @@ def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
     return ["chart_stratification"]
 
 
-def _write_provenance_sheet(wb, result, root, lag_reference=None, project=None):
+def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None):
     ws = wb.create_sheet("provenance")
     ws.cell(row=1, column=1, value="How this file was made").font = TITLE
 
-    man = (project.manifest if project is not None else {}) or {}
+    man = (study.manifest if study is not None else {}) or {}
     wbrec = man.get("source_workbook") or {}
     val = man.get("validation") or {}
 
     rows = [
         ("generated (local)", datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")),
     ]
-    if project is not None:
+    if study is not None:
         rows += [
-            ("project id", project.project_id),
-            ("project label", project.label),
-            ("project created (UTC)", project.created_utc),
-            ("project status", project.status),
-            ("project folder", str(Path(project.path).resolve())),
+            ("study id", study.study_id),
+            ("study label", study.label),
+            ("study created (UTC)", study.created_utc),
+            ("study status", study.status),
+            ("study folder", str(Path(study.path).resolve())),
             ("pull window (UTC)",
              f"{(man.get('window_utc') or {}).get('start', '-')} to "
              f"{(man.get('window_utc') or {}).get('end', '-')}"
@@ -767,7 +767,7 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None, project=None):
         "  - A column named 'time_utc' is UTC, verified by ingest/clockcheck.py",
         "    against the solar phase of air temperature and barometric pressure.",
         "  - A legacy column headed 'time (UTC)' is loaded but marked UNVERIFIED",
-        "    and shaded above. In this project's original workbook that column",
+        "    and shaded above. In this study's original workbook that column",
         "    held Pacific local time, not UTC -- a column name is not evidence of",
         "    a zone. No offset is applied to it here; guessing one is what caused",
         "    the original error.",
@@ -790,7 +790,7 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None, project=None):
 
 
 def write_workbook(result, root: Path, out_path: Path,
-                   lag_table=None, lag_reference=None, project=None) -> Path:
+                   lag_table=None, lag_reference=None, study=None) -> Path:
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -799,7 +799,7 @@ def write_workbook(result, root: Path, out_path: Path,
     _write_counts_sheet(wb, result, cols)
     _write_stats_sheet(wb, result, cols, lag_table, lag_reference)
     charts = _write_chart_sheets(wb, result, cols, data_ws, norm_ws)
-    _write_provenance_sheet(wb, result, root, lag_reference, project)
+    _write_provenance_sheet(wb, result, root, lag_reference, study)
 
     order = ([wb[c] for c in charts]
              + [wb["data"], wb["stats"], wb["counts"],

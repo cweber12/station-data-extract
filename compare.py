@@ -1,18 +1,18 @@
 """
-compare.py -- pick series from a project snapshot, choose an interval, generate
-a comparison workbook in that project's outputs/.
+compare.py -- pick series from a study snapshot, choose an interval, generate
+a comparison workbook in that study's outputs/.
 
 Run from PowerShell:   .\run.ps1
 Or directly:           python compare.py
 
 Three modes, chosen before the main window opens:
 
-  1. New project              pull fresh data, snapshot it, validate it
-  2. Analyze current data     open the newest project
-  3. Compare existing         open one project, or two side by side
+  1. New study              pull fresh data, snapshot it, validate it
+  2. Analyze current data     open the newest study
+  3. Compare existing         open one study, or two side by side
 
-Projects live one level ABOVE this repo, in la-jolla-buoy/projects/, so the
-sibling extractors can see them. See project.py for the layout.
+Studies live one level ABOVE this repo, in la-jolla-buoy/studies/, so the
+sibling extractors can see them. See study.py for the layout.
 
 Layout notes: the root uses grid with explicit weights so no panel can be
 squeezed to zero. The options column scrolls if the window is short, and the
@@ -22,12 +22,14 @@ Generate button lives outside the scroll area so it is always reachable.
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
 import sys
 import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import tkinter as tk
@@ -37,7 +39,7 @@ import pandas as pd
 
 import archive as arch
 import exporter as ex
-import project as pj
+import study as st
 import sensorkit as sk
 
 ROOT = Path(__file__).resolve().parent
@@ -45,9 +47,13 @@ LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 CHECK, UNCHECK = "\u2713  ", "\u2002\u2002\u2002 "
 PANEL_W = 360
 
-STATUS_COLORS = {pj.STATUS_OK: "#1a7f37",
-                 pj.STATUS_FAILED: "#b00020",
-                 pj.STATUS_INCOMPLETE: "#8a6d00"}
+# How often the main thread drains the worker->UI queue. See the threading
+# contract on ProgressDialog.
+POLL_MS = 80
+
+STATUS_COLORS = {st.STATUS_OK: "#1a7f37",
+                 st.STATUS_FAILED: "#b00020",
+                 st.STATUS_INCOMPLETE: "#8a6d00"}
 
 
 def enable_dpi_awareness():
@@ -114,12 +120,25 @@ class ScrollFrame(ttk.Frame):
 
 class ProgressDialog(tk.Toplevel):
     """A live log while a pull runs. A refresh takes tens of seconds and must
-    never look frozen -- a silent window is indistinguishable from a hang."""
+    never look frozen -- a silent window is indistinguishable from a hang.
+
+    THREADING CONTRACT
+    ------------------
+    Tk is not thread-safe. Every Tk call -- including `after()`, which has to
+    register a callback name -- must happen on the thread running mainloop.
+    A worker touching a widget or a StringVar raises
+    "RuntimeError: main thread is not in main loop", and if that happens inside
+    an error handler the thread dies silently and the dialog hangs forever.
+
+    So workers only ever touch a queue.Queue, which is plain Python and safe
+    from any thread. The main thread drains it on a timer. `log()`, `finish()`
+    and `put_result()` are the only methods a worker may call.
+    """
 
     def __init__(self, parent, title="Working"):
         super().__init__(parent)
         self.title(title)
-        # Same trap as ProjectChooser: never become transient for a master that
+        # Same trap as StudyChooser: never become transient for a master that
         # is not on screen, or this dialog inherits its withdrawn state.
         if parent is not None and parent.winfo_viewable():
             self.transient(parent)
@@ -141,41 +160,75 @@ class ProgressDialog(tk.Toplevel):
         self.close_btn.pack(anchor="e", pady=(8, 0))
         _center(self, parent)
 
-    def log(self, msg: str):
-        def _w():
-            self.text.configure(state="normal")
-            self.text.insert("end", str(msg).rstrip() + "\n")
-            self.text.see("end")
-            self.text.configure(state="disabled")
-            self.status.set(str(msg).strip()[:80])
+        self._q: queue.Queue = queue.Queue()
+        self._on_result = None
+        self._pump_id = None
+        self._pump()
+
+    # ---- worker-thread side: queue only, never a Tk call --------------------
+
+    def log(self, msg: str) -> None:
+        """Safe from any thread."""
+        self._q.put(("log", str(msg)))
+
+    def finish(self, msg: str) -> None:
+        """Safe from any thread."""
+        self._q.put(("finish", str(msg)))
+
+    def put_result(self, payload) -> None:
+        """Hand a result back to the main thread. Safe from any thread."""
+        self._q.put(("result", payload))
+
+    def call_when_done(self, fn) -> None:
+        """Register the main-thread handler for put_result()."""
+        self._on_result = fn
+
+    # ---- main-thread side ---------------------------------------------------
+
+    def _pump(self):
         try:
-            self.after(0, _w)
-        except tk.TclError:
+            while True:
+                kind, payload = self._q.get_nowait()
+                if kind == "log":
+                    self._append(payload)
+                elif kind == "finish":
+                    self._finish_ui(payload)
+                elif kind == "result" and self._on_result is not None:
+                    self._on_result(payload)
+        except queue.Empty:
             pass
+        except tk.TclError:
+            return                      # window went away mid-drain
+        if self.winfo_exists():
+            self._pump_id = self.after(POLL_MS, self._pump)
+
+    def _append(self, msg: str):
+        self.text.configure(state="normal")
+        self.text.insert("end", msg.rstrip() + "\n")
+        self.text.see("end")
+        self.text.configure(state="disabled")
+        self.status.set(msg.strip()[:80] or self.status.get())
+
+    def _finish_ui(self, msg: str):
+        self.bar.stop()
+        self.bar.configure(mode="determinate", value=100)
+        self.status.set(msg)
+        self.close_btn.configure(state="normal")
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
 
     def destroy(self):
         # An indeterminate Progressbar reschedules itself with `after`. If the
         # window is destroyed while one of those callbacks is pending, Tk prints
         # a traceback from ttk::progressbar::Autoincrement -- harmless, but it
         # looks like a crash to whoever is watching the console. Stop the
-        # animation first.
-        try:
-            self.bar.stop()
-        except Exception:
-            pass
+        # animation and the pump first.
+        for stop in (lambda: self.after_cancel(self._pump_id) if self._pump_id
+                     else None, self.bar.stop):
+            try:
+                stop()
+            except Exception:
+                pass
         super().destroy()
-
-    def finish(self, msg: str):
-        def _f():
-            self.bar.stop()
-            self.bar.configure(mode="determinate", value=100)
-            self.status.set(msg)
-            self.close_btn.configure(state="normal")
-            self.protocol("WM_DELETE_WINDOW", self.destroy)
-        try:
-            self.after(0, _f)
-        except tk.TclError:
-            pass
 
 
 def _center(win, parent=None):
@@ -190,14 +243,14 @@ def _center(win, parent=None):
     win.geometry(f"+{max(0, x)}+{max(0, y)}")
 
 
-class ProjectChooser(tk.Toplevel):
-    """The launcher. Returns a list of one or two ProjectInfo, or None."""
+class StudyChooser(tk.Toplevel):
+    """The launcher. Returns a list of one or two StudyInfo, or None."""
 
-    def __init__(self, parent, projects_root: Path):
+    def __init__(self, parent, studies_root: Path):
         super().__init__(parent)
-        self.title("La Jolla sensor comparison -- choose a project")
-        self.projects_root = projects_root
-        self.result: list[pj.ProjectInfo] | None = None
+        self.title("La Jolla sensor comparison -- choose a study")
+        self.studies_root = studies_root
+        self.result: list[st.StudyInfo] | None = None
         self.resizable(True, True)
         self.minsize(560, 420)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
@@ -205,17 +258,17 @@ class ProjectChooser(tk.Toplevel):
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=10, pady=10)
         self.nb = nb
-        nb.add(self._tab_new(nb), text="New project")
+        nb.add(self._tab_new(nb), text="New study")
         nb.add(self._tab_latest(nb), text="Analyze current data")
         nb.add(self._tab_existing(nb), text="Compare existing")
 
         bar = ttk.Frame(self, padding=(10, 0, 10, 10))
         bar.pack(fill="x")
-        ttk.Label(bar, text=str(projects_root),
+        ttk.Label(bar, text=str(studies_root),
                   foreground="#777").pack(side="left")
         ttk.Button(bar, text="Cancel", command=self._cancel).pack(side="right")
 
-        self.projects = pj.list_projects(projects_root)
+        self.studies = st.list_studies(studies_root)
         self._fill_lists()
         _center(self, parent)
         # `wm transient` ties this window's visibility to its master: Tk
@@ -223,7 +276,7 @@ class ProjectChooser(tk.Toplevel):
         # runs on a deliberately hidden root, so setting it unconditionally
         # made this window withdrawn too -- invisible, with wait_window()
         # blocking forever and nothing on screen. Only claim a master that is
-        # actually on screen (the File -> Switch project... case).
+        # actually on screen (the File -> Switch study... case).
         if parent is not None and parent.winfo_viewable():
             self.transient(parent)
         self.deiconify()
@@ -240,7 +293,7 @@ class ProjectChooser(tk.Toplevel):
         ttk.Label(f, wraplength=520, foreground="#555", text=(
             "Fetches every configured source over the window in "
             "config/stations.yaml, normalises to a canonical long frame, runs "
-            "the clock check against LJAC1, and writes an immutable project "
+            "the clock check against LJAC1, and writes an immutable study "
             "folder one level above this repo.")).pack(anchor="w", pady=(4, 12))
 
         row = ttk.Frame(f); row.pack(fill="x", pady=4)
@@ -263,10 +316,10 @@ class ProjectChooser(tk.Toplevel):
         ).pack(anchor="w", pady=(10, 2))
         ttk.Label(f, wraplength=520, foreground="#777", text=(
             "Optional. The Python ingest does not need Excel. Leave this off "
-            "unless you want a refreshed .xlsx snapshot inside the project.")
+            "unless you want a refreshed .xlsx snapshot inside the study.")
         ).pack(anchor="w", padx=(20, 0))
 
-        ttk.Button(f, text="Create project",
+        ttk.Button(f, text="Create study",
                    command=self._create).pack(anchor="w", pady=(16, 0), ipady=4)
         return f
 
@@ -278,29 +331,42 @@ class ProjectChooser(tk.Toplevel):
             return 45
 
     def _create(self):
+        # EVERY Tk read happens here, on the main thread. Reading a StringVar or
+        # BooleanVar from the worker raises "main thread is not in main loop",
+        # and when that lands inside the worker's own error handler the thread
+        # dies without ever calling finish() -- leaving this dialog up forever.
         label = self.label_var.get().strip() or "session"
         days = int(self.days_var.get())
-        dlg = ProgressDialog(self, "Creating project")
+        refresh = bool(self.refresh_var.get())
+
+        dlg = ProgressDialog(self, "Creating study")
+        dlg.call_when_done(lambda payload: self._create_done(payload, dlg))
 
         def worker():
             try:
-                info = pj.create_project(
-                    ROOT, label, projects_root=self.projects_root,
-                    refresh=bool(self.refresh_var.get()),
-                    window_days=days, log=dlg.log)
+                info = st.create_study(
+                    ROOT, label, studies_root=self.studies_root,
+                    refresh=refresh, window_days=days, log=dlg.log)
             except Exception as e:
                 dlg.log(f"\nFAILED: {e}")
                 dlg.finish("Failed")
-                self.after(0, lambda: messagebox.showerror(
-                    "Create failed", str(e), parent=self))
+                dlg.put_result(("error", e))
                 return
             dlg.finish(f"{info.status}: {info.n_rows:,} rows")
-            self.after(0, lambda: self._created(info, dlg))
+            dlg.put_result(("ok", info))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _created(self, info: pj.ProjectInfo, dlg):
-        if info.status == pj.STATUS_OK:
+    def _create_done(self, payload, dlg):
+        """Main thread. Everything below is free to touch Tk."""
+        kind, value = payload
+        if kind == "error":
+            messagebox.showerror("Create failed", str(value), parent=self)
+            return
+        self._created(value, dlg)
+
+    def _created(self, info: st.StudyInfo, dlg):
+        if info.status == st.STATUS_OK:
             dlg.destroy()
             self.result = [info]
             self.destroy()
@@ -311,7 +377,7 @@ class ProjectChooser(tk.Toplevel):
         checks = (info.manifest.get("validation") or {}).get("clock_checks") or []
         detail = "\n".join(c.get("detail", "") for c in checks if not c.get("ok"))
         problems = "\n".join((info.manifest.get("ingest") or {}).get("problems", []))
-        body = (f"Project {info.project_id} finished with status "
+        body = (f"Study {info.study_id} finished with status "
                 f"'{info.status}'.\n\n{detail or problems or 'see validation.json'}"
                 f"\n\nOpen it anyway?")
         if messagebox.askyesno("Validation failed", body, parent=self):
@@ -320,14 +386,14 @@ class ProjectChooser(tk.Toplevel):
             self.destroy()
         else:
             dlg.finish("Kept on disk, not opened")
-            self.projects = pj.list_projects(self.projects_root)
+            self.studies = st.list_studies(self.studies_root)
             self._fill_lists()
 
     # ------------------------------------------------------------ mode 2
 
     def _tab_latest(self, nb):
         f = ttk.Frame(nb, padding=14)
-        ttk.Label(f, text="Open the most recent project.",
+        ttk.Label(f, text="Open the most recent study.",
                   font=("Segoe UI", 10, "bold")).pack(anchor="w")
         self.latest_lbl = ttk.Label(f, wraplength=520, foreground="#555")
         self.latest_lbl.pack(anchor="w", pady=(6, 12))
@@ -335,10 +401,10 @@ class ProjectChooser(tk.Toplevel):
                    command=self._open_latest).pack(anchor="w", ipady=4)
 
         ttk.Separator(f, orient="horizontal").pack(fill="x", pady=16)
-        ttk.Label(f, text="No projects yet?", foreground="#555").pack(anchor="w")
+        ttk.Label(f, text="No studies yet?", foreground="#555").pack(anchor="w")
         ttk.Label(f, wraplength=520, foreground="#777", text=(
             "You can still scan sources/ directly, the way this tool worked "
-            "before projects existed. Legacy `time (UTC)` columns there are "
+            "before studies existed. Legacy `time (UTC)` columns there are "
             "loaded but marked UNVERIFIED -- in this workbook that column held "
             "Pacific local time, not UTC.")).pack(anchor="w", pady=(2, 8))
         ttk.Button(f, text="Scan sources/ instead (legacy)",
@@ -346,11 +412,11 @@ class ProjectChooser(tk.Toplevel):
         return f
 
     def _open_latest(self):
-        latest = pj.latest_project(self.projects_root)
+        latest = st.latest_study(self.studies_root)
         if latest is None:
             messagebox.showinfo(
-                "No projects",
-                f"Nothing under {self.projects_root}.\n\n"
+                "No studies",
+                f"Nothing under {self.studies_root}.\n\n"
                 "Create one on the first tab, or scan sources/ directly.",
                 parent=self)
             return
@@ -365,10 +431,10 @@ class ProjectChooser(tk.Toplevel):
 
     def _tab_existing(self, nb):
         f = ttk.Frame(nb, padding=14)
-        ttk.Label(f, text="Open a project, or select two to compare snapshots.",
+        ttk.Label(f, text="Open a study, or select two to compare snapshots.",
                   font=("Segoe UI", 10, "bold")).pack(anchor="w")
         ttk.Label(f, wraplength=520, foreground="#555", text=(
-            "With two selected, every series is prefixed with its project label "
+            "With two selected, every series is prefixed with its study label "
             "so the same station can be compared across pulls.")
         ).pack(anchor="w", pady=(4, 8))
 
@@ -395,17 +461,17 @@ class ProjectChooser(tk.Toplevel):
         return f
 
     def _fill_lists(self):
-        latest = self.projects[0] if self.projects else None
+        latest = self.studies[0] if self.studies else None
         self.latest_lbl.configure(text=(
             f"{latest.label}  ({latest.status})\n{latest.created_utc}\n"
             f"{latest.n_rows:,} rows, {len(latest.stations)} stations\n"
             f"{latest.validation_summary}" if latest else
-            f"No projects under {self.projects_root} yet."))
+            f"No studies under {self.studies_root} yet."))
 
         self.tree.delete(*self.tree.get_children())
         self.row_map = {}
-        entries = list(self.projects)
-        a = arch.archive_project(ROOT)
+        entries = list(self.studies)
+        a = arch.archive_study(ROOT)
         if a is not None:
             entries.append(a)
         for p in entries:
@@ -416,7 +482,7 @@ class ProjectChooser(tk.Toplevel):
                 tags=(p.status,))
             self.row_map[iid] = p
 
-    def _selected(self) -> list[pj.ProjectInfo]:
+    def _selected(self) -> list[st.StudyInfo]:
         return [self.row_map[i] for i in self.tree.selection()
                 if i in self.row_map]
 
@@ -424,15 +490,15 @@ class ProjectChooser(tk.Toplevel):
         sel = self._selected()
         if not sel:
             messagebox.showinfo("Nothing selected",
-                                "Click a project in the list first.", parent=self)
+                                "Click a study in the list first.", parent=self)
             return
         if len(sel) > 2:
             messagebox.showinfo(
-                "Too many", "Select at most two projects.", parent=self)
+                "Too many", "Select at most two studies.", parent=self)
             return
-        bad = [p for p in sel if p.status != pj.STATUS_OK]
+        bad = [p for p in sel if p.status != st.STATUS_OK]
         if bad and not messagebox.askyesno(
-                "Project did not pass validation",
+                "Study did not pass validation",
                 "\n\n".join(f"{p.label} [{p.status}]\n{p.validation_summary}"
                             for p in bad) + "\n\nOpen anyway?", parent=self):
             return
@@ -444,7 +510,7 @@ class ProjectChooser(tk.Toplevel):
 
         def worker():
             try:
-                out = arch.rebuild(ROOT, projects_root=self.projects_root,
+                out = arch.rebuild(ROOT, studies_root=self.studies_root,
                                    log=dlg.log)
                 dlg.log(f"\nwrote {out}")
                 dlg.finish("Archive rebuilt")
@@ -461,11 +527,11 @@ class ProjectChooser(tk.Toplevel):
         self.destroy()
 
 
-def choose_projects(projects_root: Path) -> list[pj.ProjectInfo] | None:
+def choose_studies(studies_root: Path) -> list[st.StudyInfo] | None:
     """Run the chooser on a hidden root window. Returns None if cancelled."""
     root = tk.Tk()
     root.withdraw()
-    dlg = ProjectChooser(root, projects_root)
+    dlg = StudyChooser(root, studies_root)
     root.wait_window(dlg)
     result = dlg.result
     root.destroy()
@@ -473,11 +539,11 @@ def choose_projects(projects_root: Path) -> list[pj.ProjectInfo] | None:
 
 
 class App(tk.Tk):
-    def __init__(self, projects: list[pj.ProjectInfo] | None = None,
-                 projects_root: Path | None = None):
+    def __init__(self, studies: list[st.StudyInfo] | None = None,
+                 studies_root: Path | None = None):
         super().__init__()
-        self.projects: list[pj.ProjectInfo] = list(projects or [])
-        self.projects_root = projects_root or pj.default_projects_root(ROOT)
+        self.studies: list[st.StudyInfo] = list(studies or [])
+        self.studies_root = studies_root or st.default_studies_root(ROOT)
         self.title("La Jolla sensor comparison")
         self.geometry("1100x700")
         self.minsize(860, 520)
@@ -486,52 +552,58 @@ class App(tk.Tk):
         self.node_map: dict[str, tuple[sk.TableInfo, sk.ColumnInfo]] = {}
         self.selected: list[tuple[sk.TableInfo, sk.ColumnInfo]] = []
 
+        # Worker threads talk to this window only through the queue. See the
+        # threading contract on ProgressDialog.
+        self._q: queue.Queue = queue.Queue()
+        self._pump_id = None
+
         self._retitle()
         self._build_menu()
         self._build_ui()
+        self._pump()
         self.after(120, self.rescan)
 
-    # -------------------------------------------------------------- project
+    # -------------------------------------------------------------- study
 
     @property
-    def project(self) -> pj.ProjectInfo | None:
-        return self.projects[0] if self.projects else None
+    def study(self) -> st.StudyInfo | None:
+        return self.studies[0] if self.studies else None
 
     @property
     def legacy_mode(self) -> bool:
-        return not self.projects
+        return not self.studies
 
     def _retitle(self):
         if self.legacy_mode:
             self.title("La Jolla sensor comparison -- sources/ (legacy)")
         else:
-            ids = " + ".join(p.project_id for p in self.projects)
+            ids = " + ".join(p.study_id for p in self.studies)
             self.title(f"La Jolla sensor comparison -- {ids}")
 
     def _build_menu(self):
         bar = tk.Menu(self)
         m = tk.Menu(bar, tearoff=0)
-        m.add_command(label="Switch project…", command=self.switch_project)
+        m.add_command(label="Switch study…", command=self.switch_study)
         m.add_command(label="Rebuild archive", command=self.rebuild_archive)
         m.add_separator()
-        m.add_command(label="Open project folder", command=self.open_project_dir)
+        m.add_command(label="Open study folder", command=self.open_study_dir)
         m.add_command(label="Open outputs folder", command=self.open_outputs)
         m.add_separator()
         m.add_command(label="Exit", command=self.destroy)
         bar.add_cascade(label="File", menu=m)
         self.config(menu=bar)
 
-    def switch_project(self):
+    def switch_study(self):
         """Reopen the chooser without restarting the app."""
-        dlg = ProjectChooser(self, self.projects_root)
+        dlg = StudyChooser(self, self.studies_root)
         self.wait_window(dlg)
         if dlg.result is None:
             return
-        self.projects = list(dlg.result)
+        self.studies = list(dlg.result)
         self.selected.clear()
         sk._frame_cache.clear()
         self._retitle()
-        self._update_project_label()
+        self._update_study_label()
         self.refresh_selected()
         self.rescan()
 
@@ -540,7 +612,7 @@ class App(tk.Tk):
 
         def worker():
             try:
-                out = arch.rebuild(ROOT, projects_root=self.projects_root,
+                out = arch.rebuild(ROOT, studies_root=self.studies_root,
                                    log=dlg.log)
                 dlg.log(f"\nwrote {out}")
                 dlg.finish("Archive rebuilt")
@@ -550,19 +622,19 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _project_caption(self) -> str:
+    def _study_caption(self) -> str:
         if self.legacy_mode:
             return f"sources/  (legacy scan of {ROOT / sk.SOURCES_DIRNAME})"
         return "   |   ".join(
-            f"{p.label}  [{p.status}]  {p.created_utc[:16]}" for p in self.projects)
+            f"{p.label}  [{p.status}]  {p.created_utc[:16]}" for p in self.studies)
 
-    def _update_project_label(self):
+    def _update_study_label(self):
         if hasattr(self, "src_var"):
-            self.src_var.set(self._project_caption())
+            self.src_var.set(self._study_caption())
         if hasattr(self, "status_dot"):
-            worst = pj.STATUS_OK
-            for p in self.projects:
-                if p.status != pj.STATUS_OK:
+            worst = st.STATUS_OK
+            for p in self.studies:
+                if p.status != st.STATUS_OK:
                     worst = p.status
             self.status_dot.configure(
                 foreground=STATUS_COLORS.get(worst, "#444")
@@ -573,7 +645,7 @@ class App(tk.Tk):
     def outputs_dir(self) -> Path:
         if self.legacy_mode:
             return ROOT / sk.OUTPUTS_DIRNAME
-        return self.project.outputs_dir
+        return self.study.outputs_dir
 
     # ---------------------------------------------------------------- layout
 
@@ -586,16 +658,16 @@ class App(tk.Tk):
         bar.grid(row=0, column=0, sticky="ew")
         self.status_dot = ttk.Label(bar, text="●", foreground="#444")
         self.status_dot.pack(side="left")
-        ttk.Label(bar, text="Project:").pack(side="left", padx=(4, 0))
-        self.src_var = tk.StringVar(value=self._project_caption())
+        ttk.Label(bar, text="Study:").pack(side="left", padx=(4, 0))
+        self.src_var = tk.StringVar(value=self._study_caption())
         ttk.Label(bar, textvariable=self.src_var,
                   foreground="#444").pack(side="left", padx=(6, 14))
         ttk.Button(bar, text="Switch…",
-                   command=self.switch_project).pack(side="left")
+                   command=self.switch_study).pack(side="left")
         ttk.Button(bar, text="Rescan", command=self.rescan).pack(side="left", padx=6)
         ttk.Button(bar, text="Open outputs folder",
                    command=self.open_outputs).pack(side="left")
-        self._update_project_label()
+        self._update_study_label()
 
         # --- row 1: body -------------------------------------------------
         body = ttk.Frame(self, padding=(10, 0))
@@ -767,7 +839,7 @@ class App(tk.Tk):
     # ---------------------------------------------------------------- catalog
 
     def rescan(self):
-        """Build the catalog from the open project(s), never from outputs/."""
+        """Build the catalog from the open study(s), never from outputs/."""
         try:
             if self.legacy_mode:
                 self.write_log(f"Scanning {ROOT / sk.SOURCES_DIRNAME} (legacy) ...")
@@ -782,10 +854,10 @@ class App(tk.Tk):
                         "has been applied; the provenance sheet records this.")
             else:
                 self.catalog = {}
-                two = len(self.projects) > 1
-                for p in self.projects:
-                    self.write_log(f"Scanning project {p.project_id} ...")
-                    self.catalog.update(sk.build_catalog_project(
+                two = len(self.studies) > 1
+                for p in self.studies:
+                    self.write_log(f"Scanning study {p.study_id} ...")
+                    self.catalog.update(sk.build_catalog_study(
                         p, config_root=ROOT,
                         label_prefix=p.label if two else None))
         except FileNotFoundError as e:
@@ -918,25 +990,50 @@ class App(tk.Tk):
             return
         self.go.configure(state="disabled")
         self.status.set("Working ...")
-        threading.Thread(target=self._generate_worker, daemon=True).start()
 
-    def _generate_worker(self):
+        # Snapshot every Tk variable HERE, on the main thread. Reading any of
+        # them inside the worker raises "main thread is not in main loop".
         try:
-            start = self.parse_dt(self.start.get())
-            end = self.parse_dt(self.end.get())
-            self.write_log(f"Building at {self.interval.get()} / "
-                           f"{self.agg.get()} / {self.overlap.get()} ...")
-            res = sk.build_comparison(
-                self.selected,
+            opts = SimpleNamespace(
+                start=self.parse_dt(self.start.get()),
+                end=self.parse_dt(self.end.get()),
                 interval=self.interval.get(),
                 aggregation=self.agg.get(),
                 overlap=self.overlap.get(),
                 min_samples=int(self.min_samples.get()),
-                start=start, end=end,
-                convert_units_flag=bool(self.convert.get()),
+                convert=bool(self.convert.get()),
                 stratification=bool(self.strat.get()),
+                do_lag=bool(self.do_lag.get()),
+                lag_ref=self.lag_ref.get(),
+                lag_hours=float(self.lag_hours.get()),
+                selected=list(self.selected),
             )
-            if self.strat.get() and not res.derived:
+        except ValueError as e:
+            self.go.configure(state="normal")
+            self.status.set("Check the window dates.")
+            messagebox.showerror("Bad input", str(e))
+            return
+
+        threading.Thread(target=self._generate_worker, args=(opts,),
+                         daemon=True).start()
+
+    def _generate_worker(self, opts):
+        """Runs off the main thread: no Tk access, only queued messages."""
+        try:
+            start, end = opts.start, opts.end
+            self.write_log(f"Building at {opts.interval} / "
+                           f"{opts.aggregation} / {opts.overlap} ...")
+            res = sk.build_comparison(
+                opts.selected,
+                interval=opts.interval,
+                aggregation=opts.aggregation,
+                overlap=opts.overlap,
+                min_samples=opts.min_samples,
+                start=start, end=end,
+                convert_units_flag=opts.convert,
+                stratification=opts.stratification,
+            )
+            if opts.stratification and not res.derived:
                 self.write_log(
                     "Stratification index not added: it needs BOTH 46254 SST "
                     "and autoss temperature selected.")
@@ -955,10 +1052,10 @@ class App(tk.Tk):
                 f"{res.data.index[-1].tz_convert(LOCAL_TZ):%Y-%m-%d %H:%M} local.")
 
             lag_table, ref = None, None
-            if self.do_lag.get() and len(cols) > 1:
-                ref = self.lag_ref.get() if self.lag_ref.get() in cols else cols[0]
-                lag_table = sk.lag_scan(res.data, ref, self.interval.get(),
-                                        float(self.lag_hours.get()))
+            if opts.do_lag and len(cols) > 1:
+                ref = opts.lag_ref if opts.lag_ref in cols else cols[0]
+                lag_table = sk.lag_scan(res.data, ref, opts.interval,
+                                        opts.lag_hours)
                 self.write_log(f"Lag scan against {ref}:")
                 for _, r in lag_table.iterrows():
                     self.write_log(
@@ -969,20 +1066,17 @@ class App(tk.Tk):
 
             out_dir = self.outputs_dir
             out_dir.mkdir(parents=True, exist_ok=True)
-            out = out_dir / ex.default_output_name(cols, self.interval.get())
-            ex.write_workbook(res, ROOT, out, lag_table, ref,
-                              project=self.project)
+            out = out_dir / ex.default_output_name(cols, opts.interval)
+            ex.write_workbook(res, ROOT, out, lag_table, ref, study=self.study)
             self.write_log(f"Wrote {out}")
-            self.after(0, lambda: self.status.set(f"Wrote {out.name}"))
-            self.after(0, lambda: self.done(out, res.dropped))
+            self._post("done", (out, list(res.dropped)))
         except Exception as exc:
             msg = "".join(traceback.format_exception_only(
                 type(exc), exc)).strip()
             self.write_log("ERROR: " + msg)
-            self.after(0, lambda m=msg: messagebox.showerror("Failed", m))
-            self.after(0, lambda: self.status.set("Failed -- see log below."))
+            self._post("error", msg)
         finally:
-            self.after(0, lambda: self.go.configure(state="normal"))
+            self._post("enable_go", None)
 
     def done(self, path: Path, dropped=()):
         extra = ("\n\nDropped (no usable values):\n  " + "\n  ".join(dropped)
@@ -998,8 +1092,8 @@ class App(tk.Tk):
         d.mkdir(parents=True, exist_ok=True)
         self.open_path(d)
 
-    def open_project_dir(self):
-        d = ROOT if self.legacy_mode else Path(self.project.path)
+    def open_study_dir(self):
+        d = ROOT if self.legacy_mode else Path(self.study.path)
         self.open_path(d)
 
     @staticmethod
@@ -1014,28 +1108,59 @@ class App(tk.Tk):
         except Exception:
             pass
 
-    def write_log(self, msg: str):
-        def _w():
-            self.log.configure(state="normal")
-            self.log.insert("end", msg + "\n")
-            self.log.see("end")
-            self.log.configure(state="disabled")
-        self.after(0, _w)
+    # ---- cross-thread messaging (see ProgressDialog's threading contract) ----
+
+    def write_log(self, msg: str) -> None:
+        """Safe from any thread: queues only, never touches Tk."""
+        self._q.put(("log", str(msg)))
+
+    def _post(self, kind: str, payload) -> None:
+        """Safe from any thread."""
+        self._q.put((kind, payload))
+
+    def _pump(self):
+        try:
+            while True:
+                kind, payload = self._q.get_nowait()
+                if kind == "log":
+                    self.log.configure(state="normal")
+                    self.log.insert("end", payload + "\n")
+                    self.log.see("end")
+                    self.log.configure(state="disabled")
+                elif kind == "status":
+                    self.status.set(payload)
+                elif kind == "enable_go":
+                    self.go.configure(state="normal")
+                elif kind == "error":
+                    self.status.set("Failed -- see log below.")
+                    messagebox.showerror("Failed", payload)
+                elif kind == "done":
+                    out, dropped = payload
+                    self.status.set(f"Wrote {out.name}")
+                    self.done(out, dropped)
+                elif kind == "refill":
+                    self.rescan()
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return
+        if self.winfo_exists():
+            self._pump_id = self.after(POLL_MS, self._pump)
 
 
 def main():
     enable_dpi_awareness()
     (ROOT / sk.SOURCES_DIRNAME).mkdir(exist_ok=True)
-    projects_root = pj.default_projects_root(ROOT)
-    projects_root.mkdir(parents=True, exist_ok=True)
+    studies_root = st.default_studies_root(ROOT)
+    studies_root.mkdir(parents=True, exist_ok=True)
 
-    chosen = choose_projects(projects_root)
+    chosen = choose_studies(studies_root)
     if chosen is None:
         return 0                      # cancelled at the launcher
     if not chosen:
-        # Legacy mode: no project, scan sources/ the old way.
+        # Legacy mode: no study, scan sources/ the old way.
         (ROOT / sk.OUTPUTS_DIRNAME).mkdir(exist_ok=True)
-    App(chosen, projects_root).mainloop()
+    App(chosen, studies_root).mainloop()
     return 0
 
 

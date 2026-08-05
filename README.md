@@ -1,29 +1,29 @@
 # La Jolla sensor comparison
 
-Pull the La Jolla station feeds into an immutable, timestamped **project**, pick
+Pull the La Jolla station feeds into an immutable, timestamped **study**, pick
 series from it, choose an averaging interval, and get a workbook with aligned
 data, correlations and charts.
 
 ```
 C:\Projects\la-jolla-buoy\
-├── projects\                      <- snapshots live HERE, one level up
+├── studies\                      <- snapshots live HERE, one level up
 │   └── 20260805T0544Z__baseline\
-│       ├── project.json               shared, tool-agnostic metadata
+│       ├── study.json               shared, tool-agnostic metadata
 │       └── station-data\              this tool's namespace
 │           ├── manifest.json          what was pulled, from where, with what QC
 │           ├── validation.json        clock checks, coverage, cross-station sanity
 │           ├── cache\observations.parquet    the canonical long frame
 │           ├── workbook\              optional refreshed .xlsx snapshot
-│           └── outputs\               workbooks generated against THIS project
-├── archive\cache\observations.parquet  every project, deduped
+│           └── outputs\               workbooks generated against THIS study
+├── archive\cache\observations.parquet  every study, deduped
 ├── station-data-extract\          <- this repo (code only)
 ├── hf-radar-extract\
 └── cudem-extract\
 ```
 
-Projects sit **above** the repo so the sibling extractors can read the same
-snapshot, and so one project can eventually hold station data, HF radar and DEM
-output for a single site and time window. `project.json` is the shared metadata
+Studies sit **above** the repo so the sibling extractors can read the same
+snapshot, and so one study can eventually hold station data, HF radar and DEM
+output for a single site and time window. `study.json` is the shared metadata
 file; each tool writes its own subdirectory beside it.
 
 ## The one thing to know
@@ -63,27 +63,27 @@ with the pier at **r ≈ 0.72**, leading it by about an hour.
 
 A launcher opens first with three modes:
 
-1. **New project** — pull every configured source over the window in
+1. **New study** — pull every configured source over the window in
    `config/stations.yaml`, normalise to the canonical long frame, run the clock
-   check, write an immutable project folder. Shows a live log; it takes tens of
+   check, write an immutable study folder. Shows a live log; it takes tens of
    seconds.
-2. **Analyze current data** — open the newest project. With no projects yet you
+2. **Analyze current data** — open the newest study. With no studies yet you
    can still scan `sources/` the old way; legacy `time (UTC)` columns are loaded
    but flagged **unverified** in amber and recorded as such on the provenance
    sheet. No offset is applied — guessing one is what caused the original bug.
-3. **Compare existing** — open one project, or select **two** and every series
-   is prefixed with its project label (`baseline: LJAC1.sea_water_temperature`)
+3. **Compare existing** — open one study, or select **two** and every series
+   is prefixed with its study label (`baseline: LJAC1.sea_water_temperature`)
    so the same station can be compared across pulls. The merged `archive` shows
-   up here as a pseudo-project.
+   up here as a pseudo-study.
 
-`File → Switch project…` reopens the launcher without restarting.
+`File → Switch study…` reopens the launcher without restarting.
 
 ### Without the GUI
 
 ```powershell
-python project.py create --label baseline        # Python ingest, no Excel needed
-python project.py create --label full --days 365 # a deeper window
-python project.py list
+python study.py create --label baseline        # Python ingest, no Excel needed
+python study.py create --label full --days 365 # a deeper window
+python study.py list
 python archive.py                                # rebuild the merged archive
 python -m ingest.erddap --feed ndbc --days 10    # probe a feed
 python -m ingest.coops --datums                  # tidal datums
@@ -97,7 +97,7 @@ pip install -r requirements.txt
 
 `pandas`, `numpy`, `openpyxl`, `pyarrow`, `pyyaml`, `requests`. **`pywin32` is
 optional** — it is only needed for the Excel refresh path. The Python ingest
-does not use Excel at all, so a project can be created headless.
+does not use Excel at all, so a study can be created headless.
 
 ## config/stations.yaml
 
@@ -134,7 +134,7 @@ not a query bug. It is wave and wind only.
 `defaults.window_days: 45`. NDBC realtime2 holds a rolling ~45 days, so 45 is a
 value any source can satisfy.
 
-Worth knowing, measured 2026-08-04: **the feeds this project actually uses hold
+Worth knowing, measured 2026-08-04: **the feeds used here hold
 far more than that.** ERDDAP `cwwcNDBCMet` advertises `time actual_range` from
 1970-02-26, and LJAC1 returns 6-minute data for probes at 2020, 2023 and 2025.
 The Axiom Scripps Pier feed reaches back to 2013-01-18. Widening `window_days`
@@ -153,7 +153,7 @@ archive.
 | `stats` | summary and correlation matrix — **live formulas** |
 | `counts` | raw samples behind each cell; shaded where thin |
 | `normalized` | the z-scored data |
-| `provenance` | project id, window, QC policy, clock-check verdicts, per-series depth/frame/time-basis and suspect counts |
+| `provenance` | study id, window, QC policy, clock-check verdicts, per-series depth/frame/time-basis and suspect counts |
 
 No dual-axis charts, on purpose: two scales on one frame make any two series
 look however you want them to. Use `chart_zscore` to compare shape and timing.
@@ -164,9 +164,9 @@ series is a gap wearing an average's clothes.
 
 ## Validation
 
-Every project is checked and the result is written to `validation.json`.
+Every study is checked and the result is written to `validation.json`.
 **A failure never aborts the snapshot** — it sets `status: failed_validation`
-and the UI shows the project in red. A failed pull is evidence about the feed,
+and the UI shows the study in red. A failed pull is evidence about the feed,
 and deleting it destroys the only record that it happened.
 
 1. **Clock check** against LJAC1 air temperature (primary) and pressure
@@ -221,7 +221,7 @@ invisible with `Visible = False`. Set it by hand once:
 **Data → Get Data → Query Options → Privacy → "Always ignore Privacy Level
 settings"**. There is a wall-clock timeout so a prompt cannot hang forever.
 
-**`refreshOnLoad` stays off in a snapshot.** A project workbook that re-refreshes
+**`refreshOnLoad` stays off in a snapshot.** A study workbook that re-refreshes
 itself when opened is not immutable, and its manifest would stop describing its
 own contents. Turn it on for `sources/` only.
 
@@ -233,17 +233,17 @@ own contents. Turn it on for `sources/` only.
   matters, and each entry carries a *trust level*: `time_utc` is verified,
   everything else is legacy and gets flagged.
 - **A new station or variable** — `config/stations.yaml` only.
-- **Another extractor** — write into `projects/<id>/<your-tool>/` and append an
-  entry to the `producers` list in `project.json`.
+- **Another extractor** — write into `studies/<id>/<your-tool>/` and append an
+  entry to the `producers` list in `study.json`.
 
 ### Scripting it without the window
 
-`sensorkit`, `exporter`, `project`, `archive` and `ingest` have no GUI
+`sensorkit`, `exporter`, `study`, `archive` and `ingest` have no GUI
 dependency.
 
 ```python
 from pathlib import Path
-import sensorkit as sk, exporter as ex, project as pj
+import sensorkit as sk, exporter as ex, study as pj
 
 info = pj.latest_project()
 tabs = sk.build_catalog_project(info, config_root=Path("."))["observations.parquet"]
@@ -254,7 +254,7 @@ sel = [(t, t.columns[0]) for t in tabs
 res = sk.build_comparison(sel, interval="1h", min_samples=2, stratification=True)
 ref = next(c for c in res.data.columns if "yellow" in c)
 ex.write_workbook(res, Path("."), info.outputs_dir / "test.xlsx",
-                  sk.lag_scan(res.data, ref, "1h"), ref, project=info)
+                  sk.lag_scan(res.data, ref, "1h"), ref, study=info)
 ```
 
 ## Lag scan

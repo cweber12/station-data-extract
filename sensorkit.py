@@ -5,7 +5,7 @@ No GUI code here on purpose: everything in this module is importable and
 testable from a plain Python prompt. compare.py is a thin Tkinter shell on top.
 
 Design rules baked in:
-  * A project is read-only input. outputs/ is never scanned. There is no path
+  * A study is read-only input. outputs/ is never scanned. There is no path
     by which a generated file becomes an input.
   * Every timestamp is converted to UTC on load -- but a column NAME is never
     accepted as evidence of a timezone. See the time contract below.
@@ -185,7 +185,7 @@ class TableInfo:
     time_trust: str = TIME_UNVERIFIED
     path: Path | None = None        # absolute location, so loading needs no root
     kind: str = "xlsx"              # "xlsx" | "parquet"
-    project_label: str | None = None   # set when comparing two projects
+    study_label: str | None = None   # set when comparing two studies
 
     @property
     def data_columns(self) -> list[ColumnInfo]:
@@ -329,7 +329,7 @@ def _station_from_table_name(name: str) -> str | None:
     return None
 
 
-def scan_parquet(path: Path, project_label: str | None = None
+def scan_parquet(path: Path, study_label: str | None = None
                  ) -> list[TableInfo]:
     """Catalogue a canonical long frame: one TableInfo per (station, variable).
 
@@ -352,7 +352,7 @@ def scan_parquet(path: Path, project_label: str | None = None
             file=path.name, name=name, sheet="observations",
             n_rows=int(len(g)), time_column="time_utc", time_basis="UTC",
             time_trust=TIME_VERIFIED, path=Path(path), kind="parquet",
-            project_label=project_label,
+            study_label=study_label,
         )
         # `table` is the station alone, not `station.variable`, so that
         # ColumnInfo.label reads `LJAC1.sea_water_temperature` rather than
@@ -400,25 +400,25 @@ def build_catalog(root: Path, *, sources_dirname: str = SOURCES_DIRNAME,
     return catalog
 
 
-def build_catalog_project(project, config_root: Path | None = None,
+def build_catalog_study(study, config_root: Path | None = None,
                           label_prefix: str | None = None
                           ) -> dict[str, list[TableInfo]]:
-    """Catalogue a project: cache/*.parquet first, then any workbook snapshot.
+    """Catalogue a study: cache/*.parquet first, then any workbook snapshot.
 
-    `label_prefix` is set when two projects are open at once, so a series from
-    each can carry its project label and stay distinguishable.
+    `label_prefix` is set when two studies are open at once, so a series from
+    each can carry its study label and stay distinguishable.
     """
     geometry = _geometry_map(config_root)
     catalog: dict[str, list[TableInfo]] = {}
 
-    for p in sorted(project.cache_dir.glob("*.parquet")):
-        tabs = scan_parquet(p, project_label=label_prefix)
+    for p in sorted(study.cache_dir.glob("*.parquet")):
+        tabs = scan_parquet(p, study_label=label_prefix)
         if tabs:
             key = f"{label_prefix}: {p.name}" if label_prefix else p.name
             catalog[key] = tabs
 
-    if project.workbook_dir.is_dir():
-        for p in sorted(project.workbook_dir.glob("*.xlsx")):
+    if study.workbook_dir.is_dir():
+        for p in sorted(study.workbook_dir.glob("*.xlsx")):
             if p.name.startswith("~$"):
                 continue
             try:
@@ -427,7 +427,7 @@ def build_catalog_project(project, config_root: Path | None = None,
                 continue
             if tabs:
                 for t in tabs:
-                    t.project_label = label_prefix
+                    t.study_label = label_prefix
                 key = f"{label_prefix}: {p.name}" if label_prefix else p.name
                 catalog[key] = tabs
 
@@ -537,9 +537,9 @@ class BuildResult:
 
 
 def series_label(table: TableInfo, col: ColumnInfo) -> str:
-    """`baseline: LJAC1.sea_water_temperature` when two projects are open."""
+    """`baseline: LJAC1.sea_water_temperature` when two studies are open."""
     base = col.label
-    return f"{table.project_label}: {base}" if table.project_label else base
+    return f"{table.study_label}: {base}" if table.study_label else base
 
 
 def build_comparison(selections, interval="1h", aggregation="mean",

@@ -1,16 +1,16 @@
 """
-project.py -- timestamped, immutable snapshots of a pull.
+study.py -- timestamped, immutable snapshots of a pull.
 
 WHERE PROJECTS LIVE
 -------------------
-One level ABOVE this repo, in `la-jolla-buoy/projects/`, not inside it. The
+One level ABOVE this repo, in `la-jolla-buoy/studies/`, not inside it. The
 other extractors in the parent directory (hf-radar-extract, cudem-extract) can
-then read and write the same project without reaching into this repo, and a
-project can accumulate several tools' output for one site and one time window:
+then read and write the same study without reaching into this repo, and a
+study can accumulate several tools' output for one site and one time window:
 
     la-jolla-buoy/
-      projects/20260804T2230Z__baseline/
-        project.json          <- shared, tool-agnostic. THE metadata file.
+      studies/20260804T2230Z__baseline/
+        study.json          <- shared, tool-agnostic. THE metadata file.
         station-data/         <- this tool's namespace, written here
           manifest.json         detail record for the station pull
           validation.json       clock checks, coverage, cross-station sanity
@@ -23,12 +23,12 @@ project can accumulate several tools' output for one site and one time window:
       hf-radar-extract/
       cudem-extract/
 
-Because `projects/` sits outside the repo it needs no .gitignore entry and can
+Because `studies/` sits outside the repo it needs no .gitignore entry and can
 never be committed by accident.
 
 IMMUTABILITY
 ------------
-A project is written once. Only `<producer>/outputs/` may change afterwards. If
+A study is written once. Only `<producer>/outputs/` may change afterwards. If
 creation fails partway the directory is LEFT IN PLACE with status "incomplete"
 rather than deleted -- a failed pull is evidence about the feed, and deleting it
 destroys the only record that the failure happened.
@@ -49,14 +49,14 @@ import pandas as pd
 
 from ingest.config import CANONICAL_COLUMNS, StationConfig, load_config
 
-PROJECTS_DIRNAME = "projects"
+STUDIES_DIRNAME = "studies"
 PRODUCER = "station-data"
 SCHEMA_VERSION = 1
 TOOL_VERSION = "station-data-extract 2026-08-05-a"
 
 MANIFEST_NAME = "manifest.json"
 VALIDATION_NAME = "validation.json"
-PROJECT_META_NAME = "project.json"
+STUDY_META_NAME = "study.json"
 CACHE_DIRNAME = "cache"
 WORKBOOK_DIRNAME = "workbook"
 OUTPUTS_DIRNAME = "outputs"
@@ -71,10 +71,10 @@ STATUS_INCOMPLETE = "incomplete"
 # paths and ids
 # --------------------------------------------------------------------------
 
-def default_projects_root(repo_root: Path | None = None) -> Path:
-    """`<repo>/../projects` -- one level up, visible to the sibling extractors."""
+def default_studies_root(repo_root: Path | None = None) -> Path:
+    """`<repo>/../studies` -- one level up, visible to the sibling extractors."""
     repo_root = Path(repo_root or Path(__file__).resolve().parent).resolve()
-    return repo_root.parent / PROJECTS_DIRNAME
+    return repo_root.parent / STUDIES_DIRNAME
 
 
 def slugify(label: str) -> str:
@@ -83,7 +83,7 @@ def slugify(label: str) -> str:
     return (s or "session")[:48]
 
 
-def new_project_id(label: str, now_utc: dt.datetime | None = None) -> str:
+def new_study_id(label: str, now_utc: dt.datetime | None = None) -> str:
     """'20260804T2230Z__baseline'. UTC, sortable, no characters Windows rejects."""
     now = now_utc or dt.datetime.now(dt.timezone.utc)
     if now.tzinfo is not None:
@@ -125,9 +125,9 @@ def _read_json(path: Path) -> dict:
 # --------------------------------------------------------------------------
 
 @dataclass
-class ProjectInfo:
+class StudyInfo:
     path: Path
-    project_id: str
+    study_id: str
     label: str
     created_utc: str
     status: str = STATUS_INCOMPLETE
@@ -163,7 +163,7 @@ class ProjectInfo:
 
     @property
     def is_archive(self) -> bool:
-        return self.project_id == "archive"
+        return self.study_id == "archive"
 
     # ------------------------------------------------------------- rendering
 
@@ -188,13 +188,13 @@ class ProjectInfo:
 
 
 # --------------------------------------------------------------------------
-# reading projects back
+# reading studies back
 # --------------------------------------------------------------------------
 
-def load_project(path: Path, producer: str = PRODUCER) -> ProjectInfo:
-    """Read one project from disk. Cheap: JSON only, never the parquet."""
+def load_study(path: Path, producer: str = PRODUCER) -> StudyInfo:
+    """Read one study from disk. Cheap: JSON only, never the parquet."""
     path = Path(path)
-    meta_path = path / PROJECT_META_NAME
+    meta_path = path / STUDY_META_NAME
     man_path = path / producer / MANIFEST_NAME
 
     meta = _read_json(meta_path) if meta_path.is_file() else {}
@@ -218,9 +218,9 @@ def load_project(path: Path, producer: str = PRODUCER) -> ProjectInfo:
 
     status = man.get("status") or meta.get("status") or STATUS_INCOMPLETE
 
-    return ProjectInfo(
+    return StudyInfo(
         path=path,
-        project_id=meta.get("project_id") or man.get("project_id") or path.name,
+        study_id=meta.get("study_id") or man.get("study_id") or path.name,
         label=meta.get("label") or man.get("label") or path.name,
         created_utc=meta.get("created_utc") or man.get("created_utc") or "",
         status=status,
@@ -234,29 +234,29 @@ def load_project(path: Path, producer: str = PRODUCER) -> ProjectInfo:
     )
 
 
-def list_projects(root: Path | None = None, producer: str = PRODUCER
-                  ) -> list[ProjectInfo]:
+def list_studies(root: Path | None = None, producer: str = PRODUCER
+                  ) -> list[StudyInfo]:
     """Newest first. Reads JSON only, so it stays fast enough for a UI list."""
-    proot = Path(root) if root is not None else default_projects_root()
+    proot = Path(root) if root is not None else default_studies_root()
     if not proot.is_dir():
         return []
     out = []
     for d in proot.iterdir():
         if not d.is_dir() or d.name.startswith("."):
             continue
-        if not (d / PROJECT_META_NAME).is_file() and not (d / producer).is_dir():
+        if not (d / STUDY_META_NAME).is_file() and not (d / producer).is_dir():
             continue
         try:
-            out.append(load_project(d, producer))
+            out.append(load_study(d, producer))
         except Exception:
-            continue                     # a corrupt project must not hide the rest
-    out.sort(key=lambda p: (p.created_utc or "", p.project_id), reverse=True)
+            continue                     # a corrupt study must not hide the rest
+    out.sort(key=lambda p: (p.created_utc or "", p.study_id), reverse=True)
     return out
 
 
-def latest_project(root: Path | None = None, producer: str = PRODUCER
-                   ) -> ProjectInfo | None:
-    ps = list_projects(root, producer)
+def latest_study(root: Path | None = None, producer: str = PRODUCER
+                   ) -> StudyInfo | None:
+    ps = list_studies(root, producer)
     return ps[0] if ps else None
 
 
@@ -399,7 +399,7 @@ def _cross_station(df: pd.DataFrame, cfg: StationConfig) -> dict:
 
 
 def validate(df: pd.DataFrame, cfg: StationConfig) -> dict:
-    """Everything a project is checked for. Never raises; records instead."""
+    """Everything a study is checked for. Never raises; records instead."""
     clock = _clock_checks(df, cfg)
     schema = _schema_conformance(df)
     coverage = _coverage(df)
@@ -421,7 +421,7 @@ def validate(df: pd.DataFrame, cfg: StationConfig) -> dict:
 
 
 # --------------------------------------------------------------------------
-# creating a project
+# creating a study
 # --------------------------------------------------------------------------
 
 def _gather(cfg: StationConfig, start: dt.datetime, end: dt.datetime,
@@ -508,23 +508,23 @@ def _local_sources(repo_root: Path, cfg: StationConfig, fetched: dt.datetime,
     return out[CANONICAL_COLUMNS]
 
 
-def create_project(repo_root: Path, label: str, *,
-                   projects_root: Path | None = None,
+def create_study(repo_root: Path, label: str, *,
+                   studies_root: Path | None = None,
                    refresh: bool = True,
                    window_days: int | None = None,
-                   log=print) -> ProjectInfo:
-    """Create projects/<id>/, ingest, validate, write metadata. Returns the info.
+                   log=print) -> StudyInfo:
+    """Create studies/<id>/, ingest, validate, write metadata. Returns the info.
 
     `refresh=True` also runs an Excel COM refresh of the Power Query workbook and
-    snapshots it into the project. `refresh=False` skips Excel entirely -- the
+    snapshots it into the study. `refresh=False` skips Excel entirely -- the
     Python ingest is the primary path and does not need it.
     """
     repo_root = Path(repo_root).resolve()
     cfg = load_config(repo_root)
-    proot = Path(projects_root) if projects_root else default_projects_root(repo_root)
+    proot = Path(studies_root) if studies_root else default_studies_root(repo_root)
 
     now = dt.datetime.now(dt.timezone.utc)
-    pid = new_project_id(label, now)
+    pid = new_study_id(label, now)
     pdir = proot / pid
     prod = pdir / PRODUCER
     (prod / CACHE_DIRNAME).mkdir(parents=True, exist_ok=True)
@@ -536,7 +536,7 @@ def create_project(repo_root: Path, label: str, *,
     # Write an incomplete marker FIRST, so a crash still leaves evidence.
     meta = {
         "schema_version": SCHEMA_VERSION,
-        "project_id": pid,
+        "study_id": pid,
         "label": str(label),
         "created_utc": _iso(now),
         "created_by": TOOL_VERSION,
@@ -551,7 +551,7 @@ def create_project(repo_root: Path, label: str, *,
         "status": STATUS_INCOMPLETE,
         "notes": "",
     }
-    _write_json(pdir / PROJECT_META_NAME, meta)
+    _write_json(pdir / STUDY_META_NAME, meta)
 
     problems: list[str] = []
 
@@ -650,7 +650,7 @@ def create_project(repo_root: Path, label: str, *,
 
     manifest = {
         "schema_version": SCHEMA_VERSION,
-        "project_id": pid,
+        "study_id": pid,
         "label": str(label),
         "producer": PRODUCER,
         "created_utc": _iso(now),
@@ -676,10 +676,10 @@ def create_project(repo_root: Path, label: str, *,
     meta["producers"][0]["n_rows"] = int(len(df))
     meta["producers"][0]["stations"] = sorted(df["station"].unique().tolist()) \
         if not df.empty else []
-    _write_json(pdir / PROJECT_META_NAME, meta)
+    _write_json(pdir / STUDY_META_NAME, meta)
 
-    log(f"  project {pid} -> {status}")
-    return load_project(pdir)
+    log(f"  study {pid} -> {status}")
+    return load_study(pdir)
 
 
 # --------------------------------------------------------------------------
@@ -688,39 +688,39 @@ def create_project(repo_root: Path, label: str, *,
 
 def _main(argv=None):
     import argparse
-    ap = argparse.ArgumentParser(description="Create and list project snapshots.")
+    ap = argparse.ArgumentParser(description="Create and list study snapshots.")
     ap.add_argument("command", choices=["create", "list", "show"])
     ap.add_argument("--label", default="session")
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
-    ap.add_argument("--projects-root", type=Path, default=None)
+    ap.add_argument("--studies-root", type=Path, default=None)
     ap.add_argument("--refresh", action="store_true",
                     help="also refresh the Excel workbook via COM")
     ap.add_argument("--days", type=int, default=None)
     args = ap.parse_args(argv)
 
-    proot = args.projects_root or default_projects_root(args.root)
+    proot = args.studies_root or default_studies_root(args.root)
 
     if args.command == "create":
-        info = create_project(args.root, args.label, projects_root=proot,
+        info = create_study(args.root, args.label, studies_root=proot,
                               refresh=args.refresh, window_days=args.days)
-        print(f"\n{info.project_id}  {info.status}")
+        print(f"\n{info.study_id}  {info.status}")
         print(f"  {info.path}")
         print(f"  {info.n_rows:,} rows, stations: {', '.join(info.stations)}")
         print(f"  {info.validation_summary}")
         return 0 if info.status == STATUS_OK else 1
 
     if args.command == "list":
-        ps = list_projects(proot)
+        ps = list_studies(proot)
         if not ps:
-            print(f"no projects under {proot}")
+            print(f"no studies under {proot}")
             return 1
         for p in ps:
             print(p.display())
         return 0
 
-    p = latest_project(proot)
+    p = latest_study(proot)
     if p is None:
-        print("no projects")
+        print("no studies")
         return 1
     print(json.dumps(p.manifest.get("validation", {}), indent=2)[:4000])
     return 0

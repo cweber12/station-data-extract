@@ -14,7 +14,7 @@ Write-Host 'La Jolla sensor comparison' -ForegroundColor Cyan
 Write-Host ''
 
 # --- find a usable Python -------------------------------------------------
-# Prefer the project's own .venv. It already has every dependency, and picking
+# Prefer the repo's own .venv. It already has every dependency, and picking
 # a system Python instead means pip-installing a second copy of everything --
 # and then wondering why a package you "installed" is still missing.
 $py = $null
@@ -115,17 +115,17 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # --- folders ---------------------------------------------------------------
-# sources/ holds hand-supplied inputs. Projects live one level UP, so the
-# sibling extractors can see them -- see project.default_projects_root().
+# sources/ holds hand-supplied inputs. Studies live one level UP, so the
+# sibling extractors can see them -- see study.default_studies_root().
 if (-not (Test-Path 'sources')) { New-Item -ItemType Directory -Path 'sources' | Out-Null }
-$projects = Join-Path (Split-Path $PSScriptRoot -Parent) 'projects'
-if (-not (Test-Path $projects)) { New-Item -ItemType Directory -Path $projects | Out-Null }
-Write-Host "Projects: $projects" -ForegroundColor DarkGray
+$studies = Join-Path (Split-Path $PSScriptRoot -Parent) 'studies'
+if (-not (Test-Path $studies)) { New-Item -ItemType Directory -Path $studies | Out-Null }
+Write-Host "Studies: $studies" -ForegroundColor DarkGray
 
-$n = @(Get-ChildItem -Path $projects -Directory -ErrorAction SilentlyContinue).Count
+$n = @(Get-ChildItem -Path $studies -Directory -ErrorAction SilentlyContinue).Count
 if ($n -eq 0) {
     Write-Host ''
-    Write-Host 'No projects yet -- choose "New project" in the launcher to pull data.' -ForegroundColor Yellow
+    Write-Host 'No studies yet -- choose "New study" in the launcher to pull data.' -ForegroundColor Yellow
 }
 
 Write-Host ''
