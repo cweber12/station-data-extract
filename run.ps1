@@ -14,8 +14,25 @@ Write-Host 'La Jolla sensor comparison' -ForegroundColor Cyan
 Write-Host ''
 
 # --- find a usable Python -------------------------------------------------
+# Prefer the project's own .venv. It already has every dependency, and picking
+# a system Python instead means pip-installing a second copy of everything --
+# and then wondering why a package you "installed" is still missing.
 $py = $null
-foreach ($candidate in @('py -3', 'python', 'python3')) {
+$pyExe = $null
+$pyArgs = @()
+
+$venv = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+if (Test-Path $venv) {
+    # Set $pyExe directly rather than going through $py, whose string-splitting
+    # below would break on any path containing a space.
+    $pyExe = $venv
+    $py = '.venv'
+    $v = & $venv -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>$null
+    Write-Host "Python $($v.Trim()) found (.venv)" -ForegroundColor Green
+}
+
+if (-not $py) {
+  foreach ($candidate in @('py -3', 'python', 'python3')) {
     $parts = $candidate.Split(' ')
     $exe = $parts[0]
     if (Get-Command $exe -ErrorAction SilentlyContinue) {
@@ -31,6 +48,7 @@ foreach ($candidate in @('py -3', 'python', 'python3')) {
             }
         } catch { }
     }
+  }
 }
 
 if (-not $py) {
@@ -41,9 +59,11 @@ if (-not $py) {
     exit 1
 }
 
-$pyParts = $py.Split(' ')
-$pyExe = $pyParts[0]
-$pyArgs = if ($pyParts.Length -gt 1) { $pyParts[1..($pyParts.Length - 1)] } else { @() }
+if (-not $pyExe) {
+    $pyParts = $py.Split(' ')
+    $pyExe = $pyParts[0]
+    $pyArgs = if ($pyParts.Length -gt 1) { $pyParts[1..($pyParts.Length - 1)] } else { @() }
+}
 
 function Invoke-Py { & $pyExe @pyArgs @args }
 
