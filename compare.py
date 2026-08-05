@@ -21,6 +21,7 @@ Generate button lives outside the scroll area so it is always reachable.
 
 from __future__ import annotations
 
+import faulthandler
 import os
 import queue
 import subprocess
@@ -54,6 +55,84 @@ POLL_MS = 80
 STATUS_COLORS = {st.STATUS_OK: "#1a7f37",
                  st.STATUS_FAILED: "#b00020",
                  st.STATUS_INCOMPLETE: "#8a6d00"}
+
+
+# --------------------------------------------------------------------------
+# session log
+# --------------------------------------------------------------------------
+#
+# On 2026-08-05 this process died inside Tcl_PanicVA -- a Tcl panic, which
+# calls abort(). There is no Python exception to catch, so there was no error
+# dialog, no traceback, and no workbook; the window simply vanished, and the
+# log pane went with it. The pane was the only record of what was being done
+# at the time, and it lived entirely in a Tk widget.
+#
+# So the pane is mirrored to disk as it is written, and faulthandler is pointed
+# at the same file: a fatal signal then appends every thread's Python stack
+# after the last thing the user did. A session that ends without the "clean
+# exit" marker crashed.
+#
+# This diagnoses; it does not prevent. The panic itself is still unexplained.
+
+LOG_DIRNAME = "logs"
+KEEP_LOGS = 40                    # newest N kept; these are tiny
+
+_LOG_LOCK = threading.Lock()
+_LOG_FILE = None
+
+
+def session_log(msg: str) -> None:
+    """Append one line. Safe from any thread, and never raises -- a logging
+    failure must not be able to take down the thing it is documenting."""
+    if _LOG_FILE is None:
+        return
+    try:
+        with _LOG_LOCK:
+            _LOG_FILE.write(f"{datetime.now():%H:%M:%S}  {msg}\n")
+    except Exception:
+        pass
+
+
+def open_session_log(root: Path):
+    """Start the on-disk mirror and arm faulthandler. Returns its path or None.
+
+    Opened line-buffered so every line is on disk before the next one is
+    produced. faulthandler writes straight to the descriptor, so its dump
+    lands after the flushed lines rather than interleaved with them.
+    """
+    global _LOG_FILE
+    d = Path(root) / LOG_DIRNAME
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"session-{datetime.now():%Y%m%d-%H%M%S}.log"
+        _LOG_FILE = open(path, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        _LOG_FILE = None
+        return None
+
+    try:
+        faulthandler.enable(file=_LOG_FILE, all_threads=True)
+    except Exception:
+        pass                      # a log without stacks still beats no log
+
+    session_log(f"=== session started "
+                f"{datetime.now(LOCAL_TZ):%Y-%m-%d %H:%M:%S %Z} ===")
+    session_log(f"python {sys.version.split()[0]}  tcl {tk.TclVersion}  "
+                f"tk {tk.TkVersion}  pid {os.getpid()}")
+
+    try:
+        old = sorted(d.glob("session-*.log"))[:-KEEP_LOGS]
+        for p in old:
+            p.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def close_session_log(reason: str = "clean exit") -> None:
+    """Mark the session as having ended on purpose. A log missing this line
+    is the signature of a crash, which is the whole point of writing it."""
+    session_log(f"=== {reason} ===")
 
 
 def enable_dpi_awareness():
@@ -1096,6 +1175,20 @@ class App(tk.Tk):
             messagebox.showerror("Bad input", str(e))
             return
 
+        # Record the exact request before the work starts. If the process dies
+        # mid-build this is the only evidence of what was selected -- and the
+        # crash being chased is reported as depending on how many data types
+        # were in the list.
+        session_log(f"generate: {len(opts.selected)} series, "
+                    f"interval={opts.interval} agg={opts.aggregation} "
+                    f"overlap={opts.overlap} min_samples={opts.min_samples} "
+                    f"convert={opts.convert} strat={opts.stratification} "
+                    f"lag={opts.do_lag}/{opts.lag_hours}h "
+                    f"window={opts.start}..{opts.end}")
+        for _t, c in opts.selected:
+            session_log(f"    series: {c.label}  unit={c.unit or '-'}  "
+                        f"canonical={sk.canonical_unit(c.unit, c.column)}")
+
         threading.Thread(target=self._generate_worker, args=(opts,),
                          daemon=True).start()
 
@@ -1193,7 +1286,13 @@ class App(tk.Tk):
     # ---- cross-thread messaging (see ProgressDialog's threading contract) ----
 
     def write_log(self, msg: str) -> None:
-        """Safe from any thread: queues only, never touches Tk."""
+        """Safe from any thread: queues only, never touches Tk.
+
+        The disk mirror is written here rather than in _pump, so a line
+        survives even when the process dies before the main thread next drains
+        the queue.
+        """
+        session_log(str(msg))
         self._q.put(("log", str(msg)))
 
     def _post(self, kind: str, payload) -> None:
@@ -1231,6 +1330,7 @@ class App(tk.Tk):
 
 
 def main():
+    log_path = open_session_log(ROOT)
     enable_dpi_awareness()
     (ROOT / sk.SOURCES_DIRNAME).mkdir(exist_ok=True)
     studies_root = st.default_studies_root(ROOT)
@@ -1238,11 +1338,23 @@ def main():
 
     chosen = choose_studies(studies_root)
     if chosen is None:
+        close_session_log("cancelled at the launcher")
         return 0                      # cancelled at the launcher
     if not chosen:
         # Legacy mode: no study, scan sources/ the old way.
         (ROOT / sk.OUTPUTS_DIRNAME).mkdir(exist_ok=True)
-    App(chosen, studies_root).mainloop()
+    session_log("opened: " + (", ".join(p.study_id for p in chosen)
+                              or "legacy sources/"))
+    try:
+        App(chosen, studies_root).mainloop()
+    except BaseException as e:
+        # A Tcl panic never reaches here -- it aborts the process. This is for
+        # the ordinary case, so the log says which way the session ended.
+        close_session_log(f"exited on {type(e).__name__}: {e}")
+        raise
+    close_session_log()
+    if log_path is not None:
+        print(f"session log: {log_path}")
     return 0
 
 

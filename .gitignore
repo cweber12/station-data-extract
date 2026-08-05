@@ -6,6 +6,9 @@ __pycache__/
 outputs/
 build/
 
+# Session logs and fatal-fault dumps. Diagnostic only, and machine-specific.
+logs/
+
 # Snapshots and the merged archive live one level up, outside this repo, so they
 # are not matched by anything here. Listed for the reader's benefit only:
 #   ../projects/
