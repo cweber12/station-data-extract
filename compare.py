@@ -22,6 +22,7 @@ Generate button lives outside the scroll area so it is always reachable.
 from __future__ import annotations
 
 import faulthandler
+import gc
 import os
 import queue
 import subprocess
@@ -772,6 +773,34 @@ class StudyChooser(tk.Toplevel):
         self.destroy()
 
 
+def release_discarded_tk() -> None:
+    """Finalise discarded Tk objects HERE, on the main thread.
+
+    Tk widgets and variables form reference cycles -- a widget holds its
+    master, the master holds its children, a Variable holds the interpreter --
+    so dropping the last name does NOT free them. They wait for the cyclic
+    collector, and that runs on whichever thread happens to allocate enough to
+    trip a generation. When that thread is a worker, every one of those Tk
+    finalizers runs off the main thread:
+
+      - tkinter.Variable.__del__ raises "main thread is not in main loop",
+        which is ignored and merely printed, but
+      - if the object being freed is a Tk INTERPRETER, its finalizer calls
+        Tcl_DeleteInterp, which deletes an async handler that was created on
+        the main thread. Tcl's response is not an exception. It is
+        "Tcl_AsyncDelete: async handler deleted by the wrong thread" followed
+        by abort: no traceback, no dialog, the window simply disappears.
+
+    Seen 2026-08-05 16:42:40 -- a generation-2 collection tripped by pandas
+    inside write_workbook, on the generate worker, finalising the study
+    chooser's interpreter that had been destroyed twenty minutes earlier.
+
+    So: whenever a dialog and its interpreter are thrown away, collect them
+    now, while we are still on the thread that is allowed to.
+    """
+    gc.collect()
+
+
 def choose_studies(studies_root: Path) -> list[st.StudyInfo] | None:
     """Run the chooser on a hidden root window. Returns None if cancelled."""
     root = tk.Tk()
@@ -780,6 +809,11 @@ def choose_studies(studies_root: Path) -> list[st.StudyInfo] | None:
     root.wait_window(dlg)
     result = dlg.result
     root.destroy()
+    # This interpreter is dead but not yet freed, and App is about to create a
+    # second one. Collect the first one's cycles on this thread; leaving them
+    # for whichever thread trips the next collection is the crash above.
+    del dlg, root
+    release_discarded_tk()
     return result
 
 
@@ -842,9 +876,15 @@ class App(tk.Tk):
         """Reopen the chooser without restarting the app."""
         dlg = StudyChooser(self, self.studies_root)
         self.wait_window(dlg)
-        if dlg.result is None:
+        result = dlg.result
+        # Same rule as choose_studies. This dialog shares the App's
+        # interpreter, so its cycles cannot panic on their own -- but they are
+        # still Tk finalizers waiting for an arbitrary thread to run them.
+        del dlg
+        release_discarded_tk()
+        if result is None:
             return
-        self.studies = list(dlg.result)
+        self.studies = list(result)
         self.selected.clear()
         sk._frame_cache.clear()
         self._retitle()
