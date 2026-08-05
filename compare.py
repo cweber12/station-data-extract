@@ -578,6 +578,17 @@ class StudyChooser(tk.Toplevel):
 
     def _rebuild_archive(self):
         dlg = ProgressDialog(self, "Rebuilding archive")
+        # The refreshed list has to be requested through the dialog's queue,
+        # not scheduled by the worker. `after()` is itself a Tk call -- it
+        # registers a callback name -- so from a worker it raises
+        # "RuntimeError: main thread is not in main loop".
+        #
+        # That raise landed AFTER dlg.finish() had already been queued, so the
+        # failure was invisible: the dialog said "Archive rebuilt", the worker
+        # thread died on the next line, and the study list silently kept
+        # showing the pre-rebuild snapshot. No traceback anywhere, because
+        # nothing catches an exception escaping a thread's target.
+        dlg.call_when_done(lambda _payload: self._fill_lists())
 
         def worker():
             try:
@@ -589,7 +600,7 @@ class StudyChooser(tk.Toplevel):
                 dlg.log(f"\nFAILED: {e}")
                 dlg.finish("Failed")
                 return
-            self.after(0, self._fill_lists)
+            dlg.put_result(("ok", out))
 
         threading.Thread(target=worker, daemon=True).start()
 
