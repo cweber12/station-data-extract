@@ -119,7 +119,10 @@ class ProgressDialog(tk.Toplevel):
     def __init__(self, parent, title="Working"):
         super().__init__(parent)
         self.title(title)
-        self.transient(parent)
+        # Same trap as ProjectChooser: never become transient for a master that
+        # is not on screen, or this dialog inherits its withdrawn state.
+        if parent is not None and parent.winfo_viewable():
+            self.transient(parent)
         self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", lambda: None)   # no closing mid-pull
         frame = ttk.Frame(self, padding=12)
@@ -149,6 +152,18 @@ class ProgressDialog(tk.Toplevel):
             self.after(0, _w)
         except tk.TclError:
             pass
+
+    def destroy(self):
+        # An indeterminate Progressbar reschedules itself with `after`. If the
+        # window is destroyed while one of those callbacks is pending, Tk prints
+        # a traceback from ttk::progressbar::Autoincrement -- harmless, but it
+        # looks like a crash to whoever is watching the console. Stop the
+        # animation first.
+        try:
+            self.bar.stop()
+        except Exception:
+            pass
+        super().destroy()
 
     def finish(self, msg: str):
         def _f():
@@ -203,7 +218,17 @@ class ProjectChooser(tk.Toplevel):
         self.projects = pj.list_projects(projects_root)
         self._fill_lists()
         _center(self, parent)
-        self.transient(parent)
+        # `wm transient` ties this window's visibility to its master: Tk
+        # withdraws a transient whenever its master is withdrawn. The launcher
+        # runs on a deliberately hidden root, so setting it unconditionally
+        # made this window withdrawn too -- invisible, with wait_window()
+        # blocking forever and nothing on screen. Only claim a master that is
+        # actually on screen (the File -> Switch project... case).
+        if parent is not None and parent.winfo_viewable():
+            self.transient(parent)
+        self.deiconify()
+        self.lift()
+        self.focus_force()
         self.grab_set()
 
     # ------------------------------------------------------------ mode 1
