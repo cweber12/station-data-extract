@@ -91,6 +91,12 @@ UNIT_PATTERNS = [
     (re.compile(r"\(microg\.L-1\)", re.I), "ug/L"),
     (re.compile(r"degrees_true", re.I), "deg"),
     (re.compile(r"\(1e-3\)", re.I), "PSU"),
+    # A trailing `(1)` is the header DECLARING itself dimensionless (CF unit
+    # "1"), which is what the seaphox pH column does. Reading the stated unit
+    # is not the same as inferring one from the column's name -- `1` still
+    # only becomes pH in canonical_unit(), and only when the column says pH.
+    # Must stay below `(1e-3)`, which would otherwise never be reached.
+    (re.compile(r"\(1\)", re.I), "1"),
     (re.compile(r"\(m\)", re.I), "m"),
     (re.compile(r"\(s\)", re.I), "s"),
     (re.compile(r"water\s*level", re.I), "ft"),
