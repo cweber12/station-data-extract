@@ -1,0 +1,12 @@
+# Core -- the Python ingest, analysis and export path.
+pandas
+numpy
+openpyxl
+pyarrow          # parquet cache for the canonical long frame
+pyyaml           # config/stations.yaml
+requests         # ERDDAP / NDBC / CO-OPS
+
+# Optional. Only for the Excel refresh path (ingest/refresh.py and
+# ingest/mashup.configure_loading). Everything else runs without Excel, so the
+# import is guarded and a project can be created headless.
+pywin32; sys_platform == "win32"

@@ -270,3 +270,41 @@ for the UI layer, and it behaves on Windows. Layout:
 
 That last sheet is the thing this workbook most conspicuously lacks, and it's what would have caught
 A2 and C3 immediately.
+
+---
+
+# Resolved
+
+*Dated 2026-08-05. Each line says what actually fixed it. Findings stay in place
+above; this section records their disposition rather than deleting the history.*
+
+| # | Finding | Resolution |
+|---|---|---|
+| **A1** | `meta_ERDDAP` duplicates `meta_COOPS_datums` | Query deleted; its stale sheet is dropped by `ingest.mashup.configure_loading`. `meta_ERDDAP_sccoos` and `meta_ERDDAP_ndbc` were already the real ERDDAP metadata queries. |
+| **A2** | Date parameters carry literal quote characters; the window is not the one requested | `p_StartUTC` / `p_EndUTC` are now computed from `DateTimeZone.UtcNow()` with an explicit format string. The triple-quoted literals are gone. Gate 1.5 checks for a literal `"` in any parameter. |
+| **A3** | `src_NDBC` ignores the parameters entirely | Its URL is built from `p_StationFilter` and `p_TimeFilter`, both derived from the parameters. |
+| **A4** | `p_NDBCStations` is dead code; the station list is hardcoded three times | Now a real M list, consumed by `p_StationFilter` (used by `src_NDBC` and `meta_NDBC_positions`), by `meta_NDBC_stations`' row filter, and by `meta_refresh`. |
+| **A5** | Four competing time conventions in one workbook | Every `src_*` query emits exactly one column, `time_utc`, built from parts by `fnParseUtc`. `fnToLocal` is deleted. Local time is derived in Python via `zoneinfo` and is a display concern only. |
+| **A6** | The `_ok` columns do not do what their name says | Replaced by `fnQc`: flags 4 (fail) and 9 (missing) are rejected, 1/2/3 pass, and the raw `*_qc_agg` columns are kept so the provenance sheet can report how many suspect values were accepted. |
+| **B1** | The NDBC payload is stored twice | `src_NDBC` is now a staging query and is not materialised to a sheet; only the three per-station tables load. |
+| **B2** | `fnBinKeys` is the wrong abstraction | Function and all `BinKey*` columns removed. Resampling is a query-time operation in `sensorkit`. `NOISE_COLUMNS` still filters `BinKey*` as a safety net for old snapshots. |
+| **B5** | Refresh and staleness | `meta_refresh` records `fetched_utc`, the window, the station list and `m_version` on every refresh; `project.py` copies them into `manifest.json`, and marks a project `incomplete` rather than guessing if the sheet is absent. |
+| **C3** | The yellow buoy sheet is missing 7 samples from its own export | The logger export is read directly from `sources/yellow_buoy_temps.xlsx` into the canonical frame, so the count is whatever the file holds; coverage and largest gap are reported per series in `validation.json`. |
+| **C4** | "The correlation you're looking for is not present at lag 0" | **This conclusion was wrong, and the reason matters.** The near-zero correlation and the apparent anti-phase were entirely artifacts of **A2/A5** — the buoy (honestly labelled PDT) was being compared against columns labelled `time (UTC)` that actually held Pacific local time, a 7-hour error. On one clock the buoy correlates with LJAC1 at **r = 0.664 at lag 0**, rising to **0.723 at −1 h**, and with autoss at **0.660 / 0.715**. The buoy *leads* the pier by about an hour. There is no anti-phase and no 8-hour offset; neither number was ever real. The remaining weak correlation against 46254 (r = 0.351) is not a timing problem either — 46254 follows the sea surface while the logger sits on the seabed, so they are in different reference frames. |
+
+## Still open
+
+- **B3** (~25% of every SCCOOS table is padding) — moot for the Python ingest,
+  which stores a long frame, but still true of the workbook.
+- **B4** (yellow buoy sheets are second-class) — improved: the buoy is a
+  first-class station in `config/stations.yaml` with `role: subject`. Its
+  coordinates and deployment depth are still `TODO(verify)`; the HOBOconnect
+  export records neither.
+- **B6** (no analysis layer) — addressed by `sensorkit` + `exporter`, but the
+  stratification index is currently the only derived quantity.
+- **C1** (LJPC1 cannot participate in a temperature comparison) — confirmed at
+  source and recorded in `config/stations.yaml` as `role: context_only`, so it
+  cannot be re-added to the temperature pipeline by accident.
+- **C2** (unit mismatch) — handled on load; °F becomes °C once, at ingest.
+- **C5** (sampling cadences) — now measured per series into `validation.json`
+  rather than assumed.

@@ -458,17 +458,23 @@ def _plot_chart(source_ws, cols, first_col, nrows, index, frame, y_cols, width):
     return _chrome(ch)
 
 
-def _legend_label(col, unit, mixed):
+def _legend_label(col, unit, mixed, geometry=""):
     """
-    Trim the label to what identifies the series. The y-axis already states the
-    unit, so drop it unless the chart mixes units; drop the `src_` prefix every
-    table carries; collapse the leftovers of messy source headers.
+    Trim the label to what identifies the series, then state WHERE IT SITS.
+
+    Depth and reference frame are not decoration. A reader comparing
+    `LJAC1 wtmp` with `46254 SST` has no way to know from the names that one is
+    bolted to a pier piling 3.4 m down and the other rides the sea surface on a
+    0.9 m sphere -- and that difference is most of the explanation for why they
+    disagree. So every legend entry carries `(depth, frame)`.
     """
     name = re.sub(r"\s*\([^)]*\)", "", col)          # (degree_Celsius)
     name = re.sub(r"[,\s]*\u00b0\s*[FC]\b", "", name)    # ", degF"
     name = re.sub(r"(^|\.)src_", r"\1", name)          # src_LJAC1 -> LJAC1
     name = re.sub(r"\s{2,}", " ", name).strip(" ,.")
-    return f"{name} [{unit}]" if mixed and unit else name
+    if mixed and unit:
+        name = f"{name} [{unit}]"
+    return f"{name} {geometry}".strip() if geometry else name
 
 
 def _write_header(ws, title, subtitle, col):
@@ -482,7 +488,7 @@ def _write_header(ws, title, subtitle, col):
     ws.row_dimensions[2].height = 13
 
 
-def _cell_legend(ws, cols, units, mixed, row, start_col):
+def _cell_legend(ws, cols, units, mixed, row, start_col, geometry=None):
     """
     A conventional horizontal legend, laid out in cells below the plot and to
     the right of the frozen axis, so it scrolls with the chart. Each entry gets
@@ -492,7 +498,8 @@ def _cell_legend(ws, cols, units, mixed, row, start_col):
     ws.row_dimensions[row].height = LEGEND_ROW_PT
     col = start_col
     for i, c in enumerate(cols):
-        label = _legend_label(c, units.get(c, ""), mixed)
+        label = _legend_label(c, units.get(c, ""), mixed,
+                              (geometry or {}).get(c, ""))
         ws.column_dimensions[get_column_letter(col)].width = SWATCH_W
         sw = ws.cell(row=row, column=col)
         sw.fill = PatternFill("solid",
@@ -542,8 +549,13 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws):
         ws.add_chart(_plot_chart(ws_src, cols, first_col, n,
                                  result.data.index, frame, cols, width),
                      f"B{CHART_TOP_ROW}")
-        _cell_legend(ws, cols, result.units, mixed, legend_row, 2)
+        _cell_legend(ws, cols, result.units, mixed, legend_row, 2,
+                     getattr(result, "geometry", None))
         made.append(name)
+
+    # ---- stratification: its own panel, because it is a different quantity --
+    made += _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
+                                        legend_row)
 
     # ---- scatter: square, self-contained ----------------------------------
     if len(cols) >= 2:
@@ -580,13 +592,90 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws):
     return made
 
 
-def _write_provenance_sheet(wb, result, root, lag_reference=None):
+def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
+                                legend_row):
+    """A separate panel for SST(46254) - T(autoss).
+
+    It gets its own sheet rather than a second axis on the raw chart: it is a
+    temperature DIFFERENCE, not a temperature, and the no-dual-axis rule exists
+    precisely so two different quantities never share one frame. Read it as the
+    covariate -- when it is large the column is stratified, and a seabed logger
+    and a near-surface sensor have no reason to agree.
+    """
+    derived = [c for c in getattr(result, "derived", []) if c in cols]
+    if not derived:
+        return []
+
+    ws = wb.create_sheet("chart_stratification")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = AXIS_COL_W
+    ws.freeze_panes = "B1"
+    _write_header(ws, "Stratification index", subtitle, 2)
+
+    n = len(result.data)
+    width = _plot_width(n)
+    x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
+    frame = result.data[derived]
+    first = 3 + cols.index(derived[0])
+
+    ws.add_chart(_axis_chart(data_ws, derived, first, n,
+                             "temperature difference [degC]", frame, derived,
+                             x_lo), f"A{CHART_TOP_ROW}")
+    ws.add_chart(_plot_chart(data_ws, derived, first, n, result.data.index,
+                             frame, derived, width), f"B{CHART_TOP_ROW}")
+    _cell_legend(ws, derived, result.units, False, legend_row, 2,
+                 getattr(result, "geometry", None))
+
+    r = legend_row + 2
+    ws.cell(row=r, column=2, value=(
+        "Surface minus 5 m. Positive means the surface is warmer, i.e. a "
+        "stratified water column. This is the covariate that says WHEN the "
+        "seabed logger and the pier sensors should be expected to track each "
+        "other -- not a sensor reading in its own right.")).font = NOTE
+    return ["chart_stratification"]
+
+
+def _write_provenance_sheet(wb, result, root, lag_reference=None, project=None):
     ws = wb.create_sheet("provenance")
     ws.cell(row=1, column=1, value="How this file was made").font = TITLE
 
+    man = (project.manifest if project is not None else {}) or {}
+    wbrec = man.get("source_workbook") or {}
+    val = man.get("validation") or {}
+
     rows = [
         ("generated (local)", datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")),
-        ("source folder", str((root / "sources").resolve())),
+    ]
+    if project is not None:
+        rows += [
+            ("project id", project.project_id),
+            ("project label", project.label),
+            ("project created (UTC)", project.created_utc),
+            ("project status", project.status),
+            ("project folder", str(Path(project.path).resolve())),
+            ("pull window (UTC)",
+             f"{(man.get('window_utc') or {}).get('start', '-')} to "
+             f"{(man.get('window_utc') or {}).get('end', '-')}"
+             f"  ({(man.get('window_utc') or {}).get('window_days', '-')} days)"),
+            ("ingest sources",
+             ", ".join((man.get("ingest") or {}).get("sources", [])) or "-"),
+            ("tool version", man.get("tool_version", "-")),
+            ("QC policy", (val.get("qc_policy")
+                           or man.get("qc_policy") or "-")),
+        ]
+        if wbrec:
+            rows += [
+                ("source workbook", wbrec.get("path", "-")),
+                ("workbook sha256", (wbrec.get("sha256") or "-")[:32] + "..."),
+                ("workbook fetched (UTC)", wbrec.get("fetched_utc") or "not recorded"),
+                ("workbook p_StartUTC", wbrec.get("p_StartUTC") or "not recorded"),
+                ("workbook p_EndUTC", wbrec.get("p_EndUTC") or "not recorded"),
+                ("workbook m_version", wbrec.get("m_version") or "not recorded"),
+            ]
+    else:
+        rows += [("source folder", str((root / "sources").resolve()))]
+
+    rows += [
         ("interval", result.interval),
         ("aggregation", result.aggregation),
         ("overlap rule", result.overlap),
@@ -609,33 +698,89 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None):
         ws.cell(row=r, column=2, value=v).font = BODY
         r += 1
 
+    # ---- clock check verdicts ---------------------------------------------
+    checks = val.get("clock_checks") or []
+    if checks:
+        r += 1
+        ws.cell(row=r, column=1, value="Clock verification").font = TITLE
+        r += 1
+        for j, h in enumerate(["signal", "role", "observed peak (UTC h)",
+                               "expected (UTC h)", "offset (h)", "amplitude",
+                               "verdict"], start=1):
+            ws.cell(row=r, column=j, value=h)
+        _style_header(ws, row=r, ncols=7)
+        ws.freeze_panes = None
+        for c in checks:
+            r += 1
+            ws.cell(row=r, column=1, value=c.get("signal", "-")).font = BODY
+            ws.cell(row=r, column=2, value=c.get("role", "-")).font = BODY
+            ws.cell(row=r, column=3, value=c.get("observed_peak_hour_utc")).font = BODY
+            ws.cell(row=r, column=4, value=c.get("expected_peak_hour_utc")).font = BODY
+            ws.cell(row=r, column=5, value=c.get("offset_hours")).font = BODY
+            ws.cell(row=r, column=6, value=c.get("amplitude")).font = BODY
+            cell = ws.cell(row=r, column=7, value="OK" if c.get("ok") else "FAIL")
+            cell.font = BODY
+            if not c.get("ok"):
+                cell.fill = WARNFILL
+        r += 2
+        ws.cell(row=r, column=1, value=(
+            "A timestamp column is only UTC if a signal with a known solar phase "
+            "says so. Air temperature peaks ~2 h after local solar noon; the S2 "
+            "pressure tide peaks ~10:00 and ~22:00 local solar. See "
+            "ingest/clockcheck.py.")).font = NOTE
+        r += 1
+
+    # ---- per-series detail -------------------------------------------------
     r += 1
     ws.cell(row=r, column=1, value="Series").font = TITLE
     r += 1
-    for j, h in enumerate(["output column", "unit", "source", "native cadence"],
-                          start=1):
+    heads = ["output column", "unit", "depth / frame", "time basis",
+             "QARTOD-3 kept", "source", "native cadence"]
+    for j, h in enumerate(heads, start=1):
         ws.cell(row=r, column=j, value=h)
-    _style_header(ws, row=r, ncols=4)
+    _style_header(ws, row=r, ncols=len(heads))
     ws.freeze_panes = None
+
+    suspect = {}
+    for s in (man.get("series") or []):
+        suspect[f"{s.get('station')}.{s.get('variable')}"] = s.get("n_flagged_suspect")
+
     for c in result.data.columns:
         r += 1
         ws.cell(row=r, column=1, value=c).font = BODY
         ws.cell(row=r, column=2, value=result.units.get(c, "")).font = BODY
-        ws.cell(row=r, column=3, value=result.sources.get(c, "")).font = BODY
-        ws.cell(row=r, column=4, value=result.cadences.get(c, "")).font = BODY
+        ws.cell(row=r, column=3,
+                value=getattr(result, "geometry", {}).get(c, "")).font = BODY
+        basis = getattr(result, "time_trust", {}).get(c, "")
+        cell = ws.cell(row=r, column=4, value=basis)
+        cell.font = BODY
+        if "unverified" in basis.lower():
+            cell.fill = WARNFILL
+        ws.cell(row=r, column=5,
+                value=suspect.get(c.split(" ")[0], "")).font = BODY
+        ws.cell(row=r, column=6, value=result.sources.get(c, "")).font = BODY
+        ws.cell(row=r, column=7, value=result.cadences.get(c, "")).font = BODY
 
     r += 2
     for line in [
         "Assumptions applied on load:",
-        "  - Columns headed 'time (UTC)' are taken as UTC.",
-        "  - Columns headed 'time (local)', 'time (PDT)' or 'Date-Time (PDT)' are",
-        "    taken as America/Los_Angeles wall time and converted to UTC.",
+        "  - A column named 'time_utc' is UTC, verified by ingest/clockcheck.py",
+        "    against the solar phase of air temperature and barometric pressure.",
+        "  - A legacy column headed 'time (UTC)' is loaded but marked UNVERIFIED",
+        "    and shaded above. In this project's original workbook that column",
+        "    held Pacific local time, not UTC -- a column name is not evidence of",
+        "    a zone. No offset is applied to it here; guessing one is what caused",
+        "    the original error.",
+        "  - Columns headed 'Date-Time (PDT)' are logger-local wall time and are",
+        "    converted via zoneinfo, never by adding a constant.",
         "  - Fahrenheit columns are converted to Celsius; the original unit is",
         "    recorded above.",
         "  - Rows whose timestamp is ambiguous or nonexistent across a DST",
         "    transition are dropped rather than guessed.",
-        "  - BinKey* columns in the source workbook are ignored; binning is done",
-        "    here, at the interval named above.",
+        "  - QARTOD flags 4 (fail) and 9 (missing) are rejected; 1, 2 and 3 pass,",
+        "    and the count of suspect (3) values KEPT is listed per series above.",
+        "  - BinKey* columns in old snapshots are ignored; binning is done here,",
+        "    at the interval named above.",
     ]:
         ws.cell(row=r, column=1, value=line).font = NOTE
         r += 1
@@ -645,7 +790,7 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None):
 
 
 def write_workbook(result, root: Path, out_path: Path,
-                   lag_table=None, lag_reference=None) -> Path:
+                   lag_table=None, lag_reference=None, project=None) -> Path:
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -654,7 +799,7 @@ def write_workbook(result, root: Path, out_path: Path,
     _write_counts_sheet(wb, result, cols)
     _write_stats_sheet(wb, result, cols, lag_table, lag_reference)
     charts = _write_chart_sheets(wb, result, cols, data_ws, norm_ws)
-    _write_provenance_sheet(wb, result, root, lag_reference)
+    _write_provenance_sheet(wb, result, root, lag_reference, project)
 
     order = ([wb[c] for c in charts]
              + [wb["data"], wb["stats"], wb["counts"],

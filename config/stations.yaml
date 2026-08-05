@@ -1,0 +1,266 @@
+# stations.yaml -- the single source of truth for station geometry and endpoints.
+#
+# Nothing downstream may hardcode a coordinate, a depth, a station id or an
+# endpoint. If you need one, read it from here.
+#
+# WHY DEPTHS LIVE HERE AND NOT IN THE FEED
+#   Axiom's ERDDAP reports z = 0.0 m for both the Scripps Pier station and
+#   CDIP 201. That is a placeholder, not a measurement. Taking it at face value
+#   puts a 5 m CTD and a surface buoy at the same depth, which is exactly the
+#   error that makes a stratification signal look like a timing error.
+#
+# REFERENCE FRAMES
+#   Two sensors at the same nominal depth are not comparable if one is fixed to
+#   the seabed and the other rides the surface. A seabed sensor sees the tide as
+#   a pressure/temperature signal moving past it; a surface-following buoy stays
+#   in the same water parcel relative to the surface. The `reference_frame` key
+#   records which. The yellow buoy is Earth-frame, so Earth-frame references are
+#   its peers and 46254 is not.
+#
+# DATUM
+#   MSL is 0.832 m above MLLW at 9410230 (MSL 7.10 ft - MLLW 4.37 ft = 2.73 ft,
+#   NAVD88, epoch 1983-2001). Verified against meta_COOPS_datums in the workbook.
+#   Depths below are stated against the datum named in `depth_reference`.
+
+schema_version: 1
+
+defaults:
+  # The pull window, in days back from now. NDBC realtime2 holds ~45 days, so
+  # 45 is the value that any source can satisfy.
+  #
+  # NOTE, measured 2026-08-04: the sources actually used here hold far more than
+  # 45 days. ERDDAP cwwcNDBCMet advertises time actual_range 1970-02-26 -> now,
+  # and LJAC1 returns 6-minute ATMP+WTMP for probes at 2020-07-01, 2023-07-01 and
+  # 2025-07-01. The Axiom Scripps Pier feed goes back to 2013-01-18. Widening
+  # this number is a config change, not a code change, and it is the cheapest way
+  # to deepen the archive if that is ever wanted.
+  window_days: 45
+  timezone_display: America/Los_Angeles
+  qc_policy: "accept 1,2; flag 3; reject 4,9"
+
+endpoints:
+  # NDBC standard meteorological data, served through NOAA CoastWatch ERDDAP.
+  # This is what the workbook uses. Deep archive, not a rolling window.
+  ndbc_erddap:
+    base: https://coastwatch.pfeg.noaa.gov/erddap/tabledap/cwwcNDBCMet
+    info: https://coastwatch.pfeg.noaa.gov/erddap/info/cwwcNDBCMet/index.csv
+    note: "time actual_range 1970-02-26 -> present (dataset-wide), verified 2026-08-04"
+
+  # NDBC realtime2 flat files. Not used by the workbook; ingest/ndbc_realtime.py
+  # talks to these. ~45-day rolling window, UTC only, newest-first rows.
+  ndbc_realtime2:
+    base: https://www.ndbc.noaa.gov/data/realtime2/{station}.{ext}
+    derived: https://www.ndbc.noaa.gov/data/derived2/{station}.dmv
+    note: "rolling ~45 days; poll no more than hourly"
+
+  # SCCOOS automated shore station at Scripps Pier.
+  # This host is what the workbook actually pulls and what is verified working.
+  sccoos_erddap:
+    base: https://erddap.sensors.axds.co/erddap/tabledap/scripps-pier-automated-shore-sta-1
+    info: https://erddap.sensors.axds.co/erddap/info/scripps-pier-automated-shore-sta-1/index.csv
+    # Same Axiom dataset id, mirrored. Kept as a documented fallback only.
+    alternate_host: https://erddap.cencoos.org/erddap/tabledap/scripps-pier-automated-shore-sta-1
+    note: "coverage from 2013-01-18T22:29:25Z; full QARTOD _qc_agg + 11-char _qc_tests"
+
+  # Frozen. Do not use. Recorded here so nobody rediscovers it and assumes it is live.
+  sccoos_erddap_dead:
+    base: https://erddap.sccoos.org/erddap/tabledap/autoss
+    status: frozen
+    note: "no data after 2019-09-18. Never use."
+
+  # 2005-2012 backfill only, and the source of the true depth = 5.0 attribute.
+  sccoos_thredds:
+    base: https://thredds.sccoos.org/thredds/dodsC/autoss/scripps_pier-{year}.nc
+    note: "historical backfill only"
+
+  coops:
+    datagetter: https://api.tidesandcurrents.noaa.gov/api/prod/datagetter
+    datums: https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/{station}/datums.json
+    note: "always request time_zone=gmt, never lst_ldt"
+
+stations:
+
+  # ------------------------------------------------------------------ subject
+  yellow_buoy:
+    id: yellow_buoy
+    name: Yellow buoy TidbiT (Onset MX2204, s/n 22506632)
+    lon: null                    # TODO(verify): not recorded in the logger export
+    lat: null                    # TODO(verify): HOBOconnect "Location" was set to "Off"
+    sensor_depth_m: null         # TODO(verify): on the anchor, on the seabed -- depth not logged
+    depth_reference: seabed
+    reference_frame: earth
+    role: subject
+    cadence_min: 10
+    source: local_file
+    variables:
+      sea_water_temperature:
+        column: "Tidbit 1 , \xB0F"
+        unit_native: degF
+        unit_canonical: degC
+    note: >
+      The instrument under study. Logs local wall time labelled PDT, which is
+      honestly labelled -- unlike the ERDDAP-derived columns, this one really is
+      Pacific local. Sits on the anchor on the seabed, so it is Earth-frame and
+      its peers are the pier sensors, not the surface buoy.
+
+  # -------------------------------------------------------- primary reference
+  autoss:
+    id: scripps-pier-automated-shore-sta-1
+    name: SCCOOS automated shore station, Scripps Pier
+    lon: -117.257
+    lat: 32.867
+    sensor_depth_m: 5.0
+    depth_reference: MLLW        # 5.83 m below MSL
+    reference_frame: earth
+    role: primary_reference
+    cadence_min: 4
+    source: sccoos_erddap
+    variables:
+      sea_water_temperature:
+        erddap: sea_water_temperature_ctd
+        qc: sea_water_temperature_ctd_qc_agg
+        unit_canonical: degC
+      sea_water_practical_salinity:
+        erddap: sea_water_practical_salinity_ctd
+        qc: sea_water_practical_salinity_ctd_qc_agg
+        unit_canonical: "1e-3"
+      mass_concentration_of_chlorophyll_in_sea_water:
+        erddap: mass_concentration_of_chlorophyll_in_sea_water_eco
+        qc: mass_concentration_of_chlorophyll_in_sea_water_eco_qc_agg
+        unit_canonical: ug/L
+      sea_water_turbidity:
+        erddap: sea_water_turbidity_eco
+        qc: sea_water_turbidity_eco_qc_agg
+        unit_canonical: NTU
+      sea_water_ph_reported_on_total_scale:
+        erddap: sea_water_ph_reported_on_total_scale_seaphox_external
+        qc: sea_water_ph_reported_on_total_scale_seaphox_external_qc_agg
+        unit_canonical: "1"
+      mass_concentration_of_oxygen_in_sea_water:
+        erddap: mass_concentration_of_oxygen_in_sea_water_seaphox
+        qc: mass_concentration_of_oxygen_in_sea_water_seaphox_qc_agg
+        unit_canonical: mg/L
+    note: >
+      Fixed to a pier piling at 5.0 m below MLLW. Earth-frame, deepest of the
+      references, and the primary comparison for the yellow buoy. The 5.0 m
+      figure comes from the THREDDS depth attribute, not from ERDDAP, which
+      reports z = 0.0.
+
+  # ------------------------------------------------- cross-check / clock anchor
+  LJAC1:
+    id: LJAC1
+    coops_id: "9410230"
+    name: La Jolla, Scripps Pier (NDBC LJAC1 / NOS 9410230)
+    lon: -117.258
+    lat: 32.867
+    sensor_depth_m: 3.431        # -11.255939 ft, NOS sensor E1
+    depth_reference: MLLW        # 4.26 m below MSL
+    reference_frame: earth
+    role: cross_check
+    cadence_min: 6
+    source: ndbc_erddap
+    clock_anchor: true
+    variables:
+      sea_water_temperature:   {erddap: wtmp, unit_canonical: degC}
+      air_temperature:         {erddap: atmp, unit_canonical: degC}
+      air_pressure_at_mean_sea_level: {erddap: bar, unit_canonical: hPa}
+      wind_from_direction:     {erddap: wd,   unit_canonical: degree_true}
+      wind_speed:              {erddap: wspd, unit_canonical: m s-1}
+      wind_speed_of_gust:      {erddap: gst,  unit_canonical: m s-1}
+      water_level:
+        source: coops
+        product: water_level
+        datum: MLLW
+        unit_canonical: ft
+    note: >
+      THE CLOCK ANCHOR. The only station here reporting both air temperature and
+      barometric pressure, which is what makes an independent timezone check
+      possible -- air temperature peaks ~2 h after local solar noon, the S2
+      pressure tide peaks ~10:00 and ~22:00 local solar. Every project is
+      validated against this station. See ingest/clockcheck.py.
+      NDBC TIDE is empty here; water level comes from the CO-OPS API instead.
+
+  # ------------------------------------------------------- surface endpoint
+  "46254":
+    id: "46254"
+    cdip_id: "201"
+    name: Scripps Nearshore, CA (NDBC 46254 / CDIP 201)
+    lon: -117.267
+    lat: 32.868
+    sensor_depth_m: 0.45
+    depth_reference: sea_surface
+    reference_frame: surface     # <- NOT comparable depth-for-depth with the above
+    role: surface_endpoint
+    cadence_min: 30
+    source: ndbc_erddap
+    variables:
+      sea_water_temperature: {erddap: wtmp, unit_canonical: degC}
+      sea_surface_wave_significant_height: {erddap: wvht, unit_canonical: m}
+      sea_surface_wave_period_at_variance_spectral_density_maximum:
+        {erddap: dpd, unit_canonical: s}
+      sea_surface_wave_mean_period: {erddap: apd, unit_canonical: s}
+      sea_surface_wave_from_direction: {erddap: mwd, unit_canonical: degree_true}
+    note: >
+      A 0.9 m sphere with the sensor ~0.45 m below the waterline. It FOLLOWS THE
+      SURFACE, so it is not a peer of the Earth-frame sensors. Its correct use is
+      as the surface endpoint of a stratification index, SST(46254) - T(autoss),
+      which is the covariate that says when the buoy and the pier should agree.
+      Reports WTMP but no ATMP.
+
+  # ------------------------------------------------------------- context only
+  LJPC1:
+    id: LJPC1
+    name: La Jolla, Scripps Pier South (NDBC LJPC1)
+    lon: -117.257
+    lat: 32.867
+    sensor_depth_m: null
+    depth_reference: null
+    reference_frame: earth
+    role: context_only
+    cadence_min: 6
+    source: ndbc_erddap
+    variables:
+      sea_surface_wave_significant_height: {erddap: wvht, unit_canonical: m}
+      wind_from_direction: {erddap: wd,   unit_canonical: degree_true}
+      wind_speed:          {erddap: wspd, unit_canonical: m s-1}
+    note: >
+      REPORTS NO WATER TEMPERATURE AND NO AIR TEMPERATURE AT ALL. This is the
+      station itself, not a query bug -- confirmed at source. It is wave and wind
+      only. Do not put it back into the temperature pipeline; the columns exist
+      in the ERDDAP schema but are empty for this station, and a silent all-null
+      series is how that becomes an invisible hole in an analysis.
+
+# Which pairs mean something, and which do not.
+comparisons:
+  stratification_index:
+    minuend: {station: "46254", variable: sea_water_temperature}
+    subtrahend: {station: autoss, variable: sea_water_temperature}
+    label: "SST(46254) - T(autoss)"
+    note: >
+      Surface minus 5 m. Large positive means a stratified water column, and that
+      is when a seabed logger and a near-surface sensor should be expected to
+      disagree. Offer this alongside any buoy-vs-pier comparison.
+
+  clock_check:
+    station: LJAC1
+    signals:
+      - {variable: air_temperature, harmonic: 1, role: primary}
+      - {variable: air_pressure_at_mean_sea_level, harmonic: 2, role: confirm}
+    tolerance_h: 1.5
+    min_days: 10
+    note: >
+      Air temperature is primary -- it is unambiguous over 24 h. Pressure
+      confirms but is ambiguous modulo 12 h, so never use it alone to measure the
+      magnitude of an offset.
+
+  cross_station_sanity:
+    a: {station: autoss, variable: sea_water_temperature}
+    b: {station: LJAC1, variable: sea_water_temperature}
+    max_abs_lag_h: 1.0
+    # Deliberately loose. autoss sits at 5.83 m below MSL and LJAC1 at 4.26 m --
+    # 1.57 m apart on a coast with a strong internal tide. In stratified summer
+    # conditions that separation is routinely 1-2 degC, so a tight agreement
+    # threshold produces false alarms. The LAG is the diagnostic that actually
+    # catches a clock error; the magnitude is reported for information only.
+    max_abs_median_diff_c: 2.5
+    note: "best lag ~ 0 is the real test; the temperature difference is informational"

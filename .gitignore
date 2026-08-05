@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Generated output, never an input.
+outputs/
+build/
+
+# Snapshots and the merged archive live one level up, outside this repo, so they
+# are not matched by anything here. Listed for the reader's benefit only:
+#   ../projects/
+#   ../archive/
+
+# Excel workbooks are megabytes of cached results. The query logic that actually
+# matters is tracked as text in sources/Section1.m -- see README.
+*.xlsx
+*.xlsm
+*.parquet
+~$*
+
+# ...but Section1.m is the whole point, so make sure nothing above hides it.
+!sources/Section1.m
+
+# EXCEPTION, deliberate: the yellow buoy logger export is 85 KB and is the only
+# irreplaceable file here. Every other source can be re-fetched from ERDDAP or
+# CO-OPS on demand; this one is a physical deployment that happened once. It
+# stays in version control.
+!sources/yellow_buoy_temps.xlsx

@@ -58,10 +58,20 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # --- dependencies ----------------------------------------------------------
+# Import name -> pip name, where they differ.
+$required = [ordered]@{
+    'pandas'   = 'pandas'
+    'numpy'    = 'numpy'
+    'openpyxl' = 'openpyxl'
+    'pyarrow'  = 'pyarrow'     # parquet cache
+    'yaml'     = 'pyyaml'      # config/stations.yaml
+    'requests' = 'requests'    # ERDDAP / NDBC / CO-OPS
+}
+
 $missing = @()
-foreach ($m in @('pandas', 'openpyxl', 'numpy')) {
-    Invoke-Py -c "import $m" 2>$null
-    if ($LASTEXITCODE -ne 0) { $missing += $m }
+foreach ($import in $required.Keys) {
+    Invoke-Py -c "import $import" 2>$null
+    if ($LASTEXITCODE -ne 0) { $missing += $required[$import] }
 }
 
 if ($missing.Count -gt 0) {
@@ -70,21 +80,32 @@ if ($missing.Count -gt 0) {
     if ($LASTEXITCODE -ne 0) {
         Write-Host ''
         Write-Host 'Install failed. If this machine blocks PyPI, ask IT for a' -ForegroundColor Red
-        Write-Host 'local index and use:  pip install --index-url <url> pandas openpyxl numpy'
+        Write-Host "local index and use:  pip install --index-url <url> $($missing -join ' ')"
         Read-Host 'Press Enter to close'
         exit 1
     }
 }
 
-# --- folders ---------------------------------------------------------------
-foreach ($d in @('sources', 'outputs')) {
-    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d | Out-Null }
+# pywin32 is OPTIONAL -- only the Excel refresh path uses it. Do not install it
+# unprompted and do not fail without it; the Python ingest needs no Excel.
+Invoke-Py -c 'import win32com.client' 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'pywin32 not present -- the Excel refresh option will be unavailable.' -ForegroundColor DarkGray
+    Write-Host '  (optional:  pip install pywin32)' -ForegroundColor DarkGray
 }
 
-$n = @(Get-ChildItem -Path 'sources' -Filter '*.xlsx' -ErrorAction SilentlyContinue).Count
+# --- folders ---------------------------------------------------------------
+# sources/ holds hand-supplied inputs. Projects live one level UP, so the
+# sibling extractors can see them -- see project.default_projects_root().
+if (-not (Test-Path 'sources')) { New-Item -ItemType Directory -Path 'sources' | Out-Null }
+$projects = Join-Path (Split-Path $PSScriptRoot -Parent) 'projects'
+if (-not (Test-Path $projects)) { New-Item -ItemType Directory -Path $projects | Out-Null }
+Write-Host "Projects: $projects" -ForegroundColor DarkGray
+
+$n = @(Get-ChildItem -Path $projects -Directory -ErrorAction SilentlyContinue).Count
 if ($n -eq 0) {
     Write-Host ''
-    Write-Host 'No .xlsx files in sources\ -- put your workbooks there first.' -ForegroundColor Yellow
+    Write-Host 'No projects yet -- choose "New project" in the launcher to pull data.' -ForegroundColor Yellow
 }
 
 Write-Host ''
