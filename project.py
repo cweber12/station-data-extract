@@ -628,9 +628,11 @@ def create_project(repo_root: Path, label: str, *,
     val["problems"] = problems
     _write_json(prod / VALIDATION_NAME, val)
 
-    status = val["status"] if not problems or not df.empty else val["status"]
-    if df.empty:
-        status = STATUS_INCOMPLETE
+    # No rows at all means the snapshot never happened, whatever the checks say.
+    # Otherwise the validation verdict stands: a source that failed while others
+    # succeeded is recorded in `problems` and does not by itself invalidate the
+    # data that WAS collected.
+    status = STATUS_INCOMPLETE if df.empty else val["status"]
 
     # ---- 5. manifest ------------------------------------------------------
     series = [{

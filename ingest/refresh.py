@@ -164,6 +164,18 @@ def refresh_and_snapshot(src_xlsx: Path, dest_xlsx: Path,
             wb.RefreshAll()
             xl.CalculateUntilAsyncQueriesDone()
 
+            # Clear refreshOnLoad before SaveAs, so the SNAPSHOT never re-runs
+            # its queries when opened. The live workbook in sources/ has this
+            # switched on; a project snapshot that refreshed itself would stop
+            # matching the manifest that describes it, and "immutable" would be
+            # a claim rather than a fact. src is closed with SaveChanges=False,
+            # so its own setting is untouched.
+            for i in range(1, wb.Connections.Count + 1):
+                try:
+                    wb.Connections.Item(i).OLEDBConnection.RefreshOnFileOpen = False
+                except Exception:
+                    pass
+
             wb.SaveAs(str(dest), FileFormat=XL_OPENXML_WORKBOOK)
             wb.Close(SaveChanges=False)
             wb = None

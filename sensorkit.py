@@ -68,9 +68,15 @@ TIME_PREFERENCE = [
     (re.compile(r"^time_utc$", re.I), "UTC", TIME_VERIFIED),
     (re.compile(r"time\s*\(utc\)", re.I), "UTC", TIME_UNVERIFIED),
     (re.compile(r"\butc\b", re.I), "UTC", TIME_UNVERIFIED),
+    # `Date-Time (PDT)` MUST be tested before `time (pdt)`, because the latter
+    # matches inside the former. They are not the same thing: `Date-Time (PDT)`
+    # is HOBOconnect's raw logger export, which states the zone it recorded in
+    # and is honestly labelled, whereas the workbook's old `time (PDT)` was a
+    # COMPUTED column -- fnToLocal applied to data that was already local. The
+    # first deserves trust; the second earned none.
+    (re.compile(r"date-?\s*time", re.I), "LOCAL", TIME_LOCAL),
     (re.compile(r"time\s*\(local\)", re.I), "LOCAL", TIME_UNVERIFIED),
     (re.compile(r"time\s*\(pdt\)", re.I), "LOCAL", TIME_UNVERIFIED),
-    (re.compile(r"date-?\s*time", re.I), "LOCAL", TIME_LOCAL),
     (re.compile(r"^time$", re.I), "LOCAL", TIME_UNVERIFIED),
 ]
 
