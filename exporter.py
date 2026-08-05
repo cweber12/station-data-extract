@@ -17,6 +17,8 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+
+import sensorkit as sk
 from openpyxl import Workbook
 from openpyxl.chart import LineChart, Reference, ScatterChart, Series
 from openpyxl.chart.axis import ChartLines
@@ -353,11 +355,16 @@ def _style_value_axis(ch, frame, cols, title, pin_left=False):
                         pin_left=pin_left)
 
 
-def _add_line_series(ch, ws, cols, first_data_col, nrows, smooth=False):
-    """One straight-line series per column, no markers."""
+def _add_line_series(ch, ws, col_ix, nrows, smooth=False):
+    """One straight-line series per column, no markers.
+
+    `col_ix` is the list of sheet column indices to plot, in legend order. It
+    is a list rather than a start-plus-count because a chart now carries one
+    unit group, and a group is an arbitrary subset of the sheet's columns --
+    salinity can sit between two temperatures.
+    """
     xref = Reference(ws, min_col=1, min_row=2, max_row=nrows + 1)
-    for i, _ in enumerate(cols):
-        c = first_data_col + i
+    for i, c in enumerate(col_ix):
         yref = Reference(ws, min_col=c, min_row=1, max_row=nrows + 1)
         ser = Series(yref, xref, title_from_data=True)
         ser.smooth = smooth
@@ -418,8 +425,7 @@ def _chrome(ch):
     return ch
 
 
-def _axis_chart(source_ws, cols, first_col, nrows, y_title,
-                frame, y_cols, x_lo):
+def _axis_chart(source_ws, col_ix, nrows, y_title, frame, y_cols, x_lo):
     """
     The y-axis only. Sits in the frozen columns so it stays put while the wide
     plot scrolls. The series are parked off to the side of the data so nothing
@@ -429,7 +435,7 @@ def _axis_chart(source_ws, cols, first_col, nrows, y_title,
     ch.title = None
     ch.legend = None
     ch.height, ch.width = CHART_H, AXIS_W
-    _add_line_series(ch, source_ws, cols, first_col, nrows)
+    _add_line_series(ch, source_ws, col_ix, nrows)
     _style_common(ch)
     _style_value_axis(ch, frame, y_cols, y_title, pin_left=True)
     ch.x_axis.delete = True
@@ -439,12 +445,12 @@ def _axis_chart(source_ws, cols, first_col, nrows, y_title,
     return _chrome(ch)
 
 
-def _plot_chart(source_ws, cols, first_col, nrows, index, frame, y_cols, width):
+def _plot_chart(source_ws, col_ix, nrows, index, frame, y_cols, width):
     """The wide, scrolling half. No title, no legend, no y-axis labels."""
     ch = ScatterChart()
     ch.title = None
     ch.height, ch.width = CHART_H, width
-    _add_line_series(ch, source_ws, cols, first_col, nrows)
+    _add_line_series(ch, source_ws, col_ix, nrows)
     _style_common(ch)
     ch.legend = None
     _style_value_axis(ch, frame, y_cols, None)
@@ -513,8 +519,58 @@ def _cell_legend(ws, cols, units, mixed, row, start_col, geometry=None):
         col += 1 + span + 1          # swatch + label + a gap
 
 
+# A panel is a title row, the chart, a legend row, then a gap before the next.
+CHART_ROWS = int(np.ceil(CHART_H / ROW_CM))
+PANEL_GAP_ROWS = 3
+
+# What to call a unit on an axis when the bare symbol would not read as one.
+UNIT_AXIS_LABELS = {
+    "": "unit not detected",
+    "1": "dimensionless",
+    "qc_flag": "QARTOD flag",
+}
+
+
+def _unit_groups(result, cols):
+    """[(axis label, [column, ...]), ...] -- one entry per data type.
+
+    Series share a y-axis when, and only when, they share a unit. Two scales
+    on one frame make any two series look however you want, so the grouping
+    key is the CANONICAL unit: `m s-1` and `m/s` are one group, because they
+    are one unit spelled two ways by two feeds.
+
+    Derived columns are kept apart even when the unit matches. The
+    stratification index is degC, but it is a temperature DIFFERENCE, not a
+    temperature, and putting it on the temperature axis is the same mistake as
+    a second axis -- one frame, two quantities.
+
+    Order follows first appearance in `cols`, so the panels come out in the
+    order the series were selected.
+    """
+    derived = set(getattr(result, "derived", []) or [])
+    groups: dict[tuple, list] = {}
+    for c in cols:
+        info = (getattr(result, "columns", {}) or {}).get(c)
+        unit = sk.canonical_unit(result.units.get(c, ""),
+                                 getattr(info, "column", None) or c)
+        groups.setdefault((c in derived, unit), []).append(c)
+    out = []
+    for (is_derived, unit), gcols in groups.items():
+        label = UNIT_AXIS_LABELS.get(unit, unit)
+        out.append((f"{label} (derived)" if is_derived else label, gcols))
+    return out
+
+
+def _panel_title(ws, row, label, gcols, col):
+    letter = get_column_letter(col)
+    ws[f"{letter}{row}"] = (f"{label}  \u00b7  {len(gcols)} "
+                            f"series" if len(gcols) != 1 else f"{label}  \u00b7  1 series")
+    ws[f"{letter}{row}"].font = Font(name="Arial", size=10, bold=True)
+    ws.row_dimensions[row].height = 15
+
+
 def _write_chart_sheets(wb, result, cols, data_ws, norm_ws):
-    """One chart per sheet: a frozen y-axis plus a wide scrolling plot."""
+    """chart_raw stacks one panel per data type; chart_zscore stays combined."""
     n = len(result.data)
     width = _plot_width(n)
     units = sorted({result.units.get(c, "") for c in cols if result.units.get(c)})
@@ -522,36 +578,66 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws):
     x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
     lo = result.data.index[0].tz_convert(LOCAL_TZ)
     hi = result.data.index[-1].tz_convert(LOCAL_TZ)
-    legend_row = CHART_TOP_ROW + int(np.ceil(CHART_H / ROW_CM)) + 1
+    legend_row = CHART_TOP_ROW + CHART_ROWS + 1
+    geometry = getattr(result, "geometry", None)
     made = []
+
+    # Sheet column of each series: the data sheet has two time columns before
+    # the data, the z-score sheet only one.
+    raw_ix = {c: 3 + i for i, c in enumerate(cols)}
+    z_ix = {c: 2 + i for i, c in enumerate(cols)}
+
+    groups = _unit_groups(result, cols)
 
     subtitle = (f"{result.interval} {result.aggregation} \u00b7 "
                 f"{lo:%Y-%m-%d %H:%M} to {hi:%Y-%m-%d %H:%M} local \u00b7 "
-                f"{n:,} intervals \u00b7 {len(cols)} series"
-                + (" \u00b7 mixed units" if mixed else ""))
+                f"{n:,} intervals \u00b7 {len(cols)} series \u00b7 "
+                f"{len(groups)} data type{'s' if len(groups) != 1 else ''}")
 
-    specs = [
-        ("chart_raw", data_ws, 3, result.data, "Raw values",
-         " / ".join(units) or "value"),
-        ("chart_zscore", norm_ws, 2,
-         (result.data - result.data.mean()) / result.data.std(ddof=0),
-         "Standardised (z-score)", "standard deviations"),
-    ]
+    # ---- chart_raw: one stacked panel per data type ------------------------
+    # Each panel is scaled to its own group. A single shared axis had to span
+    # every unit at once, which is what made it unreadable as soon as a second
+    # data type was selected.
+    ws = wb.create_sheet("chart_raw")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = AXIS_COL_W
+    ws.freeze_panes = "B1"           # column A only -- the axis and nothing else
+    _write_header(ws, "Raw values", subtitle, 2)
 
-    for name, ws_src, first_col, frame, title, y_title in specs:
-        ws = wb.create_sheet(name[:31])
-        ws.sheet_view.showGridLines = False
-        ws.column_dimensions["A"].width = AXIS_COL_W
-        ws.freeze_panes = "B1"       # column A only -- the axis and nothing else
-        _write_header(ws, title, subtitle, 2)
-        ws.add_chart(_axis_chart(ws_src, cols, first_col, n, y_title,
-                                 frame, cols, x_lo), f"A{CHART_TOP_ROW}")
-        ws.add_chart(_plot_chart(ws_src, cols, first_col, n,
-                                 result.data.index, frame, cols, width),
-                     f"B{CHART_TOP_ROW}")
-        _cell_legend(ws, cols, result.units, mixed, legend_row, 2,
-                     getattr(result, "geometry", None))
-        made.append(name)
+    row = CHART_TOP_ROW
+    for label, gcols in groups:
+        idx = [raw_ix[c] for c in gcols]
+        _panel_title(ws, row, label, gcols, 2)
+        top = row + 1
+        ws.add_chart(_axis_chart(data_ws, idx, n, label,
+                                 result.data, gcols, x_lo), f"A{top}")
+        ws.add_chart(_plot_chart(data_ws, idx, n, result.data.index,
+                                 result.data, gcols, width), f"B{top}")
+        # `mixed` is False within a panel: every series here shares a unit and
+        # the panel title already states it, so repeating it on each entry is
+        # noise.
+        lrow = top + CHART_ROWS + 1
+        _cell_legend(ws, gcols, result.units, False, lrow, 2, geometry)
+        row = lrow + PANEL_GAP_ROWS
+    made.append("chart_raw")
+
+    # ---- chart_zscore: deliberately NOT split ------------------------------
+    # A z-score is unitless by construction, so every series already shares a
+    # scale. Splitting it would defeat the only sheet that can compare shape
+    # and timing across different units.
+    zframe = (result.data - result.data.mean()) / result.data.std(ddof=0)
+    ws = wb.create_sheet("chart_zscore")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = AXIS_COL_W
+    ws.freeze_panes = "B1"
+    _write_header(ws, "Standardised (z-score)", subtitle, 2)
+    zidx = [z_ix[c] for c in cols]
+    ws.add_chart(_axis_chart(norm_ws, zidx, n, "standard deviations",
+                             zframe, cols, x_lo), f"A{CHART_TOP_ROW}")
+    ws.add_chart(_plot_chart(norm_ws, zidx, n, result.data.index,
+                             zframe, cols, width), f"B{CHART_TOP_ROW}")
+    _cell_legend(ws, cols, result.units, mixed, legend_row, 2, geometry)
+    made.append("chart_zscore")
 
     # ---- stratification: its own panel, because it is a different quantity --
     made += _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
@@ -616,12 +702,12 @@ def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
     width = _plot_width(n)
     x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
     frame = result.data[derived]
-    first = 3 + cols.index(derived[0])
+    idx = [3 + cols.index(c) for c in derived]
 
-    ws.add_chart(_axis_chart(data_ws, derived, first, n,
+    ws.add_chart(_axis_chart(data_ws, idx, n,
                              "temperature difference [degC]", frame, derived,
                              x_lo), f"A{CHART_TOP_ROW}")
-    ws.add_chart(_plot_chart(data_ws, derived, first, n, result.data.index,
+    ws.add_chart(_plot_chart(data_ws, idx, n, result.data.index,
                              frame, derived, width), f"B{CHART_TOP_ROW}")
     _cell_legend(ws, derived, result.units, False, legend_row, 2,
                  getattr(result, "geometry", None))
