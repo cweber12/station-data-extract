@@ -1367,9 +1367,21 @@ class App(tk.Tk):
 
             out_dir = self.outputs_dir
             out_dir.mkdir(parents=True, exist_ok=True)
-            out = out_dir / ex.default_output_name(cols, opts.interval)
-            ex.write_workbook(res, ROOT, out, lag_table, ref, study=self.study,
-                              cm_per_day=opts.cm_per_day)
+            asked = out_dir / ex.default_output_name(cols, opts.interval)
+            # Take the path write_workbook actually used, not the one proposed:
+            # it steps aside rather than overwrite an existing workbook, and
+            # reporting the requested name would name a file we did not write.
+            out = ex.write_workbook(res, ROOT, asked, lag_table, ref,
+                                    study=self.study,
+                                    cm_per_day=opts.cm_per_day)
+            if out.name != asked.name:
+                note = (f"{asked.name} already existed, so this build was "
+                        f"written as {out.name} instead. The output name "
+                        f"records only the first three series, the interval "
+                        f"and the minute -- not the aggregation, window or "
+                        f"chart scale.")
+                self.write_log("NOTE: " + note)
+                notes.append(note)
             self.write_log(f"Wrote {out}")
             self._post("done", (out, list(res.dropped), notes))
         except Exception as exc:

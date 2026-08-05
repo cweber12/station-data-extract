@@ -985,8 +985,33 @@ def write_workbook(result, root: Path, out_path: Path,
     wb.active = 0
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path = unique_path(out_path)
     wb.save(out_path)
     return out_path
+
+
+def unique_path(path: Path) -> Path:
+    """`path`, or the first `name-2`, `name-3`... that does not exist yet.
+
+    A generated workbook must never replace one that is already there. The
+    output name carries only the first three series, the interval and a stamp
+    good to the MINUTE -- it says nothing about the aggregation, the overlap
+    rule, the minimum sample count, the window or the chart scale. So the whole
+    point of generating twice in a minute is to vary one of the things the name
+    does not record, and that is exactly when the second file would have landed
+    on the first.
+
+    This also sidesteps writing to a workbook Excel currently has open, which
+    fails outright rather than quietly.
+    """
+    path = Path(path)
+    if not path.exists():
+        return path
+    for i in range(2, 1000):
+        candidate = path.with_name(f"{path.stem}-{i}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"cannot find a free name beside {path}")
 
 
 def default_output_name(cols, interval) -> str:
