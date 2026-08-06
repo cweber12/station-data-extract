@@ -1,6 +1,6 @@
 # Working in this repo
 
-## How to work: confirm, plan, slice, commit
+## How to work: confirm, plan, PRD, branch, slice, PR
 
 Follow this for any task beyond a one-line fix.
 
@@ -34,7 +34,63 @@ Present the slice list and wait for agreement before implementing. If the plan
 changes mid-flight — and it will, because verification surfaces real bugs — say
 so and re-confirm rather than quietly expanding scope.
 
-### 4. Implement one slice, verify it, commit it
+### 4. Open a PRD
+
+Once the slice list is agreed, write it up as a PRD and publish it to the issue
+tracker with the `ready-for-agent` label. Do this *before* starting slice 1.
+
+The conversation that produced the plan is not durable. The issue is, and it is
+the only thing another agent — or you in a fresh session — can pick the work up
+from. A plan that exists solely in a transcript has to be rebuilt from scratch
+every time someone returns to it, and it gets rebuilt slightly differently each
+time.
+
+The PRD states the problem and the solution *from the user's point of view*, the
+user stories, the implementation decisions, the **test seams**, and what is out
+of scope. Say what was considered and rejected, and why — the rejected options
+are most of what makes the accepted one defensible, and they are the first thing
+someone re-litigates otherwise.
+
+Agree the seams before publishing. They decide whether the feature can be
+verified at all, and there is no test framework here to fall back on: gates are
+module CLIs that exit non-zero. Prefer existing seams to new ones, and put a new
+seam at the highest point it will sit — logic buried inside a Tk callback can
+only be tested by opening a window.
+
+### 5. Split the PRD into issues, when that earns its keep
+
+Break the PRD into issues on the tracker — one per **vertical** slice, each
+cutting a complete path through every layer, rather than one layer across the
+whole feature. A slice that delivers only a schema, or only a UI, cannot be
+demonstrated and cannot be verified except by the slice that finally uses it.
+
+Publish in dependency order so each issue can name a real blocker. Label them
+`ready-for-agent` and point each at the PRD as its parent. **Never close or edit
+the PRD issue itself** — it is the record of what was decided, not a checklist.
+
+Mark each issue AFK if it can be implemented and merged without a human, or HITL
+if it needs a decision or a look at the artifact. Prefer AFK. A slice whose whole
+purpose is that something reads correctly *to a person* is HITL, because no gate
+can assert it.
+
+**Skip this step when it does not earn its keep.** One slice is one issue is
+overhead, and a PRD small enough to finish on one branch is better worked from
+the PRD. The test is whether two agents could pick up two of the issues without
+colliding. If not, splitting bought nothing.
+
+### 6. Branch per issue
+
+Work every issue on its own branch, cut from an up-to-date `main`. Never commit
+directly to `main`.
+
+- Name the branch after the issue: `issue-<number>-<short-slug>`.
+- One issue per branch. Work that "was right there" belongs to a different
+  branch and a different issue, even when it is two lines.
+- Do not start an issue whose blocker has not merged. The blocker's code is the
+  ground the slices stand on, and rebasing half-finished work onto a moved
+  blocker is how a verified slice quietly stops being verified.
+
+### 7. Implement one slice, verify it, commit it
 
 **Commit after every slice.** Not at the end of the task, not once per session —
 after each slice. A clean working tree between slices is the point: it means any
@@ -48,7 +104,35 @@ Before committing a slice:
 
 Then move to the next slice. Do not batch commits.
 
-### 5. Report honestly
+### 8. Push, open a PR, and wait
+
+When every slice in the issue is committed and its gates pass, push the branch
+and open a pull request. Then stop.
+
+The PR body states:
+
+- `Closes #<issue>`, so the tracker closes itself on merge,
+- what changed and why, at the level of the slices,
+- **the actual output of the gates you ran** — not "tests pass". Two bugs have
+  shipped here past code that merely did not raise, and a claim is not evidence,
+- anything you did not do, and why.
+
+Then **wait for confirmation to merge.** Do not merge your own PR unprompted, do
+not approve it, and do not bypass hooks or checks to make it mergeable. If a
+hook fails, the hook is the message.
+
+On confirmation:
+
+- merge with a **merge or rebase commit, never a squash**. Every slice is meant
+  to be revertible and bisectable on its own, and squashing a branch into a
+  single commit destroys the exact property step 7 exists to create,
+- delete the remote branch, then the local branch,
+- return to `main` and pull, so the next issue starts from the merged state.
+
+If changes are requested instead, keep working on the same branch — new slices,
+new commits, same rules. Do not rewrite history that has already been pushed.
+
+### 9. Report honestly
 
 If a slice is blocked, say so and finish the others. If verification fails, show
 the output. If you found a bug in your own earlier work, say that plainly — it
