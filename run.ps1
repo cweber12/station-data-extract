@@ -114,6 +114,14 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host '  (optional:  pip install pywin32)' -ForegroundColor DarkGray
 }
 
+# matplotlib is OPTIONAL too -- only view.py uses it. The data pull and the
+# workbook export never touch it, so do not install it unprompted.
+Invoke-Py -c 'import matplotlib' 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'matplotlib not present -- the chart view will be unavailable.' -ForegroundColor DarkGray
+    Write-Host '  (optional:  pip install matplotlib)' -ForegroundColor DarkGray
+}
+
 # --- folders ---------------------------------------------------------------
 # sources/ holds hand-supplied inputs. Studies live one level UP, so the
 # sibling extractors can see them -- see study.default_studies_root().

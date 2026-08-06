@@ -43,6 +43,7 @@ import archive as arch
 import exporter as ex
 import study as st
 import sensorkit as sk
+import view
 
 ROOT = Path(__file__).resolve().parent
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
@@ -1133,6 +1134,17 @@ class App(tk.Tk):
                              command=self.generate)
         self.go.grid(row=1, column=0, sticky="ew", pady=(8, 0), ipady=6)
 
+        self.view_btn = ttk.Button(right, text="View chart …",
+                                   command=self.open_view)
+        self.view_btn.grid(row=2, column=0, sticky="ew", pady=(6, 0), ipady=4)
+        # A disabled button cannot explain itself, so the reason sits beside it
+        # and updates with the selection.
+        self.view_hint = tk.StringVar(value="")
+        ttk.Label(right, textvariable=self.view_hint, foreground="#777",
+                  wraplength=PANEL_W).grid(row=3, column=0, sticky="w",
+                                           pady=(2, 0))
+        self._update_view_button(len(self.selected))
+
     def toggle_log(self):
         if self.log_shown.get():
             self.log_frame.grid()
@@ -1248,7 +1260,22 @@ class App(tk.Tk):
             self.lag_ref.set(labels[0])
         if not labels:
             self.lag_ref.set("")
+        self._update_view_button(len(labels))
         self.status.set(f"{len(labels)} series selected")
+
+    def _update_view_button(self, n: int) -> None:
+        """The chart view takes a pair, and says so when it does not have one."""
+        btn = getattr(self, "view_btn", None)
+        if btn is None:                      # called before the panel is built
+            return
+        if not view.available():
+            btn.configure(state="disabled")
+            self.view_hint.set("matplotlib is not installed, so the chart "
+                               "view is unavailable. Everything else works.")
+            return
+        refusal = view.pair_refusal(n)
+        btn.configure(state="disabled" if refusal else "normal")
+        self.view_hint.set(refusal or "")
 
     def remove_selected(self):
         idx = list(self.sel_list.curselection())
@@ -1290,6 +1317,104 @@ class App(tk.Tk):
                              f"not {v}")
         return v
 
+    def open_view(self):
+        """Open the interactive z-score chart on the selected pair.
+
+        Deliberately a separate path from generate(): a mark is study-level and
+        outlives any one export, so viewing and exporting do not belong in one
+        flow. Generate stays exactly as it was.
+        """
+        refusal = view.pair_refusal(len(self.selected))
+        if refusal:
+            messagebox.showinfo("Pick a pair", refusal)
+            return
+        if not view.available():
+            messagebox.showerror("matplotlib not installed",
+                                 view.UNAVAILABLE_MESSAGE)
+            return
+
+        # Snapshot every Tk variable HERE, on the main thread -- same contract
+        # as generate(). Reading one inside the worker raises "main thread is
+        # not in main loop", and that exception dies inside the error handler.
+        try:
+            opts = SimpleNamespace(
+                start=self.parse_dt(self.start.get()),
+                end=self.parse_dt(self.end.get()),
+                interval=self.interval.get(),
+                aggregation=self.agg.get(),
+                overlap=self.overlap.get(),
+                min_samples=int(self.min_samples.get()),
+                convert=bool(self.convert.get()),
+                selected=list(self.selected),
+            )
+        except (ValueError, tk.TclError) as e:
+            self.status.set("Check the options.")
+            messagebox.showerror("Bad input", str(e))
+            return
+
+        self.go.configure(state="disabled")
+        self.view_btn.configure(state="disabled")
+        self.status.set("Building chart ...")
+        session_log(f"view: {[c.label for _t, c in opts.selected]} "
+                    f"interval={opts.interval} agg={opts.aggregation} "
+                    f"overlap={opts.overlap} window={opts.start}..{opts.end}")
+        threading.Thread(target=self._view_worker, args=(opts,),
+                         daemon=True).start()
+
+    def _view_worker(self, opts):
+        """Runs off the main thread: no Tk access, only queued messages."""
+        try:
+            self.write_log(f"Building chart at {opts.interval} / "
+                           f"{opts.aggregation} / {opts.overlap} ...")
+            res = sk.build_comparison(
+                opts.selected,
+                interval=opts.interval,
+                aggregation=opts.aggregation,
+                overlap=opts.overlap,
+                min_samples=opts.min_samples,
+                start=opts.start, end=opts.end,
+                convert_units_flag=opts.convert,
+                # No stratification index here: it would add a derived third
+                # series to a window whose whole premise is a pair.
+                stratification=False,
+            )
+            for d in res.dropped:
+                self.write_log("DROPPED: " + d)
+            if res.data.empty:
+                raise ValueError(
+                    "No rows survived. The two series may not overlap in time "
+                    "-- try 'union', a coarser interval, or a lower minimum "
+                    "sample count.")
+            if len(res.data.columns) != 2:
+                raise ValueError(
+                    f"{len(res.data.columns)} series survived the build, not "
+                    "2. The chart view compares a pair.")
+            self.write_log(
+                f"{len(res.data)} rows, "
+                f"{res.data.index[0].tz_convert(LOCAL_TZ):%Y-%m-%d %H:%M} to "
+                f"{res.data.index[-1].tz_convert(LOCAL_TZ):%Y-%m-%d %H:%M} "
+                "local.")
+            self._post("view", res)
+        except Exception as exc:
+            msg = "".join(traceback.format_exception_only(
+                type(exc), exc)).strip()
+            self.write_log("ERROR: " + msg)
+            self._post("error", msg)
+        finally:
+            self._post("enable_go", None)
+
+    def show_view(self, res):
+        """Main thread only -- builds the window from a finished result."""
+        try:
+            view.ViewWindow(self, res, study=self.study)
+        except Exception as exc:
+            msg = "".join(traceback.format_exception_only(
+                type(exc), exc)).strip()
+            self.write_log("ERROR opening the chart: " + msg)
+            messagebox.showerror("Could not open the chart", msg)
+            return
+        self.status.set(f"Viewing {' vs '.join(res.data.columns)}")
+
     def generate(self):
         if not self.selected:
             messagebox.showinfo("Nothing selected",
@@ -1301,6 +1426,7 @@ class App(tk.Tk):
                 "against.\n\nGenerate anyway?"):
             return
         self.go.configure(state="disabled")
+        self.view_btn.configure(state="disabled")
         self.status.set("Working ...")
 
         # Snapshot every Tk variable HERE, on the main thread. Reading any of
@@ -1327,6 +1453,7 @@ class App(tk.Tk):
             # went uncaught before -- it escaped into the button handler and
             # left Generate greyed out with no explanation.
             self.go.configure(state="normal")
+            self._update_view_button(len(self.selected))
             self.status.set("Check the options.")
             messagebox.showerror("Bad input", str(e))
             return
@@ -1493,6 +1620,9 @@ class App(tk.Tk):
                     self.status.set(payload)
                 elif kind == "enable_go":
                     self.go.configure(state="normal")
+                    self._update_view_button(len(self.selected))
+                elif kind == "view":
+                    self.show_view(payload)
                 elif kind == "error":
                     self.status.set("Failed -- see log below.")
                     messagebox.showerror("Failed", payload)
