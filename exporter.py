@@ -210,7 +210,7 @@ def _write_stats_sheet(wb, result, cols, lag_table=None, reference=None):
 def _write_zscore_sheet(wb, result, cols):
     """Standardised copy, so series in different units share one axis."""
     ws = wb.create_sheet("normalized")
-    z = (result.data - result.data.mean()) / result.data.std(ddof=0)
+    z = sk.zscore(result.data)
 
     ws.cell(row=1, column=1, value="time (local)")
     for j, c in enumerate(cols, start=2):
@@ -693,7 +693,7 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws,
     # A z-score is unitless by construction, so every series already shares a
     # scale. Splitting it would defeat the only sheet that can compare shape
     # and timing across different units.
-    zframe = (result.data - result.data.mean()) / result.data.std(ddof=0)
+    zframe = sk.zscore(result.data)
     ws = wb.create_sheet("chart_zscore")
     ws.sheet_view.showGridLines = False
     ws.column_dimensions["A"].width = AXIS_COL_W

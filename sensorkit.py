@@ -697,6 +697,24 @@ def add_stratification_index(result: BuildResult) -> str | None:
     return label
 
 
+def zscore(frame: pd.DataFrame) -> pd.DataFrame:
+    """Standardise every column: (value - mean) / standard deviation.
+
+    A z-score is unitless by construction, which is the only reason series
+    measured in degC, metres and feet can share one frame and be compared by
+    shape and timing rather than by magnitude.
+
+    `ddof=0` is load-bearing, and it is why this is a function rather than an
+    expression written wherever it is needed. It is the POPULATION standard
+    deviation; pandas defaults to `ddof=1`. The two differ by a factor of
+    sqrt(n/(n-1)) -- at 1,081 rows that is 0.05%, small enough to read as
+    rounding and wrong in every value. A second caller that reimplemented this
+    from memory would produce a chart disagreeing with the workbook's z-score
+    sheet, and nothing in either would say so.
+    """
+    return (frame - frame.mean()) / frame.std(ddof=0)
+
+
 def lag_scan(data: pd.DataFrame, reference: str, interval: str,
              max_hours: float = 24.0) -> pd.DataFrame:
     """
