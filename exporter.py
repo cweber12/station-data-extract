@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+import identity
 import sensorkit as sk
 from openpyxl import Workbook
 from openpyxl.chart import LineChart, Reference, ScatterChart, Series
@@ -237,9 +238,6 @@ def _write_zscore_sheet(wb, result, cols):
     return ws
 
 
-SERIES_COLORS = ["2A78D6", "EB6834", "1BAF7A", "EDA100",
-                 "E87BA4", "4A3AA7", "E34948", "008300"]
-
 GRID = "D9D9D9"
 AXIS = "808080"
 EXCEL_EPOCH = datetime(1899, 12, 30)
@@ -376,18 +374,6 @@ def _add_line_series(ch, ws, col_ix, nrows, hexes, smooth=False):
         ser.graphicalProperties = GraphicalProperties(
             ln=LineProperties(solidFill=hexes[i], w=17000, cap="rnd"))
         ch.series.append(ser)
-
-
-def _series_colors(cols) -> dict:
-    """One colour per series, fixed by its position in the SELECTION.
-
-    Colour is the only thing tying a line on the raw panel to the same line on
-    the z-score sheet, so it cannot be assigned per chart. Once chart_raw split
-    into one panel per data type, per-chart assignment gave the first series of
-    every panel the same colour and moved series between colours from sheet to
-    sheet -- two different lies at once.
-    """
-    return {c: SERIES_COLORS[i % len(SERIES_COLORS)] for i, c in enumerate(cols)}
 
 
 # Horizontal scale. Width is a function of ELAPSED TIME, not of how many points
@@ -540,25 +526,6 @@ def _plot_chart(source_ws, col_ix, nrows, index, frame, y_cols, width,
     return _chrome(ch)
 
 
-def _legend_label(col, unit, mixed, geometry=""):
-    """
-    Trim the label to what identifies the series, then state WHERE IT SITS.
-
-    Depth and reference frame are not decoration. A reader comparing
-    `LJAC1 wtmp` with `46254 SST` has no way to know from the names that one is
-    bolted to a pier piling 3.4 m down and the other rides the sea surface on a
-    0.9 m sphere -- and that difference is most of the explanation for why they
-    disagree. So every legend entry carries `(depth, frame)`.
-    """
-    name = re.sub(r"\s*\([^)]*\)", "", col)          # (degree_Celsius)
-    name = re.sub(r"[,\s]*\u00b0\s*[FC]\b", "", name)    # ", degF"
-    name = re.sub(r"(^|\.)src_", r"\1", name)          # src_LJAC1 -> LJAC1
-    name = re.sub(r"\s{2,}", " ", name).strip(" ,.")
-    if mixed and unit:
-        name = f"{name} [{unit}]"
-    return f"{name} {geometry}".strip() if geometry else name
-
-
 def _write_header(ws, title, subtitle, col):
     """Title and subtitle sit beside the frozen axis, so they scroll with it."""
     letter = get_column_letter(col)
@@ -578,18 +545,19 @@ def _cell_legend(ws, cols, units, mixed, row, start_col, geometry=None,
     a narrow swatch column plus however many default-width columns its label
     needs, so nothing wraps and nothing collides.
     """
-    colors = colors or _series_colors(cols)
+    colors = colors or identity.series_colors(cols)
     ws.row_dimensions[row].height = LEGEND_ROW_PT
     col = start_col
     for i, c in enumerate(cols):
-        label = _legend_label(c, units.get(c, ""), mixed,
-                              (geometry or {}).get(c, ""))
+        label = identity.legend_label(c, units.get(c, ""), mixed,
+                                      (geometry or {}).get(c, ""))
         ws.column_dimensions[get_column_letter(col)].width = SWATCH_W
         sw = ws.cell(row=row, column=col)
         # The swatch must match the line it stands for, on every sheet.
         sw.fill = PatternFill("solid",
                               fgColor=colors[c] if c in colors
-                              else SERIES_COLORS[i % len(SERIES_COLORS)])
+                              else identity.SERIES_COLORS[
+                                  i % len(identity.SERIES_COLORS)])
 
         cell = ws.cell(row=row, column=col + 1, value=label)
         cell.font = Font(name="Arial", size=9)
@@ -686,7 +654,7 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws,
     groups = _unit_groups(result, cols)
     # One colour per series for the whole workbook, so a line keeps its
     # identity from the raw panel to the z-score sheet to the legends.
-    colors = _series_colors(cols)
+    colors = identity.series_colors(cols)
 
     subtitle = (f"{result.interval} {result.aggregation} \u00b7 "
                 f"{lo:%Y-%m-%d %H:%M} to {hi:%Y-%m-%d %H:%M} local \u00b7 "
@@ -823,7 +791,7 @@ def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
     frame = result.data[derived]
     idx = [3 + cols.index(c) for c in derived]
     # Same colours as everywhere else -- the index appears on chart_raw too.
-    colors = _series_colors(cols)
+    colors = identity.series_colors(cols)
     dhex = [colors[c] for c in derived]
 
     ws.add_chart(_axis_chart(data_ws, idx, n,
