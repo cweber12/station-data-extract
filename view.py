@@ -54,6 +54,7 @@ LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 # ---------------------------------------------------------------------------
 try:
     import matplotlib
+    import numpy as np
     matplotlib.use("TkAgg")
     import matplotlib.dates as mdates
     from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
@@ -62,7 +63,7 @@ try:
     from matplotlib.widgets import SpanSelector
     IMPORT_ERROR: Exception | None = None
 except Exception as exc:                       # pragma: no cover - environment
-    matplotlib = mdates = None
+    matplotlib = mdates = np = None
     FigureCanvasTkAgg = NavigationToolbar2Tk = Figure = None
     SpanSelector = None
     IMPORT_ERROR = exc
@@ -501,7 +502,7 @@ class ViewWindow(tk.Toplevel):
             ax, self._on_span_select, "horizontal",
             onmove_callback=self._on_span_move,
             useblit=False, button=1, minspan=0,
-            snap_values=self._xnum or None,
+            snap_values=self._xsnap if len(self._xsnap) else None,
             props=dict(facecolor="#808080", alpha=0.20),
         )
 
@@ -808,6 +809,10 @@ class ViewWindow(tk.Toplevel):
         # array so that `annotations.snap_span` stays pure-Python and can be
         # exercised with no numeric stack present at all.
         self._xnum = [float(v) for v in mdates.date2num(x)]
+        # matplotlib's own snapping does arithmetic on this directly, so it
+        # needs the array form. Kept separate rather than converting _xnum,
+        # which several pure-Python callers walk.
+        self._xsnap = np.asarray(self._xnum, dtype=float)
 
         fig = Figure(figsize=(11.5, 5.0), dpi=100)
         ax = fig.add_subplot(111)
@@ -1044,6 +1049,20 @@ def _main(argv=None):
     # ---- marking ----------------------------------------------------------
     checks.append(("this window's local axis ascends, so marking is on",
                    win.descent is None and win.span is not None))
+
+    # matplotlib snaps by doing arithmetic on snap_values, so a list raises
+    # inside _set_extents -- and the CallbackRegistry swallows it, leaving the
+    # rubber band silently not snapping. Asserted by exercising it.
+    try:
+        win.span._set_extents((win._xnum[10] + 0.001, win._xnum[20] + 0.001))
+        snapped = tuple(float(v) for v in win.span.extents)
+        rubber_ok = (abs(snapped[0] - win._xnum[10]) < 1e-9
+                     and abs(snapped[1] - win._xnum[20]) < 1e-9)
+    except Exception as exc:
+        snapped, rubber_ok = repr(exc), False
+    win.span.set_visible(False)
+    checks.append((f"the drag rubber band snaps to samples too, so what is "
+                   f"drawn is what would be stored [{snapped}]", rubber_ok))
 
     i0, i1 = 20, 40
     want0, want1 = res.data.index[i0], res.data.index[i1]
