@@ -415,8 +415,19 @@ class ViewWindow(tk.Toplevel):
         self.annotations_dir = annotations_dir
 
         self.title(self._title_text(study))
-        self.geometry("1180x680")
-        self.minsize(720, 420)
+        # Open filling the screen. Everything this window has to SAY sits below
+        # the chart -- the omitted-region counts, the missing-ghost error, the
+        # control for showing another pair's regions -- and a fixed 1180x680
+        # was smaller than its own content, so those were not merely cramped,
+        # they were never mapped. A window whose controls are off the bottom is
+        # the same failure as the dialog that was populated but withdrawn.
+        self.geometry(f"{max(900, self.winfo_screenwidth() - 60)}x"
+                      f"{max(560, self.winfo_screenheight() - 120)}+20+20")
+        try:
+            self.state("zoomed")            # a real maximise where there is one
+        except tk.TclError:                 # pragma: no cover - platform
+            pass
+        self.minsize(900, 620)
         # Never become transient for a master that is not on screen, or this
         # window inherits its withdrawn state and is built but never seen.
         if parent is not None and parent.winfo_viewable():
@@ -444,14 +455,20 @@ class ViewWindow(tk.Toplevel):
         self._draw_marks()
         self._refresh_legend()
 
-        # Chart on the left, the list of marks on the right. The list is not a
-        # convenience: an occurrence clipped out of this window is drawn
-        # nowhere, so without it there would be no way to select one, and no
-        # way to delete it short of rebuilding a wider window.
+        # PACKING ORDER IS LOAD-BEARING, and this is the whole of a bug that
+        # shipped twice. Tk gives space to the slaves packed FIRST. The chart
+        # expands, so packed first it takes everything and every fixed-height
+        # row below it is allocated nothing -- not squeezed, NOT MAPPED. At
+        # 1180x680 the content needed 754 px and the overlay controls, both
+        # status lines and the buttons were simply absent from the window, so
+        # "the omitted count is reported in the window" was true only for
+        # someone who thought to drag it taller.
+        #
+        # So the furniture is packed against the bottom FIRST, in reverse
+        # visual order, and the chart is packed last and takes what is left.
+        # It cannot push anything off, because there is nothing left to push.
         body = ttk.Frame(frame)
-        body.pack(fill="both", expand=True)
         left = ttk.Frame(body)
-        left.pack(side="left", fill="both", expand=True)
 
         canvas = FigureCanvasTkAgg(self.figure, master=left)
         self.canvas = canvas
@@ -466,7 +483,13 @@ class ViewWindow(tk.Toplevel):
 
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
+        # The list claims its width, then the chart takes the rest. The same
+        # rule as the rows below, and the same bug it prevents: the figure asks
+        # for 1150 px and expands, so packed first it took the lot and the list
+        # was allocated 10 px and never mapped. A window had to be dragged
+        # wider than this screen before the list appeared at all.
         self._build_mark_list(body)
+        left.pack(side="left", fill="both", expand=True)
 
         # The readout sits directly under the chart because it is read WHILE
         # dragging, not after. Its whole purpose is that the hour being aimed
@@ -474,14 +497,12 @@ class ViewWindow(tk.Toplevel):
         # `mm-dd` is the thing this feature replaces.
         self.span_text = tk.StringVar(value=SPAN_HINT)
         readout = ttk.Frame(frame)
-        readout.pack(fill="x", pady=(6, 0))
         ttk.Label(readout, textvariable=self.span_text,
                   font=("Segoe UI", 10)).pack(side="left")
 
         self._install_span_selector()
 
         note = ttk.Frame(frame)
-        note.pack(fill="x", pady=(8, 0))
         ttk.Label(note, text=self._coverage_note(),
                   foreground="#777").pack(side="left")
         ttk.Button(note, text="Close", command=self.destroy).pack(side="right")
@@ -494,7 +515,6 @@ class ViewWindow(tk.Toplevel):
         self.bind("<Delete>", lambda _e: self.prompt_delete())
 
         marks = ttk.Frame(frame)
-        marks.pack(fill="x", pady=(2, 0))
         self.marks_label = ttk.Label(
             marks, text=self.marks_note, wraplength=1100, justify="left",
             foreground="#B4531A" if self._marks_need_attention() else "#777")
@@ -504,7 +524,6 @@ class ViewWindow(tk.Toplevel):
         # with this pair -- see annotations.eligible_overlays for why that is
         # the rule rather than "everything in the study".
         controls = ttk.Frame(frame)
-        controls.pack(fill="x", pady=(8, 0))
         ttk.Label(controls, text="Borrow marks from:").pack(side="left")
         self.overlay_var = tk.StringVar()
         self.overlay_box = ttk.Combobox(controls, textvariable=self.overlay_var,
@@ -524,11 +543,18 @@ class ViewWindow(tk.Toplevel):
         # than appended to the marks note: the counts belong to different
         # pairs, and one sentence carrying both would attribute neither.
         borrowed = ttk.Frame(frame)
-        borrowed.pack(fill="x", pady=(2, 0))
         self.overlay_label = ttk.Label(
             borrowed, text=self.overlay_note, wraplength=1100, justify="left",
             foreground="#B4531A" if self._overlay_needs_attention() else "#777")
         self.overlay_label.pack(side="left")
+
+        # Bottom-up, then the chart. See the note above `body`.
+        borrowed.pack(side="bottom", fill="x", pady=(2, 0))
+        controls.pack(side="bottom", fill="x", pady=(8, 0))
+        marks.pack(side="bottom", fill="x", pady=(2, 0))
+        note.pack(side="bottom", fill="x", pady=(8, 0))
+        readout.pack(side="bottom", fill="x", pady=(6, 0))
+        body.pack(side="top", fill="both", expand=True)
 
         self._offer_ids = []
         self._refresh_overlay_controls()
@@ -1993,6 +2019,26 @@ def _main(argv=None):
 
     mapped = bool(win.winfo_ismapped())
     checks.append(("window is mapped", mapped))
+
+    # Asserted at the size the window OPENS at, never after a resize -- being
+    # visible only to someone who thought to drag the window bigger is what
+    # made this invisible for three slices. Tk allocates space to the slaves
+    # packed first, so an expanding chart packed first left every fixed-height
+    # row below it unmapped, including the two lines that carry the counts
+    # this feature promises to report.
+    furniture = {"overlay dropdown": win.overlay_box,
+                 "Overlay button": win.overlay_btn,
+                 "Remove button": win.remove_btn,
+                 "Delete button": win.delete_btn,
+                 "regions note": win.overlay_label,
+                 "marks note": win.marks_label,
+                 "the regions list": win.mark_tree}
+    absent = [n for n, w in furniture.items() if not w.winfo_ismapped()]
+    checks.append((f"every control and status line is on screen at the size "
+                   f"the window opens at "
+                   f"[{len(furniture) - len(absent)}/{len(furniture)}"
+                   f"{'; MISSING ' + ', '.join(absent) if absent else ''}]",
+                   not absent))
 
     expected = sk.zscore(res.data)
     drawn = win.plotted()
