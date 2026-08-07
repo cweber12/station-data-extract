@@ -503,8 +503,13 @@ class ViewWindow(tk.Toplevel):
             onmove_callback=self._on_span_move,
             useblit=False, button=1, minspan=0,
             snap_values=self._xsnap if len(self._xsnap) else None,
+            # Edge handles, so a selected mark can be adjusted by dragging its
+            # ends. Turned on only now that dragging one does something.
+            interactive=True,
+            handle_props=dict(color="#404040", linewidth=1.6),
             props=dict(facecolor="#808080", alpha=0.20),
         )
+        self.span.set_visible(False)
 
         # Click-to-select needs its own handlers rather than riding on
         # onselect: a zero-span click only reaches onselect when a selection
@@ -557,11 +562,18 @@ class ViewWindow(tk.Toplevel):
         self._restyle_bands()
 
         if entry is None:
+            self.span.set_visible(False)
             self.selection = None
             self.span_text.set(SPAN_HINT)
             self.canvas.draw_idle()
             return None
 
+        # Put the selector's handles ON the chosen band, so its edges are what
+        # a drag adjusts. Setting extents marks the selection completed, which
+        # is what makes the handles live.
+        self.span.set_visible(True)
+        self.span.extents = (self._to_num(entry.interval.start_utc),
+                             self._to_num(entry.interval.end_utc))
         self.selection = (entry.interval.start_utc, entry.interval.end_utc)
         self._selected_indices = self._indices_for(entry.interval)
         self.span_text.set(self._selected_summary(entry))
@@ -618,11 +630,44 @@ class ViewWindow(tk.Toplevel):
                 f"Shorter than one {self.result.interval} interval — "
                 f"nothing to mark.")
             return
-        self.span_text.set("Marking:  " + self._span_summary(*got))
+        verb = (f"Adjusting “{self.selected_band.markset.name}”:  "
+                if self._adjusting() else "Marking:  ")
+        self.span_text.set(verb + self._span_summary(*got))
+
+    def _adjusting(self) -> bool:
+        """True when this drag moved an edge of the selected mark.
+
+        `_active_handle` is set on press and cleared AFTER onselect fires, so
+        it is still readable here -- which is the only thing distinguishing an
+        adjustment from a brand new region, since both arrive as one span.
+        """
+        return (self.selected_band is not None
+                and getattr(self.span, "_active_handle", None) is not None)
 
     def _on_span_select(self, x0: float, x1: float):
-        """On release: record the region, then ask what it means."""
+        """On release: adjust the selected mark, or start a new one."""
         got = self.span_interval(x0, x1)
+
+        if self._adjusting():
+            if got is None:
+                # Dragged an edge past the other one. Refuse and snap back,
+                # rather than storing a mark with no duration.
+                self.select_band(self.selected_band)
+                self.span_text.set(
+                    f"An edge cannot cross the other one — a mark has to be at "
+                    f"least one {self.result.interval} long. Nothing changed.")
+                return
+            try:
+                ms = self.adjust_selected(got[0], got[1])
+            except Exception as exc:
+                messagebox.showerror("Could not adjust the mark", str(exc),
+                                     parent=self)
+                self.redraw_marks()
+                return
+            self.span_text.set(
+                f"Adjusted “{ms.name}”:  {self._span_summary(*got)}")
+            return
+
         self.selection = None if got is None else (got[0], got[1])
         if got is None:
             self.span_text.set(
@@ -686,6 +731,42 @@ class ViewWindow(tk.Toplevel):
             coverage=self.coverage_for(i0, i1), tz=str(LOCAL_TZ))
         self.redraw_marks()
         return ms
+
+    def adjust_selected(self, start_utc, end_utc):
+        """Move the selected occurrence's edges, and write. Returns the set.
+
+        The seam for adjusting, matching commit_mark for creating: no UI above
+        this line, so the rule can be exercised without a window being dragged.
+
+        Coverage is RECOMPUTED, never carried over. It describes the marked
+        window, and moving an edge makes the stored numbers describe a window
+        that no longer exists.
+        """
+        entry = self.selected_band
+        if entry is None:
+            raise RuntimeError("no mark is selected")
+        if self.store is None:
+            raise RuntimeError("this window has nowhere to store a mark")
+
+        i0, i1 = ann.snap_span(self._to_num(start_utc),
+                               self._to_num(end_utc), self._xnum)
+        ms = self.store.update_interval(
+            entry.markset.set_id,
+            entry.interval.start_utc, entry.interval.end_utc,
+            start_utc=start_utc, end_utc=end_utc,
+            coverage=self.coverage_for(i0, i1))
+        self.redraw_marks()
+        self.select_interval(ms.set_id, start_utc, end_utc)
+        return ms
+
+    def select_interval(self, set_id: str, start_utc, end_utc):
+        """Re-select an occurrence by VALUE after the bands were rebuilt."""
+        for entry in self.bands:
+            if (entry.markset.set_id == set_id
+                    and entry.interval.start_utc == start_utc
+                    and entry.interval.end_utc == end_utc):
+                return self.select_band(entry)
+        return None
 
     def redraw_marks(self):
         """Reload from disk and repaint. The file is the source of truth."""
@@ -1375,6 +1456,70 @@ def _main(argv=None):
                        win.selected_band is not None))
         checks.append(("a click did not create a mark",
                        len(win.bands) == 3))
+
+        # ---- adjusting the selected mark -----------------------------------
+        entry = win.select_band(win.bands[0])
+        was = (entry.interval.start_utc, entry.interval.end_utc)
+        set_id = entry.markset.set_id
+        neighbours = [(b.markset.set_id, b.interval.start_utc,
+                       b.interval.end_utc) for b in win.bands[1:]]
+
+        checks.append(("selecting puts the selector's handles on the mark, so "
+                       "its edges are what a drag moves",
+                       win.span.get_visible()
+                       and win.span.extents
+                       == (win._to_num(was[0]), win._to_num(was[1]))))
+
+        # Move the start earlier by 10 samples and the end later by 5.
+        i0, i1 = win._indices_for(entry.interval)
+        new = (win._utc[i0 - 10], win._utc[i1 + 5])
+        adjusted = win.adjust_selected(*new)
+
+        checks.append((f"the adjusted interval is what the window now shows "
+                       f"[{ann.local_text(new[0])} → {ann.local_text(new[1])}]",
+                       win.selection == new
+                       and win.selected_band is not None
+                       and (win.selected_band.interval.start_utc,
+                            win.selected_band.interval.end_utc) == new))
+        on_disk = ann.Store(tmp).load_file(tmp / f"{set_id}.json")
+        checks.append(("round trip after an edit returns what the window shows",
+                       any((i.start_utc, i.end_utc) == new
+                           for i in on_disk.intervals)
+                       and not any((i.start_utc, i.end_utc) == was
+                                   for i in on_disk.intervals)))
+        checks.append((f"the occurrence count did not change "
+                       f"[{len(on_disk.intervals)}]",
+                       len(on_disk.intervals) == len(adjusted.intervals)))
+        checks.append(("the other occurrences were not touched",
+                       all(n in [(b.markset.set_id, b.interval.start_utc,
+                                  b.interval.end_utc) for b in win.bands]
+                           for n in neighbours)))
+
+        edited = next(i for i in on_disk.intervals
+                      if (i.start_utc, i.end_utc) == new)
+        want_cov = win.coverage_for(*win._indices_for(edited))
+        checks.append((f"coverage was RECOMPUTED for the new window, not "
+                       f"carried over {edited.coverage}",
+                       edited.coverage == want_cov
+                       and edited.coverage != cov))
+
+        band = win.selected_band.patch
+        checks.append(("the band on the chart moved with it",
+                       abs(band.get_x() - win._to_num(new[0])) < 1e-6
+                       and abs(band.get_x() + band.get_width()
+                               - win._to_num(new[1])) < 1e-6))
+
+        # An edge dragged past the other one must change nothing.
+        before_bytes = (tmp / f"{set_id}.json").read_bytes()
+        win.span._active_handle = "min"          # as a real handle drag leaves it
+        win._on_span_select(win._to_num(new[0]), win._to_num(new[0]))
+        win.span._active_handle = None
+        checks.append((f"an edge dragged past the other is refused and nothing "
+                       f"is written [{win.span_text.get()[:46]}...]",
+                       (tmp / f"{set_id}.json").read_bytes() == before_bytes
+                       and "cannot cross" in win.span_text.get()))
+        checks.append(("and the mark stays selected at its stored extent",
+                       win.selection == new))
 
         lo, hi = win.figure.axes[0].get_xlim()
         first, last = win._xnum[0], win._xnum[-1]
