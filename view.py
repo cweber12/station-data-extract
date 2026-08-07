@@ -2780,8 +2780,43 @@ def _main(argv=None):
                        f"[{win.mark_tree.item(row, 'values')}]",
                        win.mark_tree.item(row, "values")[0] == "outside"))
 
-        win.mark_tree.selection_set(row)
-        win._on_row_selected()
+        # Drive the list the way a click does: selection_set, then update() so
+        # Tk delivers the queued <<TreeviewSelect>> itself. Calling
+        # _on_row_selected by hand -- what this gate used to do -- skips the
+        # only part of the path that ever broke, and a runaway re-entry
+        # shipped straight past it. The chart checks above already drive real
+        # MouseEvents through canvas.callbacks.process; this is the same rule,
+        # finally applied to the list.
+        #
+        # BOUNDED, because an unbounded runaway hangs update() forever and a
+        # gate that hangs reads as a slow machine. Past the bound the wrapper
+        # stops feeding the real handler, so the loop starves, update()
+        # returns, and the count fails the check instead.
+        row_calls = [0]
+        ROW_CALL_BOUND = 20
+        _row_handler = win._on_row_selected
+
+        def _counted_row_select(event=None):
+            row_calls[0] += 1
+            if row_calls[0] > ROW_CALL_BOUND:
+                return
+            return _row_handler(event)
+
+        win.mark_tree.bind("<<TreeviewSelect>>", _counted_row_select)
+        row_counts = []
+
+        def pick_row(target):
+            """Select a row through Tk. Returns how many times it dispatched."""
+            win.update()            # drain anything already queued
+            row_calls[0] = 0
+            win.mark_tree.selection_set(target)
+            win.update()            # deliver the queued event, and its answers
+            row_counts.append(row_calls[0])
+            return row_calls[0]
+
+        n = pick_row(row)
+        checks.append((f"picking a row runs the handler ONCE through the real "
+                       f"Tk event, not by hand [{n} dispatch(es)]", n == 1))
         checks.append(("picking that row selects the occurrence",
                        win.selected_band is offscreen))
         checks.append((f"the readout says why it has no handles "
@@ -2796,8 +2831,7 @@ def _main(argv=None):
         checks.append((f"adjusting it is refused, saying what to do instead "
                        f"[{why}...]", adjust_refused))
 
-        win.mark_tree.selection_set(row)
-        win._on_row_selected()
+        pick_row(row)
         gone = win.delete_selected()
         still_there = any(o.markset.name == "long ago" and o.patch is None
                           for o in win.occurrences)
@@ -2812,11 +2846,19 @@ def _main(argv=None):
         checks.append(("selecting on the chart highlights the matching row",
                        bool(sel) and win._row_for.get(sel[0]) is drawn_one))
         header = win.mark_tree.parent(sel[0])
-        win.mark_tree.selection_set(header)
-        win._on_row_selected()
+        pick_row(header)
         checks.append(("picking a set header selects nothing, rather than "
                        "guessing which occurrence was meant",
                        win.selected_band is None))
+
+        # The regression this issue is about is a COUNT, not a wrong value:
+        # every check above passes just as well when the handler ran sixty
+        # times on its way there. Assert the count itself, once, over every
+        # selection the gate made.
+        worst = max(row_counts) if row_counts else 0
+        checks.append((f"no list selection re-entered -- every one dispatched "
+                       f"at most once [{row_counts}]",
+                       bool(row_counts) and worst <= 1))
 
         lo, hi = win.figure.axes[0].get_xlim()
         first, last = win._xnum[0], win._xnum[-1]
