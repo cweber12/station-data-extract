@@ -26,13 +26,19 @@ EXACTLY TWO SERIES
     unit -- is deliberately NOT inherited. Temperature against water level is
     the intended use, and it is legitimate because a z-score is unitless.
 
-BORROWING A SET FROM ANOTHER PAIR
-    A set drawn on a DIFFERENT pair can be overlaid here when it shares exactly
+SHOWING A SET MARKED ON ANOTHER PAIR
+    A set marked on a DIFFERENT pair can be shown here when it shares exactly
     one series with what is on screen, because then its other member is a
-    candidate explanation that is not currently plotted. Its bands are drawn
-    unfilled and hatched, the legend names the pair they came from, and the
-    absent member is fetched by its stable key and drawn as a faint dashed
-    ghost line.
+    candidate explanation that is not currently plotted. Its regions are drawn
+    as open brackets rather than as shaded blocks, the legend names the pair
+    they were marked on, and the absent member is fetched by its stable key and
+    drawn as a faint solid ghost line.
+
+    The word "borrowed" was used for this throughout an earlier revision and is
+    gone from everything a user reads: it named the mechanism rather than the
+    thing, and someone opening the window for the first time could not act on
+    it. Internal identifiers still say `foreign` and `overlay`; see
+    docs/adr/0002 for why the code's vocabulary and the screen's differ.
 
     THE CORRELATING IS DONE BY EYE, DELIBERATELY. Nothing here computes a
     relationship between the borrowed series and the plotted ones. An earlier
@@ -518,7 +524,7 @@ class ViewWindow(tk.Toplevel):
         ttk.Label(note, text=self._coverage_note(),
                   foreground="#777").pack(side="left")
         ttk.Button(note, text="Close", command=self.destroy).pack(side="right")
-        self.delete_btn = ttk.Button(note, text="Delete mark",
+        self.delete_btn = ttk.Button(note, text="Delete region",
                                      command=self.prompt_delete,
                                      state="disabled")
         self.delete_btn.pack(side="right", padx=(0, 6))
@@ -536,15 +542,15 @@ class ViewWindow(tk.Toplevel):
         # with this pair -- see annotations.eligible_overlays for why that is
         # the rule rather than "everything in the study".
         controls = ttk.Frame(frame)
-        ttk.Label(controls, text="Borrow marks from:").pack(side="left")
+        ttk.Label(controls, text="Show regions from another pair:").pack(side="left")
         self.overlay_var = tk.StringVar()
         self.overlay_box = ttk.Combobox(controls, textvariable=self.overlay_var,
                                         state="readonly", width=62)
         self.overlay_box.pack(side="left", padx=(6, 6))
-        self.overlay_btn = ttk.Button(controls, text="Overlay",
+        self.overlay_btn = ttk.Button(controls, text="Show on chart",
                                       command=self.prompt_overlay)
         self.overlay_btn.pack(side="left")
-        self.remove_btn = ttk.Button(controls, text="Remove overlay",
+        self.remove_btn = ttk.Button(controls, text="Stop showing",
                                      command=self.prompt_remove_overlay,
                                      state="disabled")
         self.remove_btn.pack(side="left", padx=(6, 0))
@@ -602,7 +608,7 @@ class ViewWindow(tk.Toplevel):
         # "in this view", not "on this pair": once a set can be borrowed from
         # another pair, the older heading would be a small lie about half the
         # rows under it.
-        ttk.Label(right, text="Marks in this view",
+        ttk.Label(right, text="Regions of interest",
                   font=("Segoe UI", 9, "bold")).pack(anchor="w")
 
         holder = ttk.Frame(right)
@@ -610,8 +616,8 @@ class ViewWindow(tk.Toplevel):
         self.mark_tree = ttk.Treeview(holder, columns=("where",),
                                       show="tree headings", height=16,
                                       selectmode="browse")
-        self.mark_tree.heading("#0", text="set / occurrence")
-        self.mark_tree.heading("where", text="")
+        self.mark_tree.heading("#0", text="Set / region")
+        self.mark_tree.heading("where", text="Status")
         self.mark_tree.column("#0", width=250, stretch=False)
         self.mark_tree.column("where", width=86, stretch=False, anchor="e")
         bar = ttk.Scrollbar(holder, orient="vertical",
@@ -644,7 +650,7 @@ class ViewWindow(tk.Toplevel):
                 foreign = entries[0].is_foreign
                 node = tree.insert("", "end",
                                    text=f"{ms.name}  ({len(entries)})",
-                                   values=("borrowed" if foreign else "",),
+                                   values=("other pair" if foreign else "",),
                                    tags=("borrowed",) if foreign else (),
                                    open=True)
                 for entry in entries:
@@ -897,11 +903,11 @@ class ViewWindow(tk.Toplevel):
                 self.mark_legend.append(
                     (Patch(facecolor="none", edgecolor="#" + ms.color,
                            linewidth=1.4),
-                     f"{ms.name}  ({len(pairs)}×)  ·  borrowed from "
+                     f"{ms.name}  ({len(pairs)}×)  ·  marked on "
                      f"{ms.pair_text}"))
 
-            line = (f"Borrowed “{ms.name}” from {ms.pair_text} — "
-                    f"{len(pairs)} band(s) drawn")
+            line = (f"“{ms.name}”, marked on {ms.pair_text} — "
+                    f"{len(pairs)} region(s) drawn")
             line += (f", {omitted} outside this window and NOT drawn."
                      if omitted else ".")
             lines.append(line)
@@ -1037,7 +1043,7 @@ class ViewWindow(tk.Toplevel):
         """
         if not self.ghost_problems:
             return ""
-        return ("The bands of the borrowed set ARE drawn, but the series they "
+        return ("The regions of that set ARE drawn, but the series they "
                 "were drawn against could not be fetched, so there is no "
                 "ghost line showing what it was doing:\n\n"
                 + "\n\n".join(self.ghost_problems[:5]))
@@ -1270,8 +1276,9 @@ class ViewWindow(tk.Toplevel):
             # Where it came from, on selection rather than only in the legend.
             # It is read-only here and the readout has to say so, or the first
             # thing anyone learns about the rule is that Delete did nothing.
-            text += (f"   ·   BORROWED from {entry.markset.pair_text}, so it "
-                     f"is read-only here — open that pair to change it.")
+            text += (f"   ·   marked on {entry.markset.pair_text}, not on this "
+                     f"pair, so it is read-only here — open that pair to "
+                     f"change it.")
             return text
         if entry.patch is None:
             # Say why there is nothing to drag, rather than leaving someone
@@ -1484,7 +1491,7 @@ class ViewWindow(tk.Toplevel):
         it happened.
         """
         return (f"{verb} “{entry.markset.name}” from here is refused: it is "
-                f"borrowed from {entry.markset.pair_text}, which is not the "
+                f"marked on {entry.markset.pair_text}, which is not the "
                 f"pair on this chart. It is drawn so you can see whether its "
                 f"windows line up with what is here, not to be edited through "
                 f"them. Open that pair to change it.")
@@ -1492,9 +1499,9 @@ class ViewWindow(tk.Toplevel):
     def _no_candidates_reason(self) -> str:
         """Why the dropdown is empty. Never merely disabled and silent."""
         if self.store is None:
-            return "There is no study here to borrow marks from."
-        return ("Nothing to borrow: no saved set in this study shares exactly "
-                "one series with this pair.")
+            return "There is no study here to show regions from."
+        return ("Nothing to show: no saved set in this study shares exactly one "
+                "series with this pair.")
 
     def _refresh_overlay_controls(self):
         """Rebuild the dropdown from the candidates. Selection survives it.
@@ -1549,14 +1556,14 @@ class ViewWindow(tk.Toplevel):
         try:
             cand = self.overlay(set_id)
         except Exception as exc:
-            messagebox.showerror("Could not borrow that set", str(exc),
+            messagebox.showerror("Could not show that set", str(exc),
                                  parent=self)
             return
         finally:
             self.configure(cursor="")
         self.span_text.set(
-            f"Borrowed “{cand.markset.name}” from {cand.markset.pair_text}. "
-            f"Its bands are outlined, not filled.")
+            f"Showing “{cand.markset.name}”, marked on {cand.markset.pair_text}. "
+            f"Its regions are bracketed, not shaded.")
         # A key that no longer resolves gets a dialog, not only the note under
         # the chart. The bands are drawn and attributed; what is missing is the
         # line showing what the borrowed pair's other series was doing, and
@@ -1576,7 +1583,7 @@ class ViewWindow(tk.Toplevel):
         name, pair_text = entry.markset.name, entry.markset.pair_text
         self.remove_overlay(entry.markset.set_id)
         self.span_text.set(
-            f"Stopped borrowing “{name}” from {pair_text}. Nothing was "
+            f"Stopped showing “{name}” from {pair_text}. Nothing was "
             f"deleted — the set is still saved on its own pair.")
 
     def overlay(self, set_id: str):
@@ -1591,7 +1598,7 @@ class ViewWindow(tk.Toplevel):
                      if c.markset.set_id == set_id), None)
         if cand is None:
             raise RuntimeError(
-                f"{set_id!r} cannot be borrowed onto this pair. A set is "
+                f"{set_id!r} cannot be shown on this pair. A set is "
                 f"offered only when it shares EXACTLY ONE series with what is "
                 f"on screen, in this study: sharing both makes it the same "
                 f"comparison, which loads as native marks, and sharing neither "
@@ -1679,7 +1686,7 @@ class ViewWindow(tk.Toplevel):
             # is already disabled. Says why rather than doing nothing, which
             # would read as a bug.
             messagebox.showinfo(
-                "Borrowed mark", self.foreign_refusal(self.selected_band,
+                "Region from another pair", self.foreign_refusal(self.selected_band,
                                                       "Deleting"), parent=self)
             return
         name = self.selected_band.markset.name
@@ -2869,7 +2876,7 @@ def _main(argv=None):
 
         legend = [t.get_text()
                   for t in win.figure.axes[0].get_legend().get_texts()]
-        attributed = [t for t in legend if "borrowed from" in t]
+        attributed = [t for t in legend if "marked on" in t]
         checks.append((f"the legend names the SOURCE PAIR of the borrowed set "
                        f"{attributed}",
                        len(attributed) == 1
@@ -2894,8 +2901,8 @@ def _main(argv=None):
         rows = [r for r, entry in win._row_for.items() if entry.is_foreign]
         parents = {win.mark_tree.item(win.mark_tree.parent(r), "values")[0]
                    for r in rows}
-        checks.append((f"the mark list flags the borrowed rows [{parents}]",
-                       len(rows) == 3 and parents == {"borrowed"}))
+        checks.append((f"the list flags rows from another pair [{parents}]",
+                       len(rows) == 3 and parents == {"other pair"}))
 
         # ---- a borrowed band is read-only -----------------------------------
         edge = foreign_bands[0]
@@ -2903,14 +2910,16 @@ def _main(argv=None):
         checks.append(("a borrowed band can be selected, so clicking one says "
                        "where it came from",
                        win.selected_band is edge))
-        checks.append((f"the readout says it is borrowed and names the pair "
-                       f"[...{win.span_text.get()[-72:]}]",
-                       "BORROWED" in win.span_text.get()
+        checks.append((f"the readout says which pair it was marked on, and "
+                       f"that it is read-only here "
+                       f"[...{win.span_text.get()[-78:]}]",
+                       "marked on" in win.span_text.get()
+                       and "read-only" in win.span_text.get()
                        and wl.markset.pair_text in win.span_text.get()))
         checks.append(("no adjust handles are put on it, so there is no drag "
                        "to have to refuse",
                        not win.span.get_visible()))
-        checks.append(("the Delete button is OFF for a borrowed mark",
+        checks.append(("the Delete button is OFF for a region from another pair",
                        str(win.delete_btn.cget("state")) == "disabled"))
 
         borrowed_bytes = (tmp / f"{wl.markset.set_id}.json").read_bytes()
@@ -3177,9 +3186,9 @@ def _main(argv=None):
                        sets_drawn == {"third series", "other pair"}
                        and len(win.overlays) == 2))
         checks.append((f"and the legend attributes BOTH "
-                       f"[{len([t for t in legend if 'borrowed from' in t])} "
+                       f"[{len([t for t in legend if 'marked on' in t])} "
                        f"attributed]",
-                       len([t for t in legend if "borrowed from" in t]) == 2))
+                       len([t for t in legend if "marked on" in t]) == 2))
 
         # Everything the visual review is about is on the chart at exactly this
         # point: this pair's own solid bands, two borrowed sets outlined and
@@ -3210,7 +3219,8 @@ def _main(argv=None):
         checks.append(("the dialog wording says the bands are drawn and the "
                        "ghost is not, and is readable without a modal box "
                        "standing in the way",
-                       "bands" in gmsg and "x::y::z" in gmsg
+                       "regions of that set ARE drawn" in gmsg
+                       and "x::y::z" in gmsg
                        and "no ghost line" in gmsg))
         checks.append((f"and the note under the chart says so too, in orange "
                        f"[{win._overlay_needs_attention()}]",
