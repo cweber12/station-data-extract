@@ -100,6 +100,26 @@ except Exception as exc:                       # pragma: no cover - environment
 SPAN_HINT = ("Drag across the chart to define a region.  "
              "Click a mark to select it.")
 
+# ---------------------------------------------------------------------------
+# How a region is drawn. One place, because the fill, the layering and the
+# ghost's grey are one decision: the ghost has to read against the region AND
+# against the white outside it, so moving either without the other breaks it.
+# ---------------------------------------------------------------------------
+REGION_FILL = "#000000"
+REGION_ALPHA = 0.40           # over white this renders about #999999
+REGION_ALPHA_SELECTED = 0.55  # selection darkens; it never changes the shape
+
+# Stacking, low to high. The region is a BACKDROP: above the grid, which it is
+# meant to cover, and below every line, which it may never obscure.
+Z_GRID = 0.2
+Z_REGION = 0.5
+Z_REGION_BAR = 0.7
+Z_GHOST = 1.5
+Z_SERIES = 2.0
+
+# The ghost's grey answers to REGION_ALPHA and must be re-chosen with it.
+GHOST_GREY = "#6E6E6E"
+
 UNAVAILABLE_MESSAGE = (
     "The chart view needs matplotlib, which is not installed.\n\n"
     "    pip install matplotlib\n\n"
@@ -966,61 +986,44 @@ class ViewWindow(tk.Toplevel):
         self._append_rejection_note()
 
     def _band_patch(self, ax, clamped, color: str, foreign: bool):
-        """(patch, decorations) for one region. A BLOCK, or a BRACKET.
+        """(patch, decorations) for one region. A solid block, and a bar.
 
-        This pair's own regions are a shaded block with the set's colour along
-        the TOP. A region marked on another pair is not shaded at all: two
-        edge rules and the set's colour along the BOTTOM -- an open bracket
-        rather than a block.
+        Every region is the same shape: a dark block with no border at all,
+        and the set's colour in a bar along one edge. The bar sits at the TOP
+        for this pair's own regions and at the BOTTOM for a region marked on
+        another pair. Position is now the whole of the distinction.
 
-        Shape carries the distinction, and position of the colour bar
-        reinforces it, because both survive a glance. The first version used a
-        diagonal hatch, and hatching is the loudest thing that can be put on a
-        chart: it competed with the data it was supposed to be pointing at.
+        NO EDGES, and that is the point of this treatment rather than an
+        omission from it. Edge rules in the set's colour were added when the
+        fill was 15% grey and a narrow region was genuinely invisible without
+        them. They solved that and caused a worse thing: two saturated
+        vertical lines per region, crossing the series lines at every region
+        boundary, which is exactly the visual noise a marked window is
+        supposed to cut through. A block dark enough to see does not need an
+        outline to be found, so the outline goes.
 
-        Nothing is obscured either way. Shading is deliberately light -- what
-        the series were doing INSIDE a marked window is the entire question,
-        and a dark block answers it by hiding the evidence. The set's colour
-        survives in the bar, which is what the legend swatch matches.
+        The fill is neutral -- black, not the set's colour. A coloured wash
+        would put a ninth and tenth hue on a chart that already carries one
+        per series, and the colour that identifies the set is carried by the
+        bar, which is what the legend swatch matches.
 
-        `patch` always spans the region even when it draws nothing visible, so
-        hit testing has one artist to ask whatever the treatment.
+        The block sits ABOVE the gridlines and BELOW the data. Gridlines
+        crossing a dark region are the same noise the edge rules were, and
+        the region is a backdrop: what the series were doing inside it is the
+        entire question, so nothing may be drawn over them.
 
-        EVERY REGION GETS EDGE RULES, and that is not decoration. At 1150 px
-        for a 45-day window an hour is 1.06 px, so a six-hour region -- an
-        ordinary one -- is 6 px wide. A fill alone at that width is a smudge
-        and a light one is nothing at all; the rules are what make a real
-        region findable. The first version of this dropped the edge the old
-        band had and narrow regions effectively disappeared.
-
-        Both kinds also carry a marker near the TOP, so every region on the
-        chart can be found by scanning one line rather than two. The
-        distinction lives in the fill and in the bar along the bottom, which a
-        region from another pair has and this pair's own does not.
+        `patch` always spans the region, so hit testing has one artist to ask
+        whatever the treatment.
         """
         x0, x1 = (self._to_axis(clamped.start_utc),
                   self._to_axis(clamped.end_utc))
-        if foreign:
-            patch = ax.axvspan(x0, x1, facecolor="none", edgecolor="none",
-                               linewidth=0, zorder=0.5)
-            # The bar along the BOTTOM is the identifying mark, and it is first
-            # so that anything asking "which bar is this" gets the one that
-            # distinguishes rather than the one that merely locates.
-            bar = ax.axvspan(x0, x1, ymin=0.0, ymax=0.025,
-                             facecolor="#" + color, linewidth=0, zorder=0.6)
-            tick = ax.axvspan(x0, x1, ymin=0.965, ymax=0.99,
-                              facecolor="#" + color, alpha=0.55, linewidth=0,
-                              zorder=0.6)
-            rules = [ax.axvline(x, color="#" + color, linewidth=1.6,
-                                zorder=0.6) for x in (x0, x1)]
-            return patch, (bar, tick, *rules)
-        patch = ax.axvspan(x0, x1, facecolor="#1A1A1A", alpha=0.15,
-                           edgecolor="none", linewidth=0, zorder=0.4)
-        bar = ax.axvspan(x0, x1, ymin=0.975, ymax=1.0, facecolor="#" + color,
-                         linewidth=0, zorder=0.6)
-        rules = [ax.axvline(x, color="#" + color, linewidth=1.1, zorder=0.6)
-                 for x in (x0, x1)]
-        return patch, (bar, *rules)
+        patch = ax.axvspan(x0, x1, facecolor=REGION_FILL,
+                           alpha=REGION_ALPHA, edgecolor="none",
+                           linewidth=0, zorder=Z_REGION)
+        lo, hi = (0.0, 0.022) if foreign else (0.978, 1.0)
+        bar = ax.axvspan(x0, x1, ymin=lo, ymax=hi, facecolor="#" + color,
+                         linewidth=0, zorder=Z_REGION_BAR)
+        return patch, (bar,)
 
     def _draw_native(self):
         """One band per interval, per set drawn on THIS pair."""
@@ -1117,13 +1120,20 @@ class ViewWindow(tk.Toplevel):
                     Band(patch, ms, original, clamped, candidate=cand,
                          decorations=extra))
                 any_drawn = True
-            # An OPEN swatch, answering the filled one this pair's own sets
-            # get: the same distinction the bands make, made again where the
-            # names are read.
+            # FILLED, the same as this pair's own. The open swatch this used to
+            # be answered the open bracket the bands used to be drawn as, and
+            # both regions are now the same block. A swatch still claiming a
+            # distinction the chart no longer makes would send someone looking
+            # for an outline that is not there.
+            #
+            # The distinction is not lost: it is the bar's position on the
+            # chart, and in the legend it is the "marked on <pair>" that
+            # follows the name -- which says it in words rather than asking
+            # anyone to decode a swatch.
             if any_drawn:
                 self.mark_legend.append(
-                    (Patch(facecolor="none", edgecolor="#" + ms.color,
-                           linewidth=1.4),
+                    (Patch(facecolor="#" + ms.color, alpha=0.85,
+                           edgecolor="none"),
                      f"{ms.name}  ({len(pairs)}×)  ·  marked on "
                      f"{ms.pair_text}"))
 
@@ -1172,14 +1182,19 @@ class ViewWindow(tk.Toplevel):
             # reader must not be able to mistake it for one of the two series
             # being compared, and colour is the only thing identifying a line
             # on a chart whose y axis has no units.
-            # Solid, mid grey, under the series lines. It was dashed once, and
-            # a dashed line plus hatched bands put two competing textures on a
-            # chart whose whole job is showing the shape of two lines. Mid grey
-            # rather than light: a light line reads beautifully inside a shaded
-            # region and vanishes outside it, so the one line you are meant to
-            # follow end to end would fade in and out along its length.
-            ghost.line, = ax.plot(ghost.x, ghost.values, color="#6E6E6E",
-                                  linewidth=1.3, zorder=1.5, label=ghost.label)
+            # Solid, under the series lines. It was dashed once, and a dashed
+            # line plus hatched bands put two competing textures on a chart
+            # whose whole job is showing the shape of two lines.
+            #
+            # The grey has to work TWICE, which is what makes it delicate: it
+            # must stay visible against a dark region and stay muted against
+            # the white outside one, or the single line you are meant to
+            # follow end to end fades in and out along its length. See
+            # GHOST_GREY -- it is chosen against REGION_ALPHA and cannot be
+            # moved independently of it.
+            ghost.line, = ax.plot(ghost.x, ghost.values, color=GHOST_GREY,
+                                  linewidth=1.3, zorder=Z_GHOST,
+                                  label=ghost.label)
             ghost.borrowers = tuple(names)
             self.ghosts.append(ghost)
             self.mark_legend.append((ghost.line, ghost.label))
@@ -1607,26 +1622,21 @@ class ViewWindow(tk.Toplevel):
     def _restyle_bands(self):
         """The selected region reads as selected, without changing what it is.
 
-        A selected region from another pair stays an open bracket, and a
-        selected one of this pair's own stays a block. Selection is not allowed
-        to be the one moment the two look alike.
+        Selection DARKENS, and does nothing else. It does not add an outline,
+        because an outline appearing on click is the same noise this treatment
+        removed, arriving one region at a time. It does not recolour the fill
+        either: the fill is neutral for every region, and a selected one that
+        turned the set's colour would be the only coloured block on the chart
+        and would read as a different kind of thing.
+
+        Both kinds restyle identically, and their bar positions are what still
+        tell them apart -- selection is not allowed to be the one moment the
+        two look alike, and now it cannot be, because it does not touch shape.
         """
         for entry in self.bands:
             chosen = entry is self.selected_band
-            if entry.is_foreign:
-                # The edge RULES only. A colour bar is a patch and also has a
-                # linewidth, and giving it one draws a border round the bar
-                # that appears from nowhere the moment a region is selected.
-                for art in entry.decorations:
-                    if hasattr(art, "get_xdata"):
-                        art.set_linewidth(2.6 if chosen else 1.6)
-                # A faint wash only while selected, so the bracket still reads
-                # as a bracket the rest of the time.
-                entry.patch.set_facecolor(
-                    "#" + entry.markset.color if chosen else "none")
-                entry.patch.set_alpha(0.12 if chosen else None)
-                continue
-            entry.patch.set_alpha(0.30 if chosen else 0.15)
+            entry.patch.set_alpha(REGION_ALPHA_SELECTED if chosen
+                                  else REGION_ALPHA)
 
     def _to_num(self, when) -> float:
         return float(mdates.date2num(self._to_axis(when)))
@@ -2192,13 +2202,20 @@ class ViewWindow(tk.Toplevel):
         self.series_lines = {}
         for c in self.cols:
             line, = ax.plot(x, self.zframe[c].to_numpy(), linewidth=1.4,
-                            color="#" + colors[c], label=labels[c])
+                            color="#" + colors[c], label=labels[c],
+                            zorder=Z_SERIES)
             self.series_lines[c] = line
 
         ax.set_ylabel("standard deviations")
         ax.set_xlabel("time (local)")
-        ax.grid(True, color="#D9D9D9", linewidth=0.8)
-        ax.axhline(0, color="#808080", linewidth=0.8)
+        # UNDER the regions, both of them. A gridline or a zero rule crossing
+        # a dark region is the same noise the region's own edges were, and the
+        # region is a backdrop rather than an overlay. `axisbelow` is what
+        # moves the grid; without it matplotlib draws it at 1.5, above any
+        # patch, and the region would be striped whatever zorder it asked for.
+        ax.set_axisbelow(True)
+        ax.grid(True, color="#D9D9D9", linewidth=0.8, zorder=Z_GRID)
+        ax.axhline(0, color="#808080", linewidth=0.8, zorder=Z_GRID)
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
 
@@ -3382,22 +3399,53 @@ def _main(argv=None):
                        bool(native_before)
                        and native_state() == native_before))
 
-        # Read off the AXES. What is on the chart is the claim being made, and
-        # the distinction this issue is HITL for is a property of the artists.
-        # A BLOCK against a BRACKET: shape carries it, so the assertions are
-        # about fill and about where the colour bar sits, not about texture.
+        # Read off the AXES. What is on the chart is the claim being made.
+        # EVERY region is now the same shape -- a neutral block, no border --
+        # and the bar's position is the entire distinction, so that is what
+        # these assert.
+        every = native_bands + foreign_bands
         fill_alpha = [b.patch.get_facecolor()[3] for b in foreign_bands]
         native_fill = [b.patch.get_facecolor()[3] for b in native_bands]
-        checks.append((f"a region from another pair is UNFILLED where this "
-                       f"pair's own are shaded [fill {fill_alpha} vs "
-                       f"{native_fill}]",
+        checks.append((f"every region is filled the SAME, borrowed or not -- "
+                       f"the fill no longer carries the distinction "
+                       f"[{native_fill} vs {fill_alpha}]",
                        bool(foreign_bands) and bool(native_bands)
-                       and all(a == 0 for a in fill_alpha)
-                       and all(0 < a < 0.4 for a in native_fill)))
-        checks.append((f"the shading is light enough that the data underneath "
-                       f"survives it -- a dark block would hide the very thing "
-                       f"a marked window is asking about [{native_fill}]",
-                       all(a <= 0.2 for a in native_fill)))
+                       and len(set(native_fill + fill_alpha)) == 1))
+        neutral = {tuple(round(v, 4) for v in b.patch.get_facecolor()[:3])
+                   for b in every}
+        checks.append((f"and filled NEUTRALLY, not in the set's colour -- one "
+                       f"hue per series is already on this chart [{neutral}]",
+                       neutral == {(0.0, 0.0, 0.0)}))
+
+        # This replaces "the shading is light enough that the data survives".
+        # The old rule capped the fill because the fill was drawn over
+        # nothing in particular; the guarantee now comes from LAYERING, which
+        # holds at any darkness: the series are above the region, always.
+        region_z = max(b.patch.get_zorder() for b in every)
+        series_z = min(ln.get_zorder() for ln in win.series_lines.values())
+        checks.append((f"the data survives the block by being drawn ON TOP of "
+                       f"it, at any darkness [region z {region_z}, series z "
+                       f"{series_z}]", region_z < series_z))
+        grid_z = max(ln.get_zorder()
+                     for ln in win.figure.axes[0].get_ygridlines())
+        checks.append((f"and the gridlines are UNDER it, so no horizontal rule "
+                       f"crosses a region [grid z {grid_z}, region z "
+                       f"{region_z}]", grid_z < region_z))
+
+        # The whole point of the change: no borders. Two saturated vertical
+        # rules per region, crossing the series lines at every boundary, were
+        # the visual noise a marked window is supposed to cut through.
+        bordered = [b for b in every
+                    if b.patch.get_linewidth()
+                    or b.patch.get_edgecolor()[3] > 0]
+        strays = [a for b in every for a in b.decorations
+                  if hasattr(a, "get_xdata")]
+        checks.append((f"NO region has a border, and none has edge rules "
+                       f"[{len(bordered)} bordered, {len(strays)} rule(s)]",
+                       not bordered and not strays))
+        checks.append((f"each carries exactly one decoration, the colour bar "
+                       f"[{sorted({len(b.decorations) for b in every})}]",
+                       all(len(b.decorations) == 1 for b in every)))
         checks.append(("nothing is hatched any more, on either kind",
                        not any(b.patch.get_hatch()
                                for b in foreign_bands + native_bands)))
@@ -3418,50 +3466,30 @@ def _main(argv=None):
                        and all(v < 0.1 for v in foreign_bar_y)))
         set_rgb = {tuple(round(int(wl.markset.color[i:i + 2], 16) / 255, 4)
                          for i in (0, 2, 4))}
-        # The regression this exists to prevent: at 1150 px for a 45-day window
-        # an hour is about one pixel, so an ordinary six-hour region is 6 px
-        # wide and a fill alone is a smudge. Edge rules are what make a real
-        # region findable, and they were dropped once already.
-        def rules_of(band):
-            return [a for a in band.decorations if hasattr(a, "get_xdata")]
-
-        edged = []
-        for b in native_bands + foreign_bands:
-            rules = rules_of(b)
-            # The rule holds the naive local datetime it was drawn at; the
-            # span holds the same instant as a matplotlib date number.
-            at = sorted(float(mdates.date2num(r.get_xdata()[0]))
-                        for r in rules)
-            want = sorted((b.patch.get_x(),
-                           b.patch.get_x() + b.patch.get_width()))
-            edged.append(
-                len(rules) == 2
-                and all(abs(g - w) < 1e-6 for g, w in zip(at, want))
-                and all(r.get_color().lstrip("#").upper()
-                        == b.markset.color.upper() for r in rules))
-        checks.append((f"EVERY region has an edge rule at each of its bounds, "
-                       f"in its set's colour -- a fill alone is invisible at "
-                       f"the width of a real region [{len(edged)} regions]",
-                       bool(edged) and all(edged)))
-
-        def top_marks(band):
-            return [a for a in band.decorations
-                    if hasattr(a, "get_y") and a.get_y() > 0.9]
-
-        checks.append(("and a marker near the top, so every region on the "
-                       "chart is found by scanning one line rather than two",
-                       all(top_marks(b)
-                           for b in native_bands + foreign_bands)))
-
         checks.append(("and the bar carries the SET's colour, which is what "
                        "the legend swatch matches",
                        all(tuple(round(v, 4)
                                  for v in bar_of(b).get_facecolor()[:3])
                            in set_rgb for b in foreign_bands)))
-        checks.append(("a region from another pair is drawn ABOVE this pair's, "
-                       "so a coincidence between them still reads as both",
-                       min(b.patch.get_zorder() for b in foreign_bands)
-                       > max(b.patch.get_zorder() for b in native_bands)))
+
+        # The bar spans the region's full width, so it locates as well as
+        # identifies. Dropping the edge rules removed the other thing that
+        # marked where a region starts and stops, and a bar that only sat
+        # over part of it would leave that unanswered.
+        spans = all(abs(bar_of(b).get_x() - b.patch.get_x()) < 1e-9
+                    and abs(bar_of(b).get_width() - b.patch.get_width()) < 1e-9
+                    for b in every)
+        checks.append(("and spans the region's full width, which is what marks "
+                       "its bounds now that the edge rules are gone", spans))
+
+        # The narrow-region case the edge rules were added for. A six-hour
+        # region on a 45-day window is about 6 px, and the reason a fill alone
+        # was not enough at 15% grey. At this fill it is, and that is the
+        # trade being made -- so assert the fill is actually dark enough to
+        # see, rather than assuming it.
+        checks.append((f"the fill is dark enough to find a narrow region "
+                       f"without an outline [alpha {native_fill[0]:.2f}]",
+                       native_fill[0] >= 0.35))
 
         legend = [t.get_text()
                   for t in win.figure.axes[0].get_legend().get_texts()]
