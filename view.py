@@ -251,6 +251,7 @@ class ViewWindow(tk.Toplevel):
         self.selection: tuple | None = None
         self._selected_indices = (0, 0)
         self.bands = []
+        self.occurrences = []
         self.selected_band = None
 
         self.study = study
@@ -288,11 +289,21 @@ class ViewWindow(tk.Toplevel):
         self._load_marks()
         self._draw_marks()
         self._refresh_legend()
-        canvas = FigureCanvasTkAgg(self.figure, master=frame)
+
+        # Chart on the left, the list of marks on the right. The list is not a
+        # convenience: an occurrence clipped out of this window is drawn
+        # nowhere, so without it there would be no way to select one, and no
+        # way to delete it short of rebuilding a wider window.
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True)
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="both", expand=True)
+
+        canvas = FigureCanvasTkAgg(self.figure, master=left)
         self.canvas = canvas
         canvas.draw()
 
-        toolbar_holder = ttk.Frame(frame)
+        toolbar_holder = ttk.Frame(left)
         toolbar_holder.pack(fill="x")
         self.toolbar = NavigationToolbar2Tk(canvas, toolbar_holder,
                                             pack_toolbar=False)
@@ -300,6 +311,8 @@ class ViewWindow(tk.Toplevel):
         self.toolbar.pack(side="left")
 
         canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        self._build_mark_list(body)
 
         # The readout sits directly under the chart because it is read WHILE
         # dragging, not after. Its whole purpose is that the hour being aimed
@@ -340,6 +353,95 @@ class ViewWindow(tk.Toplevel):
         # ProgressDialog exists to prevent. The caller raises it once the
         # window is up; see report_rejections().
 
+    # ------------------------------------------------------------ mark list
+
+    def _build_mark_list(self, parent):
+        """Every occurrence on this pair, including the ones not drawn."""
+        right = ttk.Frame(parent, padding=(10, 0, 0, 0))
+        right.pack(side="right", fill="y")
+
+        ttk.Label(right, text="Marks on this pair",
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w")
+
+        holder = ttk.Frame(right)
+        holder.pack(fill="both", expand=True)
+        self.mark_tree = ttk.Treeview(holder, columns=("where",),
+                                      show="tree headings", height=16,
+                                      selectmode="browse")
+        self.mark_tree.heading("#0", text="set / occurrence")
+        self.mark_tree.heading("where", text="")
+        self.mark_tree.column("#0", width=250, stretch=False)
+        self.mark_tree.column("where", width=86, stretch=False, anchor="e")
+        bar = ttk.Scrollbar(holder, orient="vertical",
+                            command=self.mark_tree.yview)
+        self.mark_tree.configure(yscrollcommand=bar.set)
+        self.mark_tree.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+
+        self.mark_tree.tag_configure("offwindow", foreground="#B4531A")
+        self.mark_tree.bind("<<TreeviewSelect>>", self._on_row_selected)
+        self._row_for = {}
+        self._syncing = False
+        self.refresh_mark_list()
+
+    def refresh_mark_list(self):
+        """Rebuild the rows from `occurrences`. Sets are parents."""
+        tree = getattr(self, "mark_tree", None)
+        if tree is None:
+            return
+        self._syncing = True
+        try:
+            tree.delete(*tree.get_children())
+            self._row_for = {}
+            by_set = {}
+            for entry in self.occurrences:
+                by_set.setdefault(entry.markset.set_id, []).append(entry)
+            for set_id, entries in by_set.items():
+                ms = entries[0].markset
+                node = tree.insert("", "end",
+                                   text=f"{ms.name}  ({len(entries)})",
+                                   values=("",), open=True)
+                for entry in entries:
+                    iv = entry.interval
+                    outside = entry.patch is None
+                    row = tree.insert(
+                        node, "end",
+                        text=f"   {ann.local_text(iv.start_utc)} → "
+                             f"{ann.local_text(iv.end_utc)}",
+                        values=("outside" if outside else "",),
+                        tags=("offwindow",) if outside else ())
+                    self._row_for[row] = entry
+        finally:
+            self._syncing = False
+        self._sync_row_selection()
+
+    def _on_row_selected(self, _event=None):
+        """A row picked in the list selects that occurrence."""
+        if self._syncing:
+            return
+        rows = self.mark_tree.selection()
+        entry = self._row_for.get(rows[0]) if rows else None
+        # A set header is not an occurrence; clicking one selects nothing
+        # rather than guessing which of its occurrences was meant.
+        self.select_band(entry)
+
+    def _sync_row_selection(self):
+        """Point the list at whatever is selected, without looping back."""
+        tree = getattr(self, "mark_tree", None)
+        if tree is None:
+            return
+        self._syncing = True
+        try:
+            wanted = next((row for row, entry in self._row_for.items()
+                           if entry is self.selected_band), None)
+            if wanted is None:
+                tree.selection_remove(*tree.selection())
+            else:
+                tree.selection_set(wanted)
+                tree.see(wanted)
+        finally:
+            self._syncing = False
+
     # ----------------------------------------------------------------- marks
 
     def _load_marks(self):
@@ -352,6 +454,7 @@ class ViewWindow(tk.Toplevel):
         self.mark_patches = []
         self.mark_legend = []
         self.bands = []
+        self.occurrences = []
 
         if self.annotations_dir is None:
             self.marks_note = (
@@ -383,6 +486,7 @@ class ViewWindow(tk.Toplevel):
         self.mark_patches = []
         self.mark_legend = []
         self.bands = []
+        self.occurrences = []
         self.omitted = 0
         if not self.marks:
             self.marks_note = self.marks_note or "No marks on this pair yet."
@@ -404,6 +508,13 @@ class ViewWindow(tk.Toplevel):
             self.omitted += omitted
             if not pairs:
                 continue
+            drawn_originals = {id(o) for o, _c in pairs}
+            for original in ms.intervals:
+                if id(original) not in drawn_originals:
+                    # Clipped out of this window. Indexed anyway, so the list
+                    # can reach it -- otherwise it is reported as omitted and
+                    # then impossible to select, adjust or delete.
+                    self.occurrences.append(Band(None, ms, original, None))
             for original, clamped in pairs:
                 patch = ax.axvspan(
                     self._to_axis(clamped.start_utc),
@@ -411,7 +522,9 @@ class ViewWindow(tk.Toplevel):
                     facecolor="#" + ms.color, alpha=0.22,
                     edgecolor="#" + ms.color, linewidth=1.0, zorder=0)
                 self.mark_patches.append(patch)
-                self.bands.append(Band(patch, ms, original, clamped))
+                band = Band(patch, ms, original, clamped)
+                self.bands.append(band)
+                self.occurrences.append(band)
                 drawn += 1
             # One legend entry per SET, not per band -- the whole point of a
             # set is that many occurrences are one phenomenon.
@@ -586,6 +699,7 @@ class ViewWindow(tk.Toplevel):
         self.selected_band = entry
         self._restyle_bands()
         self._sync_delete_button()
+        self._sync_row_selection()
 
         if entry is None:
             if self.span is not None:
@@ -611,10 +725,16 @@ class ViewWindow(tk.Toplevel):
 
     def _selected_summary(self, entry) -> str:
         iv = entry.interval
-        return (f"Selected “{entry.markset.name}”:  "
+        text = (f"Selected “{entry.markset.name}”:  "
                 f"{ann.local_text(iv.start_utc)}  →  "
                 f"{ann.local_text(iv.end_utc)}  local"
                 f"  ·  {duration_text(iv.end_utc - iv.start_utc)}")
+        if entry.patch is None:
+            # Say why there is nothing to drag, rather than leaving someone
+            # hunting for handles that cannot exist.
+            text += ("   ·   outside this window, so it is not drawn: it can "
+                     "be deleted, but adjusting means rebuilding wider.")
+        return text
 
     def _restyle_bands(self):
         """The selected band reads as selected. Colour still identifies the set."""
@@ -779,6 +899,12 @@ class ViewWindow(tk.Toplevel):
             raise RuntimeError("no mark is selected")
         if self.store is None:
             raise RuntimeError("this window has nowhere to store a mark")
+        if entry.patch is None:
+            raise RuntimeError(
+                f"“{entry.markset.name}” falls outside this window, so it is "
+                f"not drawn and has no edges to drag. Rebuild the window wide "
+                f"enough to show it, and its edges become adjustable. It can "
+                f"be deleted from here either way.")
 
         i0, i1 = ann.snap_span(self._to_num(start_utc),
                                self._to_num(end_utc), self._xnum)
@@ -887,6 +1013,7 @@ class ViewWindow(tk.Toplevel):
         self._load_marks()
         self._draw_marks()
         self._refresh_legend()
+        self.refresh_mark_list()
         if getattr(self, "marks_label", None) is not None:
             self.marks_label.configure(
                 text=self.marks_note,
@@ -1755,6 +1882,79 @@ def _main(argv=None):
                        not any(b.markset.name == "stranded"
                                for b in win.bands)))
         win.span = keep_span
+
+        # ---- the mark list reaches what the chart cannot --------------------
+        far = ann.Store(tmp)
+        far_start = idx[0] - dt.timedelta(days=40)
+        far.confirm(study_id=info.study_id, pair=refs, name="long ago",
+                    reason="before this window starts",
+                    start_utc=far_start,
+                    end_utc=far_start + dt.timedelta(hours=6))
+        far.confirm(study_id=info.study_id, pair=refs, name="long ago",
+                    reason="", start_utc=idx[900], end_utc=idx[930])
+        win.redraw_marks()
+
+        mine = [o for o in win.occurrences if o.markset.name == "long ago"]
+        checks.append((f"every occurrence is indexed, drawn or not "
+                       f"[{len(mine)} indexed, "
+                       f"{sum(1 for o in mine if o.patch is None)} not drawn]",
+                       len(mine) == 2
+                       and sum(1 for o in mine if o.patch is None) == 1))
+
+        offscreen = next(o for o in mine if o.patch is None)
+        checks.append(("the one outside the window is drawn nowhere, so the "
+                       "chart cannot reach it",
+                       win.band_at(win._to_num(offscreen.interval.start_utc))
+                       is not offscreen))
+
+        rows = {win.mark_tree.item(r, "text").strip(): r
+                for r in win._row_for}
+        listed = ann.local_text(offscreen.interval.start_utc)
+        checks.append((f"but the list shows it, flagged [{listed}]",
+                       any(win._row_for[r] is offscreen for r in win._row_for)))
+        row = next(r for r in win._row_for
+                   if win._row_for[r] is offscreen)
+        checks.append((f"and says it is outside "
+                       f"[{win.mark_tree.item(row, 'values')}]",
+                       win.mark_tree.item(row, "values")[0] == "outside"))
+
+        win.mark_tree.selection_set(row)
+        win._on_row_selected()
+        checks.append(("picking that row selects the occurrence",
+                       win.selected_band is offscreen))
+        checks.append((f"the readout says why it has no handles "
+                       f"[...{win.span_text.get()[-58:]}]",
+                       "not drawn" in win.span_text.get()))
+
+        try:
+            win.adjust_selected(idx[10], idx[20])
+            adjust_refused, why = False, "it was allowed"
+        except RuntimeError as exc:
+            adjust_refused, why = True, str(exc)[:60]
+        checks.append((f"adjusting it is refused, saying what to do instead "
+                       f"[{why}...]", adjust_refused))
+
+        win.mark_tree.selection_set(row)
+        win._on_row_selected()
+        gone = win.delete_selected()
+        still_there = any(o.markset.name == "long ago" and o.patch is None
+                          for o in win.occurrences)
+        checks.append(("BUT IT CAN BE DELETED from the list -- the gap this "
+                       "list exists to close",
+                       gone is not None and not still_there))
+
+        # chart and list stay in step, in both directions
+        drawn_one = next(o for o in win.occurrences if o.patch is not None)
+        win.select_band(drawn_one)
+        sel = win.mark_tree.selection()
+        checks.append(("selecting on the chart highlights the matching row",
+                       bool(sel) and win._row_for.get(sel[0]) is drawn_one))
+        header = win.mark_tree.parent(sel[0])
+        win.mark_tree.selection_set(header)
+        win._on_row_selected()
+        checks.append(("picking a set header selects nothing, rather than "
+                       "guessing which occurrence was meant",
+                       win.selected_band is None))
 
         lo, hi = win.figure.axes[0].get_xlim()
         first, last = win._xnum[0], win._xnum[-1]
