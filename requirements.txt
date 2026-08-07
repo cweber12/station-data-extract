@@ -10,3 +10,8 @@ requests         # ERDDAP / NDBC / CO-OPS
 # ingest/mashup.configure_loading). Everything else runs without Excel, so the
 # import is guarded and a project can be created headless.
 pywin32; sys_platform == "win32"
+
+# Optional. Only for the interactive chart view (view.py). Pulling data and
+# writing workbooks never touch it, so the import is guarded the same way and
+# the export path keeps working on a machine that has never installed it.
+matplotlib
