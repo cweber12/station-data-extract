@@ -374,6 +374,26 @@ class ViewWindow(tk.Toplevel):
             foreground="#B4531A" if self._marks_need_attention() else "#777")
         self.marks_label.pack(side="left")
 
+        # Borrowing. The dropdown offers only sets sharing EXACTLY ONE series
+        # with this pair -- see annotations.eligible_overlays for why that is
+        # the rule rather than "everything in the study".
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x", pady=(8, 0))
+        ttk.Label(controls, text="Borrow marks from:").pack(side="left")
+        self.overlay_var = tk.StringVar()
+        self.overlay_box = ttk.Combobox(controls, textvariable=self.overlay_var,
+                                        state="readonly", width=62)
+        self.overlay_box.pack(side="left", padx=(6, 6))
+        self.overlay_btn = ttk.Button(controls, text="Overlay",
+                                      command=self.prompt_overlay)
+        self.overlay_btn.pack(side="left")
+        self.remove_btn = ttk.Button(controls, text="Remove overlay",
+                                     command=self.prompt_remove_overlay,
+                                     state="disabled")
+        self.remove_btn.pack(side="left", padx=(6, 0))
+        self.overlay_hint = ttk.Label(controls, foreground="#777", text="")
+        self.overlay_hint.pack(side="left", padx=(10, 0))
+
         # What is borrowed, and what of it is NOT drawn. Its own line rather
         # than appended to the marks note: the counts belong to different
         # pairs, and one sentence carrying both would attribute neither.
@@ -383,6 +403,9 @@ class ViewWindow(tk.Toplevel):
             borrowed, text=self.overlay_note, wraplength=1100, justify="left",
             foreground="#B4531A" if self._overlay_needs_attention() else "#777")
         self.overlay_label.pack(side="left")
+
+        self._offer_ids = []
+        self._refresh_overlay_controls()
 
         # NOTE the dialog is NOT raised here. A modal box opened during
         # construction blocks whoever is building the window -- including a
@@ -1119,6 +1142,83 @@ class ViewWindow(tk.Toplevel):
                 f"windows line up with what is here, not to be edited through "
                 f"them. Open that pair to change it.")
 
+    def _no_candidates_reason(self) -> str:
+        """Why the dropdown is empty. Never merely disabled and silent."""
+        if self.store is None:
+            return "There is no study here to borrow marks from."
+        return ("Nothing to borrow: no saved set in this study shares exactly "
+                "one series with this pair.")
+
+    def _refresh_overlay_controls(self):
+        """Rebuild the dropdown from the candidates. Selection survives it.
+
+        Kept by SET ID rather than by the displayed string, because the string
+        changes the moment a set goes on the chart -- and a selection that
+        silently moved to a different set would borrow one thing while the box
+        showed another.
+        """
+        box = getattr(self, "overlay_box", None)
+        if box is None:
+            return
+        was = self.overlay_choice()
+        self._offer_ids = [c.markset.set_id for c in self.candidates]
+        values = [c.offer_text + ("   ·   on chart"
+                                  if c.markset.set_id in self.overlay_ids
+                                  else "")
+                  for c in self.candidates]
+        box.configure(values=values)
+        if was in self._offer_ids:
+            box.current(self._offer_ids.index(was))
+        elif values:
+            box.current(0)
+        else:
+            self.overlay_var.set("")
+
+        live = "readonly" if values else "disabled"
+        box.configure(state=live)
+        self.overlay_btn.configure(state="normal" if values else "disabled")
+        self.overlay_hint.configure(
+            text="" if values else self._no_candidates_reason())
+
+    def overlay_choice(self):
+        """The set id the dropdown is showing, or None. The seam under the UI."""
+        box = getattr(self, "overlay_box", None)
+        if box is None:
+            return None
+        i = box.current()
+        return self._offer_ids[i] if 0 <= i < len(self._offer_ids) else None
+
+    def prompt_overlay(self):
+        """Borrow whatever is chosen. UI only; the rule is in overlay()."""
+        set_id = self.overlay_choice()
+        if set_id is None:
+            return
+        try:
+            cand = self.overlay(set_id)
+        except Exception as exc:
+            messagebox.showerror("Could not borrow that set", str(exc),
+                                 parent=self)
+            return
+        self.span_text.set(
+            f"Borrowed “{cand.markset.name}” from {cand.markset.pair_text}. "
+            f"Its bands are outlined, not filled.")
+
+    def prompt_remove_overlay(self):
+        """Stop borrowing the selected band's set. UI only.
+
+        Deliberately says that nothing was deleted. This button sits beside
+        Delete mark, acts on a band, and removes bands from the chart -- three
+        good reasons for someone to wonder whether their marks are gone.
+        """
+        entry = self.selected_band
+        if entry is None or not entry.is_foreign:
+            return
+        name, pair_text = entry.markset.name, entry.markset.pair_text
+        self.remove_overlay(entry.markset.set_id)
+        self.span_text.set(
+            f"Stopped borrowing “{name}” from {pair_text}. Nothing was "
+            f"deleted — the set is still saved on its own pair.")
+
     def overlay(self, set_id: str):
         """Borrow a saved set onto this chart, and redraw. Returns its offer.
 
@@ -1232,12 +1332,18 @@ class ViewWindow(tk.Toplevel):
         self.span_text.set(f"Deleted an occurrence of “{name}”.")
 
     def _sync_delete_button(self):
+        """The buttons that act on a selection follow it. Exactly one applies:
+        a native mark can be deleted, a borrowed one can only be handed back."""
+        entry = self.selected_band
         button = getattr(self, "delete_btn", None)
         if button is not None:
-            entry = self.selected_band
             live = (entry is not None and self.store is not None
                     and not entry.is_foreign)
             button.configure(state="normal" if live else "disabled")
+        remove = getattr(self, "remove_btn", None)
+        if remove is not None:
+            remove.configure(state="normal" if entry is not None
+                             and entry.is_foreign else "disabled")
 
     def select_interval(self, set_id: str, start_utc, end_utc):
         """Re-select an occurrence by VALUE after the bands were rebuilt."""
@@ -1272,6 +1378,7 @@ class ViewWindow(tk.Toplevel):
                 text=self.overlay_note,
                 foreground="#B4531A" if self._overlay_needs_attention()
                 else "#777")
+        self._refresh_overlay_controls()
         if getattr(self, "canvas", None) is not None:
             self.canvas.draw_idle()
 
@@ -2373,6 +2480,57 @@ def _main(argv=None):
                        "file",
                        (tmp / f"{wl.markset.set_id}.json").read_bytes()
                        == borrowed_bytes))
+
+        # ---- the dropdown ----------------------------------------------------
+        offers = list(win.overlay_box.cget("values"))
+        checks.append((f"the dropdown offers exactly the eligible sets, each "
+                       f"naming its source pair {offers}",
+                       len(offers) == len(win.candidates) == 2
+                       and all(c.markset.name in o and c.markset.pair_text in o
+                               for c, o in zip(win.candidates, offers))))
+        checks.append((f"and marks the one already on the chart "
+                       f"[{[o[-9:] for o in offers if 'on chart' in o]}]",
+                       sum("on chart" in o for o in offers) == 1))
+
+        # Hand it back through the button, then borrow it again through the
+        # button, so the control is exercised and not only the seam under it.
+        win.select_band(next(b for b in win.bands if b.is_foreign))
+        checks.append(("Remove overlay is live only while a BORROWED band is "
+                       "selected",
+                       str(win.remove_btn.cget("state")) == "normal"))
+        win.prompt_remove_overlay()
+        checks.append((f"pressing it stops the borrowing and says nothing was "
+                       f"deleted [...{win.span_text.get()[-46:]}]",
+                       not [b for b in win.bands if b.is_foreign]
+                       and "Nothing was deleted" in win.span_text.get()
+                       and (tmp / f"{wl.markset.set_id}.json").exists()))
+        win.select_band(next(b for b in win.bands if not b.is_foreign))
+        checks.append(("and it is off again for a native mark, which is "
+                       "deleted rather than handed back",
+                       str(win.remove_btn.cget("state")) == "disabled"
+                       and str(win.delete_btn.cget("state")) == "normal"))
+
+        win.overlay_box.current(win._offer_ids.index(wl.markset.set_id))
+        checks.append(("the choice resolves to a SET ID, not to the label the "
+                       "box happens to be showing",
+                       win.overlay_choice() == wl.markset.set_id))
+        win.prompt_overlay()
+        checks.append((f"pressing Overlay draws its bands "
+                       f"[{len([b for b in win.bands if b.is_foreign])} "
+                       f"borrowed]",
+                       [b.markset.set_id for b in win.bands if b.is_foreign]
+                       == [wl.markset.set_id] * 2))
+
+        bare = ViewWindow(root_tk, res, study=info,
+                          annotations_dir=tmp / "no-sets-here")
+        bare.update_idletasks()
+        hint = str(bare.overlay_hint.cget("text"))
+        checks.append((f"with nothing eligible the control is disabled and "
+                       f"SAYS WHY [{hint}]",
+                       str(bare.overlay_box.cget("state")) == "disabled"
+                       and str(bare.overlay_btn.cget("state")) == "disabled"
+                       and "exactly one series" in hint))
+        bare.destroy()
 
         # ---- native wins a tie ----------------------------------------------
         overlap = ann.Store(tmp)
