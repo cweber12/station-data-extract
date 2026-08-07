@@ -430,6 +430,64 @@ def sets_for_pair(sets, keys, study_id: str | None = None) -> list:
             and (study_id is None or s.study_id == study_id)]
 
 
+@dataclass(frozen=True)
+class Candidate:
+    """A saved set that could be BORROWED onto the pair being viewed.
+
+    `shared` is the member already on screen; `foreign` is the one that is not,
+    and it is the whole reason the set is worth offering -- it is the candidate
+    explanation, and the series the ghost line is fetched for. Both are carried
+    as full SeriesRefs rather than as keys because the LABEL is what a person
+    reads, and it still communicates in the one case where the key is worth
+    least: when the key no longer resolves and the ghost cannot be drawn.
+    """
+    markset: object
+    shared: SeriesRef
+    foreign: SeriesRef
+
+    @property
+    def offer_text(self) -> str:
+        """What the dropdown shows. The source pair is part of the offer.
+
+        Naming the pair here rather than only in the legend means the choice is
+        made knowing what is being borrowed, not just its name -- two sets can
+        share a name across different pairs, and "internal tide" alone would
+        not say which comparison it was drawn from.
+        """
+        return f"{self.markset.name}  —  {self.markset.pair_text}"
+
+
+def eligible_overlays(sets, keys, study_id: str | None = None) -> list:
+    """The sets that could be borrowed onto this pair: EXACTLY ONE shared.
+
+    Sharing exactly one series is what makes a set worth offering: its other
+    member is a candidate explanation that is not currently on screen, which is
+    the entire point of the overlay. Sharing BOTH means it is the same
+    comparison, and it must keep loading as native marks through
+    `sets_for_pair` -- this function is a second rule beside that one, never a
+    loosening of it. Sharing NEITHER means it has no bearing on what is drawn.
+
+    Membership is decided on `pair`, not on `pair_keys`, so that a set whose
+    two members are the same key -- which reads as one shared series through a
+    frozenset -- is refused rather than offered with no partner to ghost.
+
+    Matching is on the resolvable KEY and the study id, for the same reasons
+    `sets_for_pair` gives: labels can be changed without the data changing, and
+    `scan_parquet` hands every study the identical key for the same station and
+    variable, so the study id is the only thing separating them.
+    """
+    want = frozenset(keys)
+    out = []
+    for s in sets:
+        if study_id is not None and s.study_id != study_id:
+            continue
+        shared = [r for r in s.pair if r.key in want]
+        foreign = [r for r in s.pair if r.key not in want]
+        if len(shared) == 1 and len(foreign) == 1:
+            out.append(Candidate(s, shared[0], foreign[0]))
+    return out
+
+
 def clip_to_window(intervals, lo: dt.datetime, hi: dt.datetime):
     """([(original, clamped)], count omitted entirely).
 
@@ -1095,6 +1153,76 @@ def _main(argv=None):
            sets_for_pair(good, [r.key for r in other], study_id) == [])
         ok("a set from a different study is not returned",
            sets_for_pair(good, keys, "20260805T0544Z__baseline") == [])
+
+        # ---- overlay eligibility --------------------------------------------
+        # Built in memory rather than through the store. This is a pure rule
+        # about a LIST of sets, and handing it exactly the sets it is being
+        # asked about is what makes each verdict attributable to one of them.
+        temp_ljac1, water = pair
+        temp_46254 = other[0]
+        salinity = SeriesRef("observations.parquet::LJAC1::sea_water_salinity",
+                             "LJAC1.sea_water_salinity")
+
+        def a_set(name, members, study=study_id):
+            return MarkSet(
+                set_id=f"id-{_slug(name)}", name=name, reason="",
+                color=SET_COLORS[0],
+                created_utc=dt.datetime(2026, 8, 1, tzinfo=utc),
+                study_id=study, pair=members,
+                intervals=[Interval(dt.datetime(2026, 7, 20, 0, tzinfo=utc),
+                                    dt.datetime(2026, 7, 20, 6, tzinfo=utc))])
+
+        # On screen: LJAC1 temperature against 46254 temperature -- the case
+        # the whole feature exists for, where the two fail to line up and the
+        # question is what else might explain it.
+        viewing = [temp_ljac1.key, temp_46254.key]
+        catalogue = [
+            a_set("water level", (temp_ljac1, water)),
+            a_set("water level reversed", (water, temp_ljac1)),
+            a_set("same comparison", (temp_ljac1, temp_46254)),
+            a_set("elsewhere", (water, salinity)),
+            a_set("degenerate", (temp_ljac1, temp_ljac1)),
+            a_set("other study", (temp_ljac1, water),
+                  study="20260805T0544Z__baseline"),
+        ]
+        offered = eligible_overlays(catalogue, viewing, study_id)
+
+        ok("only the sets sharing EXACTLY ONE series are offered",
+           [c.markset.name for c in offered]
+           == ["water level", "water level reversed"],
+           str([c.markset.name for c in offered]))
+        ok("each offer names the member NOT on screen -- the one the ghost "
+           "line is fetched for",
+           all(c.foreign.key == water.key and c.shared.key == temp_ljac1.key
+               for c in offered),
+           " / ".join(f"{c.shared.label} shared, {c.foreign.label} foreign"
+                      for c in offered))
+        ok("a set stored with its shared member SECOND is offered the same "
+           "way round",
+           len(offered) == 2 and offered[1].foreign == water
+           and offered[1].shared == temp_ljac1)
+
+        native = sets_for_pair(catalogue, viewing, study_id)
+        ok("the set sharing BOTH series still loads as NATIVE marks",
+           [s.name for s in native] == ["same comparison"],
+           str([s.name for s in native]))
+        ok("and is therefore NOT offered as an overlay -- the two rules "
+           "partition the catalogue rather than overlapping",
+           not ({s.set_id for s in native}
+                & {c.markset.set_id for c in offered}))
+        ok("a set sharing NEITHER series is not offered",
+           not any(c.markset.name == "elsewhere" for c in offered))
+        ok("a set whose pair is one series twice is not offered: it reads as "
+           "one shared series, but there is no partner to ghost",
+           not any(c.markset.name == "degenerate" for c in offered))
+        ok("a set from another study is not offered, however well its keys "
+           "match",
+           not any(c.markset.name == "other study" for c in offered))
+        ok(f"the offer names the source pair, not just the set "
+           f"[{offered[0].offer_text if offered else ''}]",
+           bool(offered) and water.label in offered[0].offer_text
+           and temp_ljac1.label in offered[0].offer_text
+           and "water level" in offered[0].offer_text)
 
         # ---- clipping -------------------------------------------------------
         ivs = [Interval(dt.datetime(2026, 7, 20, 0, tzinfo=utc),
