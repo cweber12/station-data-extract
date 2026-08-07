@@ -184,6 +184,16 @@ def check_pure(module: str) -> tuple[bool, str]:
 
 def _main(argv=None):
     import argparse
+    import sys
+
+    # Messages here quote mark names, which carry typographic
+    # quotes; a Windows console defaults to cp1252 and cannot
+    # encode them, which would crash the gate on its way to
+    # printing a PASS.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     ap = argparse.ArgumentParser(
         description="Assert the headless path never acquires a UI dependency.")
     ap.add_argument("--check", action="store_true",

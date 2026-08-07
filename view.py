@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import datetime as dt
 import tkinter as tk
+from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from zoneinfo import ZoneInfo
 
@@ -53,6 +54,7 @@ LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 # ---------------------------------------------------------------------------
 try:
     import matplotlib
+    import numpy as np
     matplotlib.use("TkAgg")
     import matplotlib.dates as mdates
     from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
@@ -61,12 +63,13 @@ try:
     from matplotlib.widgets import SpanSelector
     IMPORT_ERROR: Exception | None = None
 except Exception as exc:                       # pragma: no cover - environment
-    matplotlib = mdates = None
+    matplotlib = mdates = np = None
     FigureCanvasTkAgg = NavigationToolbar2Tk = Figure = None
     SpanSelector = None
     IMPORT_ERROR = exc
 
-SPAN_HINT = "Drag across the chart to define a region."
+SPAN_HINT = ("Drag across the chart to define a region.  "
+             "Click a mark to select it.")
 
 UNAVAILABLE_MESSAGE = (
     "The chart view needs matplotlib, which is not installed.\n\n"
@@ -109,6 +112,24 @@ def duration_text(td: dt.timedelta) -> str:
     parts = [f"{days} d" if days else "", f"{hours} h" if hours else "",
              f"{minutes} min" if minutes else ""]
     return " ".join(p for p in parts if p) or "0 min"
+
+
+@dataclass
+class Band:
+    """One drawn occurrence, and what it is an occurrence OF.
+
+    A patch on its own is a rectangle. Clicking one has to resolve to the set
+    and the interval it came from, or neither adjusting nor deleting can say
+    what it is acting on.
+    """
+    patch: object          # what is on the axes, or None when not drawn
+    markset: object
+    interval: object       # the ORIGINAL stored occurrence -- its identity
+    drawn: object = None   # the same occurrence clamped to this window
+
+    @property
+    def is_drawn(self) -> bool:
+        return self.patch is not None
 
 
 class MarkDialog(tk.Toplevel):
@@ -233,6 +254,8 @@ class ViewWindow(tk.Toplevel):
         self._xnum = []
         self.selection: tuple | None = None
         self._selected_indices = (0, 0)
+        self.occurrences = []
+        self.selected_band = None
 
         self.study = study
         self.study_id = getattr(study, "study_id", None)
@@ -269,11 +292,21 @@ class ViewWindow(tk.Toplevel):
         self._load_marks()
         self._draw_marks()
         self._refresh_legend()
-        canvas = FigureCanvasTkAgg(self.figure, master=frame)
+
+        # Chart on the left, the list of marks on the right. The list is not a
+        # convenience: an occurrence clipped out of this window is drawn
+        # nowhere, so without it there would be no way to select one, and no
+        # way to delete it short of rebuilding a wider window.
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True)
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="both", expand=True)
+
+        canvas = FigureCanvasTkAgg(self.figure, master=left)
         self.canvas = canvas
         canvas.draw()
 
-        toolbar_holder = ttk.Frame(frame)
+        toolbar_holder = ttk.Frame(left)
         toolbar_holder.pack(fill="x")
         self.toolbar = NavigationToolbar2Tk(canvas, toolbar_holder,
                                             pack_toolbar=False)
@@ -281,6 +314,8 @@ class ViewWindow(tk.Toplevel):
         self.toolbar.pack(side="left")
 
         canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        self._build_mark_list(body)
 
         # The readout sits directly under the chart because it is read WHILE
         # dragging, not after. Its whole purpose is that the hour being aimed
@@ -299,6 +334,13 @@ class ViewWindow(tk.Toplevel):
         ttk.Label(note, text=self._coverage_note(),
                   foreground="#777").pack(side="left")
         ttk.Button(note, text="Close", command=self.destroy).pack(side="right")
+        self.delete_btn = ttk.Button(note, text="Delete mark",
+                                     command=self.prompt_delete,
+                                     state="disabled")
+        self.delete_btn.pack(side="right", padx=(0, 6))
+        # Delete key as well as the button. There is no text entry in this
+        # window, so the key cannot be stolen from something being typed into.
+        self.bind("<Delete>", lambda _e: self.prompt_delete())
 
         marks = ttk.Frame(frame)
         marks.pack(fill="x", pady=(2, 0))
@@ -314,6 +356,109 @@ class ViewWindow(tk.Toplevel):
         # ProgressDialog exists to prevent. The caller raises it once the
         # window is up; see report_rejections().
 
+    # `occurrences` is the only stored collection; these are views of it.
+    # Three lists kept in step by hand is three chances for them to drift, and
+    # the chart-facing code only ever wants the drawn subset.
+
+    @property
+    def bands(self) -> list:
+        """The occurrences that are actually on the axes."""
+        return [o for o in self.occurrences if o.is_drawn]
+
+    @property
+    def mark_patches(self) -> list:
+        """Their patches, in the same order."""
+        return [o.patch for o in self.bands]
+
+    # ------------------------------------------------------------ mark list
+
+    def _build_mark_list(self, parent):
+        """Every occurrence on this pair, including the ones not drawn."""
+        right = ttk.Frame(parent, padding=(10, 0, 0, 0))
+        right.pack(side="right", fill="y")
+
+        ttk.Label(right, text="Marks on this pair",
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w")
+
+        holder = ttk.Frame(right)
+        holder.pack(fill="both", expand=True)
+        self.mark_tree = ttk.Treeview(holder, columns=("where",),
+                                      show="tree headings", height=16,
+                                      selectmode="browse")
+        self.mark_tree.heading("#0", text="set / occurrence")
+        self.mark_tree.heading("where", text="")
+        self.mark_tree.column("#0", width=250, stretch=False)
+        self.mark_tree.column("where", width=86, stretch=False, anchor="e")
+        bar = ttk.Scrollbar(holder, orient="vertical",
+                            command=self.mark_tree.yview)
+        self.mark_tree.configure(yscrollcommand=bar.set)
+        self.mark_tree.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+
+        self.mark_tree.tag_configure("offwindow", foreground="#B4531A")
+        self.mark_tree.bind("<<TreeviewSelect>>", self._on_row_selected)
+        self._row_for = {}
+        self._syncing = False
+        self.refresh_mark_list()
+
+    def refresh_mark_list(self):
+        """Rebuild the rows from `occurrences`. Sets are parents."""
+        tree = getattr(self, "mark_tree", None)
+        if tree is None:
+            return
+        self._syncing = True
+        try:
+            tree.delete(*tree.get_children())
+            self._row_for = {}
+            by_set = {}
+            for entry in self.occurrences:
+                by_set.setdefault(entry.markset.set_id, []).append(entry)
+            for set_id, entries in by_set.items():
+                ms = entries[0].markset
+                node = tree.insert("", "end",
+                                   text=f"{ms.name}  ({len(entries)})",
+                                   values=("",), open=True)
+                for entry in entries:
+                    iv = entry.interval
+                    outside = entry.patch is None
+                    row = tree.insert(
+                        node, "end",
+                        text=f"   {ann.local_text(iv.start_utc)} → "
+                             f"{ann.local_text(iv.end_utc)}",
+                        values=("outside" if outside else "",),
+                        tags=("offwindow",) if outside else ())
+                    self._row_for[row] = entry
+        finally:
+            self._syncing = False
+        self._sync_row_selection()
+
+    def _on_row_selected(self, _event=None):
+        """A row picked in the list selects that occurrence."""
+        if self._syncing:
+            return
+        rows = self.mark_tree.selection()
+        entry = self._row_for.get(rows[0]) if rows else None
+        # A set header is not an occurrence; clicking one selects nothing
+        # rather than guessing which of its occurrences was meant.
+        self.select_band(entry)
+
+    def _sync_row_selection(self):
+        """Point the list at whatever is selected, without looping back."""
+        tree = getattr(self, "mark_tree", None)
+        if tree is None:
+            return
+        self._syncing = True
+        try:
+            wanted = next((row for row, entry in self._row_for.items()
+                           if entry is self.selected_band), None)
+            if wanted is None:
+                tree.selection_remove(*tree.selection())
+            else:
+                tree.selection_set(wanted)
+                tree.see(wanted)
+        finally:
+            self._syncing = False
+
     # ----------------------------------------------------------------- marks
 
     def _load_marks(self):
@@ -323,8 +468,8 @@ class ViewWindow(tk.Toplevel):
         self.marks = []
         self.mark_problems = []
         self.omitted = 0
-        self.mark_patches = []
         self.mark_legend = []
+        self.occurrences = []
 
         if self.annotations_dir is None:
             self.marks_note = (
@@ -353,8 +498,8 @@ class ViewWindow(tk.Toplevel):
 
     def _draw_marks(self):
         """One band per interval, per set, clipped to this window."""
-        self.mark_patches = []
         self.mark_legend = []
+        self.occurrences = []
         self.omitted = 0
         if not self.marks:
             self.marks_note = self.marks_note or "No marks on this pair yet."
@@ -366,20 +511,36 @@ class ViewWindow(tk.Toplevel):
         drawn = 0
 
         for ms in self.marks:
-            kept, omitted = ann.clip_to_window(ms.intervals, lo, hi)
+            # Pairs, not just the clamped form. The clamped interval says where
+            # to draw; the ORIGINAL is the occurrence's identity, and it is what
+            # update_interval and delete_interval match on. Keeping only the
+            # clamped one meant any mark overlapping the window edge could be
+            # selected but never adjusted or deleted, because the store had
+            # never held the value being looked up.
+            pairs, omitted = ann.clip_to_window(ms.intervals, lo, hi)
             self.omitted += omitted
-            if not kept:
-                continue
-            for iv in kept:
+            clamped_for = {id(original): clamped for original, clamped in pairs}
+
+            # Walked in stored order, so the list reads chronologically, and
+            # EVERY occurrence is indexed -- including the ones clipped out of
+            # this window, which are drawn nowhere and would otherwise be
+            # reported as omitted and then impossible to select or delete.
+            for original in ms.intervals:
+                clamped = clamped_for.get(id(original))
+                if clamped is None:
+                    self.occurrences.append(Band(None, ms, original, None))
+                    continue
                 patch = ax.axvspan(
-                    self._to_axis(iv.start_utc), self._to_axis(iv.end_utc),
+                    self._to_axis(clamped.start_utc),
+                    self._to_axis(clamped.end_utc),
                     facecolor="#" + ms.color, alpha=0.22,
                     edgecolor="#" + ms.color, linewidth=1.0, zorder=0)
-                self.mark_patches.append(patch)
+                self.occurrences.append(Band(patch, ms, original, clamped))
                 drawn += 1
             # One legend entry per SET, not per band -- the whole point of a
             # set is that many occurrences are one phenomenon.
-            self.mark_legend.append((patch, f"{ms.name}  ({len(kept)}×)"))
+            if pairs:
+                self.mark_legend.append((patch, f"{ms.name}  ({len(pairs)}×)"))
 
         n_sets = len({id(m) for m in self.marks})
         parts = [f"{drawn} mark(s) in {n_sets} set(s) on this pair."]
@@ -465,6 +626,14 @@ class ViewWindow(tk.Toplevel):
         # hour of the axis is not ascending and a bisect through it would
         # return a confident wrong index. Better to say so than to store a mark
         # that means an hour other than the one that was dragged.
+        # Click-to-select is wired up FIRST and unconditionally. Creating and
+        # adjusting need a monotonic axis to snap against; selecting and
+        # deleting do not, and a window that cannot be marked must not become
+        # one whose existing marks can never be removed.
+        self._press_x = None
+        self.canvas.mpl_connect("button_press_event", self._on_press)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
+
         self.descent = ann.first_descent(self._xnum)
         if self.descent is not None:
             when = ann.local_text(self._utc[self.descent])
@@ -472,8 +641,9 @@ class ViewWindow(tk.Toplevel):
             self.span_text.set(
                 f"Marking is off for this window: local time runs backwards "
                 f"around {when}, where a DST fall-back makes one wall clock "
-                f"hour cover two different hours of real time. Rebuild the "
-                f"window to exclude it.")
+                f"hour cover two different hours of real time. Existing marks "
+                f"can still be selected and deleted. Rebuild the window to "
+                f"exclude it.")
             return
 
         ax = self.figure.axes[0]
@@ -481,9 +651,118 @@ class ViewWindow(tk.Toplevel):
             ax, self._on_span_select, "horizontal",
             onmove_callback=self._on_span_move,
             useblit=False, button=1, minspan=0,
-            snap_values=self._xnum or None,
+            snap_values=self._xnum if len(self._xnum) else None,
+            # Edge handles, so a selected mark can be adjusted by dragging its
+            # ends. Turned on only now that dragging one does something.
+            interactive=True,
+            handle_props=dict(color="#404040", linewidth=1.6),
             props=dict(facecolor="#808080", alpha=0.20),
         )
+        self.span.set_visible(False)
+
+        # NOTE the press/release handlers are connected above, before this
+        # point, because they must exist even when the selector is refused.
+        # They ride alongside onselect rather than on it: SpanSelector._release
+        # only calls onselect for a zero-span click when a selection ALREADY
+        # exists (`span <= minspan` is guarded by `_selection_completed`), so
+        # the first click on a band would never arrive.
+
+    # ------------------------------------------------------- selecting a mark
+
+    def _on_press(self, event):
+        """Remember where a press landed, so release can tell click from drag."""
+        if event.inaxes is self.figure.axes[0]:
+            self._press_x = event.xdata
+
+    def _on_release(self, event):
+        """A click that did not move is a SELECT, not a failed drag."""
+        if event.inaxes is not self.figure.axes[0] or self._press_x is None:
+            return
+        # With no selector there is no create gesture to be confused with, and
+        # snap_span cannot be trusted on the axis that refused it, so every
+        # release is a click.
+        moved = (self.span is not None
+                 and self.span_interval(self._press_x, event.xdata) is not None)
+        self._press_x = None
+        if moved:
+            return                       # a real drag; onselect owns it
+        self.select_band_at(event.xdata)
+
+    def band_at(self, x: float):
+        """The (set, interval, patch) whose band covers x, or None.
+
+        Hit-tested on x alone. A band spans the full height of the axes, so the
+        y coordinate carries no information about which mark was clicked, and
+        consulting it would only make a click near the top or bottom edge fail
+        for no reason a user could see.
+        """
+        for entry in self.bands:
+            if entry.patch.get_x() <= x <= entry.patch.get_x() \
+                    + entry.patch.get_width():
+                return entry
+        return None
+
+    def select_band_at(self, x: float):
+        """Select the mark under x, or clear the selection. Returns the entry."""
+        return self.select_band(self.band_at(x))
+
+    def select_band(self, entry):
+        """Make `entry` the selected mark, or clear when None."""
+        self.selected_band = entry
+        self._restyle_bands()
+        self._sync_delete_button()
+        self._sync_row_selection()
+
+        if entry is None:
+            if self.span is not None:
+                self.span.set_visible(False)
+            self.selection = None
+            self.span_text.set(SPAN_HINT)
+            self.canvas.draw_idle()
+            return None
+
+        # Put the selector's handles ON the chosen band, so its edges are what
+        # a drag adjusts. Setting extents marks the selection completed, which
+        # is what makes the handles live.
+        shown = entry.drawn or entry.interval
+        if self.span is not None:
+            self.span.set_visible(True)
+            self.span.extents = (self._to_num(shown.start_utc),
+                                 self._to_num(shown.end_utc))
+        self.selection = (entry.interval.start_utc, entry.interval.end_utc)
+        self._selected_indices = self._indices_for(shown)
+        self.span_text.set(self._selected_summary(entry))
+        self.canvas.draw_idle()
+        return entry
+
+    def _selected_summary(self, entry) -> str:
+        iv = entry.interval
+        text = (f"Selected “{entry.markset.name}”:  "
+                f"{ann.local_text(iv.start_utc)}  →  "
+                f"{ann.local_text(iv.end_utc)}  local"
+                f"  ·  {duration_text(iv.end_utc - iv.start_utc)}")
+        if entry.patch is None:
+            # Say why there is nothing to drag, rather than leaving someone
+            # hunting for handles that cannot exist.
+            text += ("   ·   outside this window, so it is not drawn: it can "
+                     "be deleted, but adjusting means rebuilding wider.")
+        return text
+
+    def _restyle_bands(self):
+        """The selected band reads as selected. Colour still identifies the set."""
+        for entry in self.bands:
+            chosen = entry is self.selected_band
+            entry.patch.set_alpha(0.34 if chosen else 0.22)
+            entry.patch.set_linewidth(2.2 if chosen else 1.0)
+            entry.patch.set_linestyle("solid" if chosen else "dotted")
+
+    def _to_num(self, when) -> float:
+        return float(mdates.date2num(self._to_axis(when)))
+
+    def _indices_for(self, interval) -> tuple:
+        """Which samples an interval's edges sit on, for coverage."""
+        return ann.snap_span(self._to_num(interval.start_utc),
+                             self._to_num(interval.end_utc), self._xnum)
 
     def span_interval(self, x0: float, x1: float):
         """A dragged span -> (start_utc, end_utc, i0, i1), or None if degenerate.
@@ -512,11 +791,44 @@ class ViewWindow(tk.Toplevel):
                 f"Shorter than one {self.result.interval} interval — "
                 f"nothing to mark.")
             return
-        self.span_text.set("Marking:  " + self._span_summary(*got))
+        verb = (f"Adjusting “{self.selected_band.markset.name}”:  "
+                if self._adjusting() else "Marking:  ")
+        self.span_text.set(verb + self._span_summary(*got))
+
+    def _adjusting(self) -> bool:
+        """True when this drag moved an edge of the selected mark.
+
+        `_active_handle` is set on press and cleared AFTER onselect fires, so
+        it is still readable here -- which is the only thing distinguishing an
+        adjustment from a brand new region, since both arrive as one span.
+        """
+        return (self.selected_band is not None
+                and getattr(self.span, "_active_handle", None) is not None)
 
     def _on_span_select(self, x0: float, x1: float):
-        """On release: record the region, then ask what it means."""
+        """On release: adjust the selected mark, or start a new one."""
         got = self.span_interval(x0, x1)
+
+        if self._adjusting():
+            if got is None:
+                # Dragged an edge past the other one. Refuse and snap back,
+                # rather than storing a mark with no duration.
+                self.select_band(self.selected_band)
+                self.span_text.set(
+                    f"An edge cannot cross the other one — a mark has to be at "
+                    f"least one {self.result.interval} long. Nothing changed.")
+                return
+            try:
+                ms = self.adjust_selected(got[0], got[1])
+            except Exception as exc:
+                messagebox.showerror("Could not adjust the mark", str(exc),
+                                     parent=self)
+                self.redraw_marks()
+                return
+            self.span_text.set(
+                f"Adjusted “{ms.name}”:  {self._span_summary(*got)}")
+            return
+
         self.selection = None if got is None else (got[0], got[1])
         if got is None:
             self.span_text.set(
@@ -581,13 +893,136 @@ class ViewWindow(tk.Toplevel):
         self.redraw_marks()
         return ms
 
+    def adjust_selected(self, start_utc, end_utc):
+        """Move the selected occurrence's edges, and write. Returns the set.
+
+        The seam for adjusting, matching commit_mark for creating: no UI above
+        this line, so the rule can be exercised without a window being dragged.
+
+        Coverage is RECOMPUTED, never carried over. It describes the marked
+        window, and moving an edge makes the stored numbers describe a window
+        that no longer exists.
+        """
+        entry = self.selected_band
+        if entry is None:
+            raise RuntimeError("no mark is selected")
+        if self.store is None:
+            raise RuntimeError("this window has nowhere to store a mark")
+        if entry.patch is None:
+            raise RuntimeError(
+                f"“{entry.markset.name}” falls outside this window, so it is "
+                f"not drawn and has no edges to drag. Rebuild the window wide "
+                f"enough to show it, and its edges become adjustable. It can "
+                f"be deleted from here either way.")
+
+        i0, i1 = ann.snap_span(self._to_num(start_utc),
+                               self._to_num(end_utc), self._xnum)
+        ms = self.store.update_interval(
+            entry.markset.set_id,
+            entry.interval.start_utc, entry.interval.end_utc,
+            start_utc=start_utc, end_utc=end_utc,
+            coverage=self.coverage_for(i0, i1))
+        self.redraw_marks()
+        self.select_interval(ms.set_id, start_utc, end_utc)
+        return ms
+
+    # ------------------------------------------------------------- deleting
+
+    def deletion_message(self) -> str:
+        """What deleting the selection would destroy, in full, or ''.
+
+        Built separately from being shown so the wording can be asserted
+        without a modal dialog in the way -- the same split as
+        rejection_message, and for the same reason.
+        """
+        entry = self.selected_band
+        if entry is None:
+            return ""
+        ms, iv = entry.markset, entry.interval
+        lines = [f"Delete this mark?", "",
+                 f"    {ms.name}",
+                 f"    {ann.local_text(iv.start_utc)} → "
+                 f"{ann.local_text(iv.end_utc)} local"]
+        if ms.reason:
+            lines.append(f"    “{ms.reason}”")
+        lines.append("")
+        if len(ms.intervals) == 1:
+            # Not an ordinary delete: the set and the written reason go too,
+            # and a reason cannot be regenerated from anything.
+            lines.append(
+                f"This is the only occurrence of “{ms.name}”, so the set is "
+                f"removed as well, along with its reason.")
+        else:
+            lines.append(
+                f"“{ms.name}” has {len(ms.intervals)} occurrences; the other "
+                f"{len(ms.intervals) - 1} are kept.")
+        lines.append("This cannot be undone.")
+        return "\n".join(lines)
+
+    def delete_selected(self):
+        """Delete the selected occurrence, and write. Returns the set, or None.
+
+        The seam. No confirmation here -- the caller asks first, because delete
+        is the undo for this whole feature and has none of its own.
+        """
+        entry = self.selected_band
+        if entry is None:
+            raise RuntimeError("no mark is selected")
+        if self.store is None:
+            raise RuntimeError("this window has nowhere to delete from")
+        ms = self.store.delete_interval(entry.markset.set_id,
+                                        entry.interval.start_utc,
+                                        entry.interval.end_utc)
+        self.redraw_marks()
+        self.span_text.set(SPAN_HINT)
+        return ms
+
+    def prompt_delete(self):
+        """Confirm, then delete. UI only; see delete_selected."""
+        if self.selected_band is None or self.store is None:
+            return
+        name = self.selected_band.markset.name
+        if not messagebox.askyesno("Delete mark", self.deletion_message(),
+                                   icon="warning", default="no", parent=self):
+            return
+        try:
+            self.delete_selected()
+        except Exception as exc:
+            messagebox.showerror("Could not delete the mark", str(exc),
+                                 parent=self)
+            self.redraw_marks()
+            return
+        self.span_text.set(f"Deleted an occurrence of “{name}”.")
+
+    def _sync_delete_button(self):
+        button = getattr(self, "delete_btn", None)
+        if button is not None:
+            button.configure(state=("normal" if self.selected_band is not None
+                                    and self.store is not None else "disabled"))
+
+    def select_interval(self, set_id: str, start_utc, end_utc):
+        """Re-select an occurrence by VALUE after the bands were rebuilt."""
+        for entry in self.bands:
+            if (entry.markset.set_id == set_id
+                    and entry.interval.start_utc == start_utc
+                    and entry.interval.end_utc == end_utc):
+                return self.select_band(entry)
+        return None
+
     def redraw_marks(self):
         """Reload from disk and repaint. The file is the source of truth."""
         for patch in self.mark_patches:
             patch.remove()
+        # Every Band held a patch that has just been removed, so any selection
+        # now points at an artist that is no longer on the axes. Cleared here
+        # rather than left dangling; a caller that wants the selection back
+        # re-selects by value after the redraw.
+        self.selected_band = None
+        self._sync_delete_button()
         self._load_marks()
         self._draw_marks()
         self._refresh_legend()
+        self.refresh_mark_list()
         if getattr(self, "marks_label", None) is not None:
             self.marks_label.configure(
                 text=self.marks_note,
@@ -694,10 +1129,13 @@ class ViewWindow(tk.Toplevel):
         # already paid for once.
         x = self.result.data.index.tz_convert(LOCAL_TZ).tz_localize(None)
 
-        # Plain floats, in the same order as `_utc`. A list rather than an
-        # array so that `annotations.snap_span` stays pure-Python and can be
-        # exercised with no numeric stack present at all.
-        self._xnum = [float(v) for v in mdates.date2num(x)]
+        # The plotted x of every sample, in the same order as `_utc`. An
+        # ARRAY, because matplotlib's own snapping does arithmetic on it
+        # directly and a list raises inside _set_extents. `snap_span` and
+        # `first_descent` bisect and compare, which work on any sequence, so
+        # one representation serves both -- annotations stays free of the
+        # numeric stack because of what it IMPORTS, not what it is handed.
+        self._xnum = np.asarray(mdates.date2num(x), dtype=float)
 
         fig = Figure(figsize=(11.5, 5.0), dpi=100)
         ax = fig.add_subplot(111)
@@ -720,6 +1158,23 @@ class ViewWindow(tk.Toplevel):
         locator = mdates.AutoDateLocator()
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+
+        # PIN THE VIEW TO THE SERIES, and stop autoscaling.
+        #
+        # Everything added after this point is furniture, not data: the mark
+        # bands are clipped to this window by construction, and the span
+        # selector's rubber band is a Rectangle it initialises at x = 0. Left
+        # autoscaling, that rectangle drags the x axis back to the matplotlib
+        # epoch, so the first redraw after a mark is saved rescales the chart
+        # to span 1970 to now and squeezes 45 days of data into a few pixels.
+        # Observed as xlim (-1033, 21704) where the data occupies (20596,
+        # 20641).
+        # autoscale_view computes the limits from the series; setting them
+        # explicitly is what turns autoscaling off, so no further call is
+        # needed and adding one would only imply it was load-bearing.
+        ax.autoscale_view()
+        ax.set_xlim(ax.get_xlim())
+        ax.set_ylim(ax.get_ylim())
 
         # The legend is built by _refresh_legend once the mark bands exist, so
         # that sets are named alongside the series rather than in a second
@@ -919,6 +1374,20 @@ def _main(argv=None):
     checks.append(("this window's local axis ascends, so marking is on",
                    win.descent is None and win.span is not None))
 
+    # matplotlib snaps by doing arithmetic on snap_values, so a list raises
+    # inside _set_extents -- and the CallbackRegistry swallows it, leaving the
+    # rubber band silently not snapping. Asserted by exercising it.
+    try:
+        win.span._set_extents((win._xnum[10] + 0.001, win._xnum[20] + 0.001))
+        snapped = tuple(float(v) for v in win.span.extents)
+        rubber_ok = (abs(snapped[0] - win._xnum[10]) < 1e-9
+                     and abs(snapped[1] - win._xnum[20]) < 1e-9)
+    except Exception as exc:
+        snapped, rubber_ok = repr(exc), False
+    win.span.set_visible(False)
+    checks.append((f"the drag rubber band snaps to samples too, so what is "
+                   f"drawn is what would be stored [{snapped}]", rubber_ok))
+
     i0, i1 = 20, 40
     want0, want1 = res.data.index[i0], res.data.index[i1]
 
@@ -1041,8 +1510,10 @@ def _main(argv=None):
                                for p in win.figure.axes[0].patches)))
         checks.append((f"one band is drawn per interval inside the window "
                        f"[{len(spans)} bands]", len(spans) == len(inside)))
-        checks.append(("the window's mark bookkeeping matches the axes exactly",
-                       spans == win.mark_patches))
+        checks.append(("the derived band views agree with the axes exactly",
+                       spans == win.mark_patches
+                       and [b.patch for b in win.bands] == spans
+                       and all(o.is_drawn for o in win.bands)))
 
         # The band must sit where the STORED instant says, not merely somewhere.
         # The length is part of the assertion: `all()` over an empty zip is
@@ -1171,6 +1642,337 @@ def _main(argv=None):
                        == "third occurrence"))
         dlg._cancel()
         checks.append(("cancelling yields nothing", dlg.result_value is None))
+
+        # ---- clicking a band selects it ------------------------------------
+        win.redraw_marks()
+        target = win.bands[0]
+        mid = target.patch.get_x() + target.patch.get_width() / 2
+
+        checks.append((f"a band is found by the x it covers "
+                       f"[{len(win.bands)} bands indexed]",
+                       win.band_at(mid) is target))
+        checks.append(("clicking a band selects that occurrence, not merely "
+                       "some band",
+                       win.select_band_at(mid) is target
+                       and win.selected_band is target
+                       and win.selection == (target.interval.start_utc,
+                                             target.interval.end_utc)))
+        checks.append((f"the readout names the selected mark "
+                       f"[{win.span_text.get()}]",
+                       target.markset.name in win.span_text.get()
+                       and ann.local_text(target.interval.start_utc)
+                       in win.span_text.get()))
+        checks.append(("the selected band is styled apart from the others",
+                       all(target.patch.get_linewidth() > b.patch.get_linewidth()
+                           for b in win.bands if b is not target)))
+        checks.append(("selecting resolves to the interval's samples, so a "
+                       "later edit can recompute coverage",
+                       win._selected_indices
+                       == win._indices_for(target.interval)))
+
+        # A gap between two bands, to click on nothing.
+        gap = max(b.patch.get_x() + b.patch.get_width() for b in win.bands) \
+            + 0.01
+        checks.append(("clicking away from every band clears the selection",
+                       win.select_band_at(gap) is None
+                       and win.selected_band is None
+                       and win.selection is None))
+        checks.append((f"and the hint comes back [{win.span_text.get()[:38]}...]",
+                       win.span_text.get() == SPAN_HINT))
+
+        win.select_band(target)
+        win.redraw_marks()
+        checks.append(("a redraw drops the selection rather than leaving it "
+                       "pointing at a patch removed from the axes",
+                       win.selected_band is None
+                       and all(b.patch in win.figure.axes[0].patches
+                               for b in win.bands)))
+
+        # Through the real event path, not the method behind it.
+        target = win.bands[0]
+        mid = target.patch.get_x() + target.patch.get_width() / 2
+        px, py = win.figure.axes[0].transData.transform((mid, 0.0))
+        for name in ("button_press_event", "button_release_event"):
+            win.canvas.callbacks.process(
+                name, MouseEvent(name, win.canvas, int(px), int(py),
+                                 button=MouseButton.LEFT))
+        checks.append((f"a real click selects, through the event path "
+                       f"[{win.selected_band.markset.name if win.selected_band else None}]",
+                       win.selected_band is not None))
+        checks.append(("a click did not create a mark",
+                       len(win.bands) == 3))
+
+        # ---- adjusting the selected mark -----------------------------------
+        entry = win.select_band(win.bands[0])
+        was = (entry.interval.start_utc, entry.interval.end_utc)
+        set_id = entry.markset.set_id
+        neighbours = [(b.markset.set_id, b.interval.start_utc,
+                       b.interval.end_utc) for b in win.bands[1:]]
+
+        checks.append(("selecting puts the selector's handles on the mark, so "
+                       "its edges are what a drag moves",
+                       win.span.get_visible()
+                       and win.span.extents
+                       == (win._to_num(was[0]), win._to_num(was[1]))))
+
+        # Move the start earlier by 10 samples and the end later by 5.
+        i0, i1 = win._indices_for(entry.interval)
+        new = (win._utc[i0 - 10], win._utc[i1 + 5])
+        adjusted = win.adjust_selected(*new)
+
+        checks.append((f"the adjusted interval is what the window now shows "
+                       f"[{ann.local_text(new[0])} → {ann.local_text(new[1])}]",
+                       win.selection == new
+                       and win.selected_band is not None
+                       and (win.selected_band.interval.start_utc,
+                            win.selected_band.interval.end_utc) == new))
+        on_disk = ann.Store(tmp).load_file(tmp / f"{set_id}.json")
+        checks.append(("round trip after an edit returns what the window shows",
+                       any((i.start_utc, i.end_utc) == new
+                           for i in on_disk.intervals)
+                       and not any((i.start_utc, i.end_utc) == was
+                                   for i in on_disk.intervals)))
+        checks.append((f"the occurrence count did not change "
+                       f"[{len(on_disk.intervals)}]",
+                       len(on_disk.intervals) == len(adjusted.intervals)))
+        checks.append(("the other occurrences were not touched",
+                       all(n in [(b.markset.set_id, b.interval.start_utc,
+                                  b.interval.end_utc) for b in win.bands]
+                           for n in neighbours)))
+
+        edited = next(i for i in on_disk.intervals
+                      if (i.start_utc, i.end_utc) == new)
+        want_cov = win.coverage_for(*win._indices_for(edited))
+        checks.append((f"coverage was RECOMPUTED for the new window, not "
+                       f"carried over {edited.coverage}",
+                       edited.coverage == want_cov
+                       and edited.coverage != cov))
+
+        band = win.selected_band.patch
+        checks.append(("the band on the chart moved with it",
+                       abs(band.get_x() - win._to_num(new[0])) < 1e-6
+                       and abs(band.get_x() + band.get_width()
+                               - win._to_num(new[1])) < 1e-6))
+
+        # An edge dragged past the other one must change nothing.
+        before_bytes = (tmp / f"{set_id}.json").read_bytes()
+        win.span._active_handle = "min"          # as a real handle drag leaves it
+        win._on_span_select(win._to_num(new[0]), win._to_num(new[0]))
+        win.span._active_handle = None
+        checks.append((f"an edge dragged past the other is refused and nothing "
+                       f"is written [{win.span_text.get()[:46]}...]",
+                       (tmp / f"{set_id}.json").read_bytes() == before_bytes
+                       and "cannot cross" in win.span_text.get()))
+        checks.append(("and the mark stays selected at its stored extent",
+                       win.selection == new))
+
+        # ---- deleting ------------------------------------------------------
+        entry = win.select_band(win.bands[0])
+        set_id, doomed = entry.markset.set_id, (entry.interval.start_utc,
+                                                entry.interval.end_utc)
+        n_before = len(entry.markset.intervals)
+        survivors = [(b.markset.set_id, b.interval.start_utc,
+                      b.interval.end_utc) for b in win.bands[1:]]
+
+        msg = win.deletion_message()
+        checks.append((f"the confirmation names the mark, its local times and "
+                       f"its reason [{msg.splitlines()[2].strip()}]",
+                       entry.markset.name in msg
+                       and ann.local_text(doomed[0]) in msg
+                       and entry.markset.reason in msg
+                       and "cannot be undone" in msg))
+        checks.append((f"and says how many occurrences survive "
+                       f"[{msg.splitlines()[-2]}]",
+                       f"{n_before - 1} are kept" in msg))
+        checks.append(("the Delete button is live only while something is "
+                       "selected",
+                       str(win.delete_btn.cget("state")) == "normal"))
+
+        left = win.delete_selected()
+        checks.append((f"the occurrence is gone from the set "
+                       f"[{n_before} -> {len(left.intervals)}]",
+                       left is not None and len(left.intervals) == n_before - 1
+                       and all((i.start_utc, i.end_utc) != doomed
+                               for i in left.intervals)))
+        checks.append(("round trip after a delete returns what the window shows",
+                       [(i.start_utc, i.end_utc) for i in
+                        ann.Store(tmp).load_file(tmp / f"{set_id}.json").intervals]
+                       == [(i.start_utc, i.end_utc) for i in left.intervals]))
+        checks.append(("its band is off the chart, and the others remain",
+                       all(abs(b.patch.get_x() - win._to_num(doomed[0])) > 1e-9
+                           for b in win.bands)
+                       and all(s in [(b.markset.set_id, b.interval.start_utc,
+                                      b.interval.end_utc) for b in win.bands]
+                               for s in survivors)))
+        checks.append(("nothing is selected afterwards, and the button is off",
+                       win.selected_band is None
+                       and str(win.delete_btn.cget("state")) == "disabled"))
+
+        # Emptying a set needs one whose every occurrence is DRAWN. The set
+        # above has an interval outside the window, which is unreachable by
+        # clicking -- the gap slice 5 exists to close, and a reason this check
+        # gets its own fixture rather than reusing that one.
+        solo = ann.Store(tmp)
+        solo.confirm(study_id=info.study_id, pair=refs, name="short lived",
+                     reason="exists to be deleted",
+                     start_utc=idx[800], end_utc=idx[830])
+        solo.confirm(study_id=info.study_id, pair=refs, name="short lived",
+                     reason="", start_utc=idx[850], end_utc=idx[880])
+        win.redraw_marks()
+        solo_id = next(b.markset.set_id for b in win.bands
+                       if b.markset.name == "short lived")
+
+        warned = False
+        while True:
+            here = [b for b in win.bands if b.markset.set_id == solo_id]
+            if not here:
+                break
+            win.select_band(here[0])
+            if len(here[0].markset.intervals) == 1:
+                note = win.deletion_message()
+                warned = "only occurrence" in note and "reason" in note
+                checks.append((f"deleting the last occurrence warns that the "
+                               f"set and its reason go too "
+                               f"[{note.splitlines()[-2][:52]}...]", warned))
+            if win.delete_selected() is None:
+                break
+        checks.append(("the warning was actually reached, not skipped", warned))
+        checks.append(("deleting the last occurrence removes the file, leaving "
+                       "no named set with nothing in it",
+                       not (tmp / f"{solo_id}.json").exists()))
+        _sets, _bad = ann.Store(tmp).load_all()
+        checks.append((f"the store is still valid afterwards "
+                       f"[{len(_sets)} set(s), {len(_bad)} rejected]",
+                       len(_bad) == 1 and "corrupt.json" in _bad[0]))
+
+        # A mark overlapping the window EDGE is drawn clamped, but its identity
+        # in the store is the original. Selecting one and deleting it must find
+        # it -- keeping only the clamped form made every such mark permanently
+        # unadjustable and undeletable.
+        straddle = ann.Store(tmp)
+        straddle_start = idx[0] - dt.timedelta(days=2)
+        straddle.confirm(study_id=info.study_id, pair=refs, name="straddler",
+                         reason="starts before this window does",
+                         start_utc=straddle_start, end_utc=idx[30])
+        win.redraw_marks()
+        edge = next(b for b in win.bands if b.markset.name == "straddler")
+        checks.append((f"a mark overlapping the window edge keeps its ORIGINAL "
+                       f"extent as identity, and is drawn clamped "
+                       f"[{ann.local_text(edge.interval.start_utc)} stored, "
+                       f"{ann.local_text(edge.drawn.start_utc)} drawn]",
+                       edge.interval.start_utc == straddle_start
+                       and edge.drawn.start_utc == win._utc[0]))
+        win.select_band(edge)
+        try:
+            win.delete_selected()
+            edge_ok, why = True, ""
+        except Exception as exc:
+            edge_ok, why = False, str(exc)[:70]
+        checks.append((f"and it can actually be deleted [{why}]",
+                       edge_ok and not any(b.markset.name == "straddler"
+                                           for b in win.bands)))
+
+        # A window whose axis was refused for marking must still be deletable.
+        # #5 turns the selector off across a DST fall-back; only creating and
+        # adjusting need a monotonic axis, and a window that cannot be marked
+        # must not become one whose marks can never be removed.
+        keep_span, win.span = win.span, None
+        stuck = ann.Store(tmp)
+        stuck.confirm(study_id=info.study_id, pair=refs, name="stranded",
+                      reason="left on an unmarkable window",
+                      start_utc=idx[700], end_utc=idx[740])
+        win.redraw_marks()
+        target = next(b for b in win.bands if b.markset.name == "stranded")
+        picked = win.select_band(target)
+        checks.append(("with the selector refused, a mark can still be "
+                       "selected", picked is target
+                       and win.selected_band is target))
+        win.delete_selected()
+        checks.append(("and deleted, so an unmarkable window is not one whose "
+                       "marks are stuck there forever",
+                       not any(b.markset.name == "stranded"
+                               for b in win.bands)))
+        win.span = keep_span
+
+        # ---- the mark list reaches what the chart cannot --------------------
+        far = ann.Store(tmp)
+        far_start = idx[0] - dt.timedelta(days=40)
+        far.confirm(study_id=info.study_id, pair=refs, name="long ago",
+                    reason="before this window starts",
+                    start_utc=far_start,
+                    end_utc=far_start + dt.timedelta(hours=6))
+        far.confirm(study_id=info.study_id, pair=refs, name="long ago",
+                    reason="", start_utc=idx[900], end_utc=idx[930])
+        win.redraw_marks()
+
+        mine = [o for o in win.occurrences if o.markset.name == "long ago"]
+        checks.append((f"every occurrence is indexed, drawn or not "
+                       f"[{len(mine)} indexed, "
+                       f"{sum(1 for o in mine if o.patch is None)} not drawn]",
+                       len(mine) == 2
+                       and sum(1 for o in mine if o.patch is None) == 1))
+
+        offscreen = next(o for o in mine if o.patch is None)
+        checks.append(("the one outside the window is drawn nowhere, so the "
+                       "chart cannot reach it",
+                       win.band_at(win._to_num(offscreen.interval.start_utc))
+                       is not offscreen))
+
+        rows = {win.mark_tree.item(r, "text").strip(): r
+                for r in win._row_for}
+        listed = ann.local_text(offscreen.interval.start_utc)
+        checks.append((f"but the list shows it, flagged [{listed}]",
+                       any(win._row_for[r] is offscreen for r in win._row_for)))
+        row = next(r for r in win._row_for
+                   if win._row_for[r] is offscreen)
+        checks.append((f"and says it is outside "
+                       f"[{win.mark_tree.item(row, 'values')}]",
+                       win.mark_tree.item(row, "values")[0] == "outside"))
+
+        win.mark_tree.selection_set(row)
+        win._on_row_selected()
+        checks.append(("picking that row selects the occurrence",
+                       win.selected_band is offscreen))
+        checks.append((f"the readout says why it has no handles "
+                       f"[...{win.span_text.get()[-58:]}]",
+                       "not drawn" in win.span_text.get()))
+
+        try:
+            win.adjust_selected(idx[10], idx[20])
+            adjust_refused, why = False, "it was allowed"
+        except RuntimeError as exc:
+            adjust_refused, why = True, str(exc)[:60]
+        checks.append((f"adjusting it is refused, saying what to do instead "
+                       f"[{why}...]", adjust_refused))
+
+        win.mark_tree.selection_set(row)
+        win._on_row_selected()
+        gone = win.delete_selected()
+        still_there = any(o.markset.name == "long ago" and o.patch is None
+                          for o in win.occurrences)
+        checks.append(("BUT IT CAN BE DELETED from the list -- the gap this "
+                       "list exists to close",
+                       gone is not None and not still_there))
+
+        # chart and list stay in step, in both directions
+        drawn_one = next(o for o in win.occurrences if o.patch is not None)
+        win.select_band(drawn_one)
+        sel = win.mark_tree.selection()
+        checks.append(("selecting on the chart highlights the matching row",
+                       bool(sel) and win._row_for.get(sel[0]) is drawn_one))
+        header = win.mark_tree.parent(sel[0])
+        win.mark_tree.selection_set(header)
+        win._on_row_selected()
+        checks.append(("picking a set header selects nothing, rather than "
+                       "guessing which occurrence was meant",
+                       win.selected_band is None))
+
+        lo, hi = win.figure.axes[0].get_xlim()
+        first, last = win._xnum[0], win._xnum[-1]
+        checks.append((f"the x axis still frames the data after a save and a "
+                       f"redraw [{lo:.0f}..{hi:.0f} vs data {first:.0f}.."
+                       f"{last:.0f}]",
+                       lo > first - 5 and hi < last + 5))
 
         colors = {p.get_facecolor()[:3] for p in spans}
         series_rgb = {tuple(round(int(c[i:i + 2], 16) / 255, 6)
