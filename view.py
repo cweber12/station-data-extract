@@ -406,6 +406,7 @@ class ViewWindow(tk.Toplevel):
         self.ghosts = []
         self.ghost_problems = []
         self._ghost_cache = {}
+        self._ghost_ylim = None
 
         self.study = study
         self.study_id = getattr(study, "study_id", None)
@@ -882,7 +883,8 @@ class ViewWindow(tk.Toplevel):
         if self.ghost_problems:
             self.overlay_note = "\n".join(
                 [self.overlay_note] + self.ghost_problems).strip()
-        self._apply_ylim()
+        # NOTE the frame is NOT touched here. Drawing is not a reason to move
+        # the view; see _apply_ylim, called by the two actions that are.
 
     def _ghost_for(self, ref, lo, hi) -> Ghost:
         """One fetch per key per window, failures included. Raises GhostError."""
@@ -903,25 +905,37 @@ class ViewWindow(tk.Toplevel):
         return got
 
     def _apply_ylim(self):
-        """Widen y to fit the ghosts; keep the x pin exactly as it was.
+        """Widen y to fit the ghosts. Called by BORROWING, never by drawing.
 
-        Only the X axis was ever the bug that pinning fixed: the span
-        selector's rubber band is a Rectangle initialised at x = 0, the
-        matplotlib epoch, and left autoscaling it dragged the chart back to
-        1970. A band contributes nothing to the y limits at all -- axvspan
-        spans y in AXES coordinates -- so y can be recomputed safely.
+        THE VIEW BELONGS TO WHOEVER IS LOOKING AT IT. Zoom, pan, home and an
+        action taken on purpose may move the frame; a redraw may not. This ran
+        inside the drawing path once, and saving a region while zoomed snapped
+        the vertical scale back to full range -- measured as y (-1.47, 1.46) ->
+        (-4.90, 4.86) on a save, with the x zoom surviving, which is worse than
+        either being consistent.
 
-        And it has to be. A ghost standardised over a window it does not
-        dominate exceeds the range of the two plotted series easily, and a line
-        whose entire job is to show what a series was doing must not be cropped
-        by a frame that says nothing about having cropped it.
+        Widening for a ghost is legitimate because BORROWING IS AN ACTION. A
+        ghost standardised over a window it does not dominate exceeds the range
+        of the two plotted series easily, and a line whose entire job is to
+        show what a series was doing must not be cropped by a frame that says
+        nothing about having cropped it.
+
+        Only y. The x pin stays exactly as the rubber-band fix left it: a band
+        contributes nothing to the y limits at all -- axvspan spans y in AXES
+        coordinates -- which is why y can be recomputed and x cannot.
         """
         ax = self.figure.axes[0]
         base = getattr(self, "_series_ylim", None)
         if base is None:
             return
         if not self.ghosts:
-            ax.set_ylim(base)                 # exactly what it was before
+            # Restore the frame this widened -- but ONLY if it is still the one
+            # this widened. Anything else means the view was moved since, and
+            # handing back a borrowed set is not a reason to undo a zoom.
+            if self._ghost_ylim is not None \
+                    and ax.get_ylim() == self._ghost_ylim:
+                ax.set_ylim(base)
+            self._ghost_ylim = None
             return
         lows = [base[0]]
         highs = [base[1]]
@@ -933,6 +947,9 @@ class ViewWindow(tk.Toplevel):
         span = max(highs) - min(lows)
         pad = 0.05 * span if span > 0 else 0.5
         ax.set_ylim(min(lows) - pad, max(highs) + pad)
+        # Remembered so that removing the ghost can tell "the frame I set" from
+        # "the frame the user has since chosen", and only undo the former.
+        self._ghost_ylim = ax.get_ylim()
 
     def ghost_message(self) -> str:
         """What to tell someone about a ghost that could not be drawn, or ''.
@@ -1499,6 +1516,9 @@ class ViewWindow(tk.Toplevel):
         if set_id not in self.overlay_ids:
             self.overlay_ids.append(set_id)
         self.redraw_marks()
+        # Here, and not inside the redraw: borrowing is an action, and an
+        # action may move the frame. Drawing may not.
+        self._apply_ylim()
         return cand
 
     def remove_overlay(self, set_id: str) -> bool:
@@ -1507,6 +1527,7 @@ class ViewWindow(tk.Toplevel):
             return False
         self.overlay_ids = [i for i in self.overlay_ids if i != set_id]
         self.redraw_marks()
+        self._apply_ylim()
         return True
 
     # ------------------------------------------------------------- deleting
@@ -2930,6 +2951,32 @@ def _main(argv=None):
                        == n_lines_with - 1
                        and win.figure.axes[0].get_ylim() == win._series_ylim))
         win.overlay(wl.markset.set_id)
+
+        # ---- the view belongs to whoever is looking at it --------------------
+        # docs/adr/0001. This is the assertion the frame code cannot make about
+        # itself: _apply_ylim ran inside the drawing path, so saving a region
+        # while zoomed snapped the vertical scale back to full range while the
+        # x zoom survived. Nothing above would have noticed -- band positions
+        # are asserted in DATA coordinates, which stay correct however absurd
+        # the view becomes.
+        zoomed_x = (float(win._xnum[300]), float(win._xnum[380]))
+        zoomed_y = (-1.5, 1.5)
+        axis.set_xlim(zoomed_x)
+        axis.set_ylim(zoomed_y)
+        win.selection = (idx[320], idx[340])
+        win._selected_indices = (320, 340)
+        win.commit_mark("zoomed in", "saved without leaving the zoom")
+        moved = (axis.get_xlim(), axis.get_ylim())
+        checks.append((f"saving a region while zoomed leaves the view exactly "
+                       f"where it was [y {moved[1][0]:.2f}..{moved[1][1]:.2f}, "
+                       f"wanted {zoomed_y[0]:.2f}..{zoomed_y[1]:.2f}]",
+                       moved == (zoomed_x, zoomed_y)))
+        checks.append(("and the region saved at that zoom is on the chart, so "
+                       "the frame was kept by not moving it rather than by "
+                       "not drawing",
+                       any(b.markset.name == "zoomed in" for b in win.bands)))
+        axis.set_xlim(pinned_x)
+        win._apply_ylim()          # back to the borrowed frame for what follows
 
         # ---- native wins a tie ----------------------------------------------
         overlap = ann.Store(tmp)
