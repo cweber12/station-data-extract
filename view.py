@@ -1868,6 +1868,13 @@ def _main(argv=None):
     ap.add_argument("--overlap", default="union")
     ap.add_argument("--check", action="store_true",
                     help="assert the window is viewable and correct, then exit")
+    ap.add_argument("--shot", default=None, metavar="PATH",
+                    help="write the chart to a PNG and exit. With --check it "
+                         "writes the gate's own window, which carries a native "
+                         "set, two borrowed ones and a ghost line at once -- "
+                         "the picture the overlay's visual review is of, since "
+                         "no gate can assert that a borrowed band READS as "
+                         "borrowed")
     args = ap.parse_args(argv)
 
     from pathlib import Path
@@ -1931,6 +1938,10 @@ def _main(argv=None):
     win.update_idletasks()
 
     if not args.check:
+        if args.shot:
+            win.figure.savefig(args.shot, dpi=110, facecolor="white")
+            print(f"shot  : {args.shot}")
+            return 0
         root_tk.mainloop()
         return 0
 
@@ -2931,6 +2942,16 @@ def _main(argv=None):
                        f"[{len([t for t in legend if 'borrowed from' in t])} "
                        f"attributed]",
                        len([t for t in legend if "borrowed from" in t]) == 2))
+
+        # Everything the visual review is about is on the chart at exactly this
+        # point: this pair's own solid bands, two borrowed sets outlined and
+        # hatched, and a ghost line. Whether a borrowed band READS as borrowed
+        # is a judgement about visual weight, and no assertion above can make
+        # it -- so the gate can hand over the picture instead of a window
+        # someone has to open.
+        if args.shot:
+            win.figure.savefig(args.shot, dpi=110, facecolor="white")
+            print(f"shot  : {args.shot}")
 
         # ---- a key that no longer resolves ----------------------------------
         # "other pair" was drawn against x::y::z, which is in no study. Its
