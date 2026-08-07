@@ -378,6 +378,35 @@ class MarkDialog(tk.Toplevel):
         return self.result_value
 
 
+def _stock_icon_stats(master=None):
+    """Canvas size, palette and ink weight of matplotlib's own toolbar icons.
+
+    Gate support, so "cohesive with the other icons" is a measurement rather
+    than an opinion. Read through `tk.PhotoImage`, which handles PNG in Tk 8.6
+    and is the same reader the button itself uses -- no Pillow, and no second
+    notion of what a pixel is.
+
+    `cbook._get_data_path` is private. Fine HERE: a gate that breaks when
+    matplotlib moves its icons is a gate reporting something true.
+    """
+    from matplotlib import cbook
+    import pathlib
+    folder = pathlib.Path(str(cbook._get_data_path("images")))
+    sizes, colours, weights = set(), set(), []
+    for name in ("home.png", "move.png", "zoom_to_rect.png", "filesave.png"):
+        img = tk.PhotoImage(master=master, file=str(folder / name))
+        sizes.add((img.width(), img.height()))
+        n = 0
+        for x in range(img.width()):
+            for y in range(img.height()):
+                if not img.transparency_get(x, y):
+                    colours.add(img.get(x, y))
+                    n += 1
+        weights.append(n)
+    return {"size": sizes.pop() if len(sizes) == 1 else None,
+            "colours": colours, "low": min(weights), "high": max(weights)}
+
+
 def _region_icon(master):
     """A 20x20 marquee over a trace: "select a span of this chart".
 
@@ -391,46 +420,34 @@ def _region_icon(master):
     must keep the returned image alive: Tk drops an image the moment its last
     Python reference goes, and the button then renders empty.
     """
-    ink, trace, wash = "#3C3C3C", "#2A78D6", "#C9D8EC"
-    img = tk.PhotoImage(master=master, width=20, height=20)
+    # Matched to its neighbours, which is the whole point of an icon here:
+    # matplotlib's are 24x24 PURE BLACK silhouettes of about 220 inked pixels
+    # -- solid shapes, no outlines, no second colour. A two-tone 20x20 badge
+    # sat in that row looking like something from another program.
+    ink = "#000000"
+    size = 24
+    img = tk.PhotoImage(master=master, width=size, height=size)
 
-    # A VERTICAL marquee, not a square one. A region is a span of time and
-    # nothing else, so the selection that depicts it runs the height of the
-    # chart -- the same shape the drag actually leaves behind. A square
-    # marquee would imply the y range is part of the claim, which is the one
-    # thing CONTEXT.md is at pains to say it is not.
-    x0, x1, y0, y1 = 5, 14, 2, 17
-
-    # The wash first, so the trace and the dashes both sit on top of it.
-    for x in range(x0 + 1, x1):
-        for y in range(y0 + 1, y1):
-            img.put(wash, to=(x, y))
-
-    # The trace runs the FULL width, so the marquee is visibly selecting part
-    # of something longer rather than floating on its own.
-    # Shallow on purpose. A steep polyline at this size reads as scribble
-    # rather than as data: six rows of travel in three columns is a near
-    # vertical stroke, and three of those in a row look like noise.
-    ridge = [(1, 12), (5, 10), (9, 12), (13, 8), (18, 10)]
-    for (ax_, ay), (bx, by) in zip(ridge, ridge[1:]):
-        steps = max(abs(bx - ax_), abs(by - ay))
-        for s in range(steps + 1):
-            x = round(ax_ + (bx - ax_) * s / steps)
-            y = round(ay + (by - ay) * s / steps)
-            img.put(trace, to=(x, y))
-
-    # The dashes last, so nothing paints over the edge that carries the
-    # meaning. Anchored at the corners: a dash pattern that starts wherever
-    # the loop happens to begin leaves gaps at the corners, and a rectangle
-    # missing its corners does not read as a rectangle at all.
-    for y in range(y0, y1 + 1):
-        if y in (y0, y1) or (y - y0) % 4 < 2:
-            img.put(ink, to=(x0, y))
-            img.put(ink, to=(x1, y))
+    # The icon IS a region: the colour bar, then the block under it. It
+    # previews its own result, which is the most a 24 px glyph can do.
+    #
+    # Vertical because a region is a span of time and nothing else -- a square
+    # would imply the y range is part of the claim, which CONTEXT.md is at
+    # pains to deny.
+    #
+    # Two solid shapes and a gap, and nothing overlapping. A trace crossing
+    # the block was tried twice: with one colour it has to be knocked out of
+    # the block as negative space, and at this size the knockout either
+    # vanishes at 2 px or severs the block at 3 px. Neighbouring glyphs are
+    # single silhouettes for the same reason.
+    # Width chosen to land inside the stock icons' ink weight (228-284 px);
+    # at ten columns this read visibly lighter than everything beside it.
+    x0, x1 = 6, 17
     for x in range(x0, x1 + 1):
-        if x in (x0, x1) or (x - x0) % 4 < 2:
-            img.put(ink, to=(x, y0))
-            img.put(ink, to=(x, y1))
+        for y in range(2, 5):                     # the colour bar, on top
+            img.put(ink, to=(x, y))
+        for y in range(7, 22):                    # the region under it
+            img.put(ink, to=(x, y))
     return img
 
 
@@ -2470,11 +2487,33 @@ def _main(argv=None):
     inked = {icon.get(x, y) for x, y in opaque}
     checks.append((f"and the image survived, with pixels actually drawn "
                    f"[{icon.width()}x{icon.height()}, {len(opaque)} inked]",
-                   (icon.width(), icon.height()) == (20, 20)
-                   and len(opaque) > 40))
-    checks.append((f"which depict a marquee OVER a trace -- both colours are "
-                   f"present, so it is not half an icon [{sorted(inked)}]",
-                   (60, 60, 60) in inked and (42, 120, 214) in inked))
+                   (icon.width(), icon.height()) == (24, 24)
+                   and len(opaque) > 150))
+
+    # COHESION, asserted rather than asserted-in-a-comment. matplotlib's own
+    # toolbar icons are 24x24 pure-black silhouettes of roughly 210-250 inked
+    # pixels; a two-tone 20x20 badge sat in that row looking like it came from
+    # another program. Same canvas, same single colour, comparable weight.
+    stock = _stock_icon_stats()
+    checks.append((f"and match the stock toolbar icons: same canvas, ONE "
+                   f"colour, pure black [{sorted(inked)} vs stock "
+                   f"{sorted(stock['colours'])}]",
+                   inked == {(0, 0, 0)}
+                   and (icon.width(), icon.height()) == stock["size"]))
+    checks.append((f"at a comparable ink weight, so it does not read as "
+                   f"lighter or heavier than its neighbours "
+                   f"[{len(opaque)} vs stock {stock['low']}-{stock['high']}]",
+                   0.6 * stock["low"] <= len(opaque) <= 1.4 * stock["high"]))
+
+    # A BAR over a BLOCK, which is what a region looks like on the chart. The
+    # gap is the assertion: without it this is one plain rectangle, and the
+    # icon stops previewing its own result.
+    mid = (icon.width()) // 2
+    column = [not icon.transparency_get(mid, y) for y in range(icon.height())]
+    runs = [k for k, v in enumerate(column) if v and not column[k - 1]]
+    checks.append((f"and depict a colour bar ABOVE a region block, not one "
+                   f"plain rectangle [{len(runs)} inked run(s) down the "
+                   f"middle]", len(runs) == 2))
     checks.append((f"and the button is drawn at least as wide as its icon, so "
                    f"the image is rendered and not merely attached "
                    f"[{win.region_btn.winfo_width()} px]",
