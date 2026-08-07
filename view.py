@@ -721,6 +721,20 @@ class ViewWindow(tk.Toplevel):
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 
+        # PIN THE VIEW TO THE SERIES, and stop autoscaling.
+        #
+        # Everything added after this point is furniture, not data: the mark
+        # bands are clipped to this window by construction, and the span
+        # selector's rubber band is a Rectangle it initialises at x = 0. Left
+        # autoscaling, that rectangle drags the x axis back to the matplotlib
+        # epoch, so the first redraw after a mark is saved rescales the chart
+        # to span 1970 to now and squeezes 45 days of data into a few pixels.
+        ax.autoscale_view()
+        self._xlim, self._ylim = ax.get_xlim(), ax.get_ylim()
+        ax.set_xlim(self._xlim)
+        ax.set_ylim(self._ylim)
+        ax.set_autoscale_on(False)
+
         # The legend is built by _refresh_legend once the mark bands exist, so
         # that sets are named alongside the series rather than in a second
         # legend nobody reads.
@@ -1105,6 +1119,13 @@ def _main(argv=None):
                      if p is not getattr(win.span, "_selection_artist", None)]
         checks.append((f"the new band is on the chart without reopening "
                        f"[{len(spans_now)} bands]", len(spans_now) == 3))
+
+        lo, hi = win.figure.axes[0].get_xlim()
+        first, last = win._xnum[0], win._xnum[-1]
+        checks.append((f"the x axis still frames the data after a save and a "
+                       f"redraw [{lo:.0f}..{hi:.0f} vs data {first:.0f}.."
+                       f"{last:.0f}]",
+                       lo > first - 5 and hi < last + 5))
 
         cov = next(i.coverage for i in on_disk.intervals
                    if i.start_utc == idx[500].to_pydatetime())
