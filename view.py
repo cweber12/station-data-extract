@@ -566,9 +566,17 @@ class ViewWindow(tk.Toplevel):
             foreground="#B4531A" if self._overlay_needs_attention() else "#777")
         self.overlay_label.pack(side="left")
 
-        # Bottom-up, then the chart. See the note above `body`.
+        # THE CONTROL GOES ABOVE THE CHART, not below it. It was at the very
+        # bottom, under three status lines, and it fitted the window by ten
+        # pixels -- which is not a layout, it is a coin toss, and it came up
+        # tails on a screen with a taskbar. Above the chart it cannot be
+        # pushed anywhere by anything, and it is the first thing seen rather
+        # than the last, which is the right order for the only control that
+        # brings another pair's regions onto this chart.
+        controls.pack(side="top", fill="x", pady=(0, 8))
+
+        # The rest bottom-up, then the chart. See the note above `body`.
         borrowed.pack(side="bottom", fill="x", pady=(2, 0))
-        controls.pack(side="bottom", fill="x", pady=(8, 0))
         marks.pack(side="bottom", fill="x", pady=(2, 0))
         note.pack(side="bottom", fill="x", pady=(8, 0))
         readout.pack(side="bottom", fill="x", pady=(6, 0))
@@ -2127,6 +2135,29 @@ def _main(argv=None):
                    f"[{len(furniture) - len(absent)}/{len(furniture)}"
                    f"{'; MISSING ' + ', '.join(absent) if absent else ''}]",
                    not absent))
+
+    # Mapped is not the same as REACHABLE. A row can be mapped and still sit
+    # past the bottom edge of the window, which is what a user sees as "it is
+    # overflowing". Asserted against the window's own height, not its request.
+    def below_edge(w):
+        return (w.winfo_rooty() - win.winfo_rooty()) + w.winfo_height() \
+            > win.winfo_height()
+
+    over = [n for n, w in furniture.items() if below_edge(w)]
+    checks.append((f"and none of them runs past the bottom edge of the window "
+                   f"[{'; OVER: ' + ', '.join(over) if over else 'all inside'}]",
+                   not over))
+
+    # The control that brings another pair's regions onto the chart sits ABOVE
+    # the chart. Below it, it was the last thing on a window it fitted by ten
+    # pixels, and the first thing to disappear on a shorter screen.
+    canvas_top = (win.canvas.get_tk_widget().winfo_rooty()
+                  - win.winfo_rooty())
+    control_top = win.overlay_box.winfo_rooty() - win.winfo_rooty()
+    checks.append((f"the 'regions from another pair' control is above the "
+                   f"chart, where nothing can push it off "
+                   f"[control at y={control_top}, chart at y={canvas_top}]",
+                   control_top < canvas_top))
 
     expected = sk.zscore(res.data)
     drawn = win.plotted()
