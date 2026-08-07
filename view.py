@@ -26,6 +26,26 @@ EXACTLY TWO SERIES
     unit -- is deliberately NOT inherited. Temperature against water level is
     the intended use, and it is legitimate because a z-score is unitless.
 
+BORROWING A SET FROM ANOTHER PAIR
+    A set drawn on a DIFFERENT pair can be overlaid here when it shares exactly
+    one series with what is on screen, because then its other member is a
+    candidate explanation that is not currently plotted. Its bands are drawn
+    unfilled and hatched, the legend names the pair they came from, and the
+    absent member is fetched by its stable key and drawn as a faint dashed
+    ghost line.
+
+    THE CORRELATING IS DONE BY EYE, DELIBERATELY. Nothing here computes a
+    relationship between the borrowed series and the plotted ones. An earlier
+    version of this idea ranked all-pairs correlations and offered the best;
+    it was dropped because these series share tidal and diurnal harmonics, so
+    raw-level correlation between any two of them produces confident nonsense.
+    What this shows is where someone judged something interesting and what the
+    series was doing there. The judgement stays with the person.
+
+    A borrowed band is READ-ONLY here, and everything a borrowed set draws is
+    attributed on the chart itself, not only in this window's state: a printed
+    or exported copy has to carry the same warning the screen did.
+
 THREADING
     Everything here runs on the main thread. A ViewWindow is constructed from
     the Tk event loop with a BuildResult a worker has already finished
