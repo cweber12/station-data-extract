@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import datetime as dt
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from zoneinfo import ZoneInfo
 
 import annotations as ann
@@ -114,7 +114,13 @@ def duration_text(td: dt.timedelta) -> str:
 class ViewWindow(tk.Toplevel):
     """The z-score chart of a pair, in a window. Read-only for now."""
 
-    def __init__(self, parent, result, study=None):
+    def __init__(self, parent, result, study=None, annotations_dir=None):
+        """`annotations_dir` defaults to the study's.
+
+        Taken as a path rather than read off the study on purpose: the store is
+        a pure function of a directory, so the window has no business knowing
+        how a study lays itself out, and a gate can point it somewhere harmless.
+        """
         if not available():
             raise RuntimeError(UNAVAILABLE_MESSAGE)
         super().__init__(parent)
@@ -132,6 +138,12 @@ class ViewWindow(tk.Toplevel):
         self._utc = result.data.index
         self._xnum = []
         self.selection: tuple | None = None
+
+        self.study = study
+        self.study_id = getattr(study, "study_id", None)
+        if annotations_dir is None and study is not None:
+            annotations_dir = study.annotations_dir
+        self.annotations_dir = annotations_dir
 
         self.title(self._title_text(study))
         self.geometry("1180x680")
@@ -159,6 +171,9 @@ class ViewWindow(tk.Toplevel):
                   foreground="#777").pack(anchor="w", pady=(0, 6))
 
         self.figure = self._figure()
+        self._load_marks()
+        self._draw_marks()
+        self._refresh_legend()
         canvas = FigureCanvasTkAgg(self.figure, master=frame)
         self.canvas = canvas
         canvas.draw()
@@ -189,6 +204,150 @@ class ViewWindow(tk.Toplevel):
         ttk.Label(note, text=self._coverage_note(),
                   foreground="#777").pack(side="left")
         ttk.Button(note, text="Close", command=self.destroy).pack(side="right")
+
+        marks = ttk.Frame(frame)
+        marks.pack(fill="x", pady=(2, 0))
+        ttk.Label(marks, text=self.marks_note,
+                  foreground="#B4531A" if self._marks_need_attention()
+                  else "#777", wraplength=1100,
+                  justify="left").pack(side="left")
+
+        # NOTE the dialog is NOT raised here. A modal box opened during
+        # construction blocks whoever is building the window -- including a
+        # gate driving it with update() -- until somebody clicks, which is a
+        # hang with no error, the same shape of bug the threading contract on
+        # ProgressDialog exists to prevent. The caller raises it once the
+        # window is up; see report_rejections().
+
+    # ----------------------------------------------------------------- marks
+
+    def _load_marks(self):
+        """The sets already drawn on THIS pair, in THIS study."""
+        self.store = None
+        self.pair_refs = None
+        self.marks = []
+        self.mark_problems = []
+        self.omitted = 0
+        self.mark_patches = []
+        self.mark_legend = []
+
+        if self.annotations_dir is None:
+            self.marks_note = (
+                "Marks are stored in a study, and this is a legacy sources/ "
+                "session, so there is nowhere to put them.")
+            return
+
+        columns = getattr(self.result, "columns", None) or {}
+        missing = [c for c in self.cols if c not in columns]
+        if missing:
+            # A derived column has no ColumnInfo and therefore no resolvable
+            # key. Without one a mark could not say what it was drawn against.
+            self.marks_note = (
+                f"Marking is off: {', '.join(missing)} is derived and has no "
+                f"resolvable source key, so a mark could not record the pair "
+                f"it was drawn against.")
+            return
+
+        self.pair_refs = tuple(ann.SeriesRef(columns[c].key, c)
+                               for c in self.cols)
+        self.store = ann.Store(self.annotations_dir)
+        sets, self.mark_problems = self.store.load_all()
+        self.marks = ann.sets_for_pair(sets, [r.key for r in self.pair_refs],
+                                       self.study_id)
+        self.marks_note = ""            # filled in by _draw_marks
+
+    def _draw_marks(self):
+        """One band per interval, per set, clipped to this window."""
+        self.mark_patches = []
+        self.mark_legend = []
+        self.omitted = 0
+        if not self.marks:
+            self.marks_note = self.marks_note or "No marks on this pair yet."
+            self._append_rejection_note()
+            return
+
+        ax = self.figure.axes[0]
+        lo, hi = self._utc[0], self._utc[-1]
+        drawn = 0
+
+        for ms in self.marks:
+            kept, omitted = ann.clip_to_window(ms.intervals, lo, hi)
+            self.omitted += omitted
+            if not kept:
+                continue
+            for iv in kept:
+                patch = ax.axvspan(
+                    self._to_axis(iv.start_utc), self._to_axis(iv.end_utc),
+                    facecolor="#" + ms.color, alpha=0.22,
+                    edgecolor="#" + ms.color, linewidth=1.0, zorder=0)
+                self.mark_patches.append(patch)
+                drawn += 1
+            # One legend entry per SET, not per band -- the whole point of a
+            # set is that many occurrences are one phenomenon.
+            self.mark_legend.append((patch, f"{ms.name}  ({len(kept)}×)"))
+
+        n_sets = len({id(m) for m in self.marks})
+        parts = [f"{drawn} mark(s) in {n_sets} set(s) on this pair."]
+        if self.omitted:
+            parts.append(
+                f"{self.omitted} fall outside this window and are NOT drawn — "
+                f"rebuild wider to see them.")
+        self.marks_note = "  ".join(parts)
+        self._append_rejection_note()
+
+    def _to_axis(self, when):
+        """A UTC instant -> the naive local value the axis is drawn on.
+
+        This IS the conversion snap_span refuses to make, and it is safe in
+        this direction only. One instant has exactly one local rendering; it is
+        the reverse -- a wall time back to an instant -- that is ambiguous for
+        an hour each November and undefined for an hour each March.
+        """
+        return when.astimezone(LOCAL_TZ).replace(tzinfo=None)
+
+    def _append_rejection_note(self):
+        if self.mark_problems:
+            self.marks_note += (f"  {len(self.mark_problems)} annotation "
+                                f"file(s) REJECTED and not shown.")
+
+    def _marks_need_attention(self) -> bool:
+        return bool(self.mark_problems or self.omitted)
+
+    def rejection_message(self) -> str:
+        """What to tell someone about files that would not load, or ''.
+
+        Separate from showing it so the wording can be asserted without a modal
+        dialog standing in the way.
+        """
+        if not self.mark_problems:
+            return ""
+        return ("These files are in the study but could not be trusted, so "
+                "their marks are NOT on the chart:\n\n"
+                + "\n\n".join(self.mark_problems[:5]))
+
+    def report_rejections(self):
+        """Raise the dialog, if there is anything to say. Caller's job.
+
+        A mark that failed to load is one someone made and can no longer see,
+        which is the single failure this feature must not be quiet about -- so
+        it gets a dialog, not only the grey line under the chart.
+        """
+        msg = self.rejection_message()
+        if msg:
+            messagebox.showwarning("Annotation files rejected", msg,
+                                   parent=self)
+
+    def _refresh_legend(self):
+        """Series first, then the sets. Bands are named or they say nothing."""
+        ax = self.figure.axes[0]
+        handles = list(self.series_lines.values())
+        labels = [h.get_label() for h in handles]
+        for patch, label in self.mark_legend:
+            handles.append(patch)
+            labels.append(label)
+        ax.legend(handles, labels, loc="upper center",
+                  bbox_to_anchor=(0.5, -0.16), ncol=2, frameon=False,
+                  fontsize=9)
 
     # ------------------------------------------------------------- selecting
 
@@ -329,8 +488,9 @@ class ViewWindow(tk.Toplevel):
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16),
-                  ncol=2, frameon=False, fontsize=9)
+        # The legend is built by _refresh_legend once the mark bands exist, so
+        # that sets are named alongside the series rather than in a second
+        # legend nobody reads.
         fig.subplots_adjust(left=0.06, right=0.99, top=0.97, bottom=0.28)
         return fig
 
@@ -359,6 +519,7 @@ class ViewWindow(tk.Toplevel):
 
 def _main(argv=None):
     import argparse
+    import json
     import sys
 
     import numpy as np
@@ -552,6 +713,113 @@ def _main(argv=None):
     checks.append((f"a real mouse drag sets the selection, within one sample "
                    f"[{sel[0] if sel else None} .. {sel[1] if sel else None}]",
                    near))
+
+    # ---- reopening a marked pair renders the marks --------------------------
+    # Against a temp directory, not the study's: the store is a function of a
+    # path, and a gate should not leave marks in someone's real study.
+    import shutil
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp(prefix="view-gate-"))
+    win.destroy()
+    try:
+        store = ann.Store(tmp)
+        refs = tuple(ann.SeriesRef(res.columns[c].key, c)
+                     for c in res.data.columns)
+        idx = res.data.index
+
+        # two occurrences inside the window, one entirely outside it
+        inside = [(idx[100], idx[140]), (idx[300], idx[360])]
+        for a, b in inside:
+            store.confirm(study_id=info.study_id, pair=refs,
+                          name="internal tide", reason="gate fixture",
+                          start_utc=a, end_utc=b)
+        store.confirm(study_id=info.study_id, pair=refs, name="internal tide",
+                      reason="", start_utc=idx[0] - dt.timedelta(days=30),
+                      end_utc=idx[0] - dt.timedelta(days=29))
+        # a set on a DIFFERENT pair, which must not appear
+        store.confirm(study_id=info.study_id, reason="", name="other pair",
+                      pair=(refs[0], ann.SeriesRef("x::y::z", "x.y.z")),
+                      start_utc=idx[100], end_utc=idx[140])
+        # and a file that cannot be trusted
+        (tmp / "corrupt.json").write_text(json.dumps({
+            "set_id": "corrupt", "name": "zone-less", "color": "6E7B8B",
+            "created_utc": "2026-08-06T00:00:00+00:00",
+            "study_id": info.study_id,
+            "pair": [refs[0].to_json(), refs[1].to_json()],
+            "intervals": [{"start_utc": "2026-07-20 21:00:00",
+                           "end_utc": "2026-07-20T23:00:00+00:00"}],
+        }, indent=2), encoding="utf-8")
+
+        win = ViewWindow(root_tk, res, study=info, annotations_dir=tmp)
+        win.update()
+        win.update_idletasks()
+
+        checks.append(("reopening the pair loads only ITS sets, not the one "
+                       f"drawn on another pair [{[m.name for m in win.marks]}]",
+                       [m.name for m in win.marks] == ["internal tide"]))
+
+        # Read off the AXES, not off the window's own bookkeeping -- what is on
+        # the chart is the claim being made. The SpanSelector keeps its own
+        # rubber-band Rectangle on the same axes, so it is excluded by
+        # IDENTITY rather than by type or colour, either of which would start
+        # silently swallowing real bands the day one of them matched.
+        rubber_band = getattr(win.span, "_selection_artist", None)
+        spans = [p for p in win.figure.axes[0].patches if p is not rubber_band]
+        checks.append(("the drag rubber-band is on the axes and was excluded",
+                       rubber_band is not None
+                       and any(p is rubber_band
+                               for p in win.figure.axes[0].patches)))
+        checks.append((f"one band is drawn per interval inside the window "
+                       f"[{len(spans)} bands]", len(spans) == len(inside)))
+        checks.append(("the window's mark bookkeeping matches the axes exactly",
+                       spans == win.mark_patches))
+
+        # The band must sit where the STORED instant says, not merely somewhere.
+        # The length is part of the assertion: `all()` over an empty zip is
+        # True, so without it this passes loudest when nothing was drawn at all.
+        drawn_x = sorted((p.get_x(), p.get_x() + p.get_width()) for p in spans)
+        want_x = sorted((mdates.date2num(win._to_axis(a)),
+                         mdates.date2num(win._to_axis(b)))
+                        for a, b in inside)
+        placed = (len(drawn_x) == len(want_x)
+                  and all(abs(g[0] - w[0]) < 1e-6 and abs(g[1] - w[1]) < 1e-6
+                          for g, w in zip(drawn_x, want_x)))
+        checks.append((f"each band spans exactly its stored interval "
+                       f"[{len(drawn_x)} compared]", placed))
+
+        checks.append((f"the interval outside the window is reported, not "
+                       f"dropped silently [omitted={win.omitted}]",
+                       win.omitted == 1))
+
+        legend = [t.get_text()
+                  for t in win.figure.axes[0].get_legend().get_texts()]
+        checks.append((f"the legend names the set beside the series {legend}",
+                       any("internal tide" in t for t in legend)
+                       and len(legend) == len(res.data.columns) + 1))
+
+        checks.append((f"the untrusted file is reported [{len(win.mark_problems)}"
+                       f" rejected]", len(win.mark_problems) == 1
+                       and "corrupt.json" in win.mark_problems[0]))
+        msg = win.rejection_message()
+        checks.append(("the rejection names the file, the field and the "
+                       "problem, without a modal dialog to block a caller",
+                       "corrupt.json" in msg and "start_utc" in msg
+                       and "no timezone" in msg))
+        checks.append((f"the note says what happened [{win.marks_note}]",
+                       "REJECTED" in win.marks_note
+                       and "NOT drawn" in win.marks_note))
+
+        colors = {p.get_facecolor()[:3] for p in spans}
+        series_rgb = {tuple(round(int(c[i:i + 2], 16) / 255, 6)
+                            for i in (0, 2, 4))
+                      for c in identity.SERIES_COLORS}
+        rounded = {tuple(round(v, 6) for v in c) for c in colors}
+        checks.append((f"no band is drawn in a series colour "
+                       f"[{len(rounded)} band colour(s) checked]",
+                       bool(rounded) and not (rounded & series_rgb)))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     print("\nview gate:")
     for what, ok in checks:

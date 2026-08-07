@@ -1406,7 +1406,7 @@ class App(tk.Tk):
     def show_view(self, res):
         """Main thread only -- builds the window from a finished result."""
         try:
-            view.ViewWindow(self, res, study=self.study)
+            win = view.ViewWindow(self, res, study=self.study)
         except Exception as exc:
             msg = "".join(traceback.format_exception_only(
                 type(exc), exc)).strip()
@@ -1414,6 +1414,12 @@ class App(tk.Tk):
             messagebox.showerror("Could not open the chart", msg)
             return
         self.status.set(f"Viewing {' vs '.join(res.data.columns)}")
+
+        # Raised HERE rather than inside the window, because a modal dialog
+        # opened during construction blocks the caller until someone clicks.
+        for problem in win.mark_problems:
+            self.write_log("ANNOTATION REJECTED: " + problem)
+        win.report_rejections()
 
     def generate(self):
         if not self.selected:
