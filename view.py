@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import datetime as dt
 import tkinter as tk
+from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from zoneinfo import ZoneInfo
 
@@ -66,7 +67,8 @@ except Exception as exc:                       # pragma: no cover - environment
     SpanSelector = None
     IMPORT_ERROR = exc
 
-SPAN_HINT = "Drag across the chart to define a region."
+SPAN_HINT = ("Drag across the chart to define a region.  "
+             "Click a mark to select it.")
 
 UNAVAILABLE_MESSAGE = (
     "The chart view needs matplotlib, which is not installed.\n\n"
@@ -109,6 +111,19 @@ def duration_text(td: dt.timedelta) -> str:
     parts = [f"{days} d" if days else "", f"{hours} h" if hours else "",
              f"{minutes} min" if minutes else ""]
     return " ".join(p for p in parts if p) or "0 min"
+
+
+@dataclass
+class Band:
+    """One drawn occurrence, and what it is an occurrence OF.
+
+    A patch on its own is a rectangle. Clicking one has to resolve to the set
+    and the interval it came from, or neither adjusting nor deleting can say
+    what it is acting on.
+    """
+    patch: object
+    markset: object
+    interval: object
 
 
 class MarkDialog(tk.Toplevel):
@@ -233,6 +248,8 @@ class ViewWindow(tk.Toplevel):
         self._xnum = []
         self.selection: tuple | None = None
         self._selected_indices = (0, 0)
+        self.bands = []
+        self.selected_band = None
 
         self.study = study
         self.study_id = getattr(study, "study_id", None)
@@ -325,6 +342,7 @@ class ViewWindow(tk.Toplevel):
         self.omitted = 0
         self.mark_patches = []
         self.mark_legend = []
+        self.bands = []
 
         if self.annotations_dir is None:
             self.marks_note = (
@@ -355,6 +373,7 @@ class ViewWindow(tk.Toplevel):
         """One band per interval, per set, clipped to this window."""
         self.mark_patches = []
         self.mark_legend = []
+        self.bands = []
         self.omitted = 0
         if not self.marks:
             self.marks_note = self.marks_note or "No marks on this pair yet."
@@ -376,6 +395,7 @@ class ViewWindow(tk.Toplevel):
                     facecolor="#" + ms.color, alpha=0.22,
                     edgecolor="#" + ms.color, linewidth=1.0, zorder=0)
                 self.mark_patches.append(patch)
+                self.bands.append(Band(patch, ms, iv))
                 drawn += 1
             # One legend entry per SET, not per band -- the whole point of a
             # set is that many occurrences are one phenomenon.
@@ -485,6 +505,91 @@ class ViewWindow(tk.Toplevel):
             props=dict(facecolor="#808080", alpha=0.20),
         )
 
+        # Click-to-select needs its own handlers rather than riding on
+        # onselect: a zero-span click only reaches onselect when a selection
+        # ALREADY exists (SpanSelector._release calls it under
+        # `span <= minspan` only if `_selection_completed`), so the first click
+        # on a band would never arrive. Connected after the selector, so these
+        # run after its own press/release handling has settled.
+        self._press_x = None
+        self.canvas.mpl_connect("button_press_event", self._on_press)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
+
+    # ------------------------------------------------------- selecting a mark
+
+    def _on_press(self, event):
+        """Remember where a press landed, so release can tell click from drag."""
+        if event.inaxes is self.figure.axes[0]:
+            self._press_x = event.xdata
+
+    def _on_release(self, event):
+        """A click that did not move is a SELECT, not a failed drag."""
+        if event.inaxes is not self.figure.axes[0] or self._press_x is None:
+            return
+        moved = self.span_interval(self._press_x, event.xdata) is not None
+        self._press_x = None
+        if moved:
+            return                       # a real drag; onselect owns it
+        self.select_band_at(event.xdata)
+
+    def band_at(self, x: float):
+        """The (set, interval, patch) whose band covers x, or None.
+
+        Hit-tested on x alone. A band spans the full height of the axes, so the
+        y coordinate carries no information about which mark was clicked, and
+        consulting it would only make a click near the top or bottom edge fail
+        for no reason a user could see.
+        """
+        for entry in self.bands:
+            if entry.patch.get_x() <= x <= entry.patch.get_x() \
+                    + entry.patch.get_width():
+                return entry
+        return None
+
+    def select_band_at(self, x: float):
+        """Select the mark under x, or clear the selection. Returns the entry."""
+        return self.select_band(self.band_at(x))
+
+    def select_band(self, entry):
+        """Make `entry` the selected mark, or clear when None."""
+        self.selected_band = entry
+        self._restyle_bands()
+
+        if entry is None:
+            self.selection = None
+            self.span_text.set(SPAN_HINT)
+            self.canvas.draw_idle()
+            return None
+
+        self.selection = (entry.interval.start_utc, entry.interval.end_utc)
+        self._selected_indices = self._indices_for(entry.interval)
+        self.span_text.set(self._selected_summary(entry))
+        self.canvas.draw_idle()
+        return entry
+
+    def _selected_summary(self, entry) -> str:
+        iv = entry.interval
+        return (f"Selected “{entry.markset.name}”:  "
+                f"{ann.local_text(iv.start_utc)}  →  "
+                f"{ann.local_text(iv.end_utc)}  local"
+                f"  ·  {duration_text(iv.end_utc - iv.start_utc)}")
+
+    def _restyle_bands(self):
+        """The selected band reads as selected. Colour still identifies the set."""
+        for entry in self.bands:
+            chosen = entry is self.selected_band
+            entry.patch.set_alpha(0.34 if chosen else 0.22)
+            entry.patch.set_linewidth(2.2 if chosen else 1.0)
+            entry.patch.set_linestyle("solid" if chosen else "dotted")
+
+    def _to_num(self, when) -> float:
+        return float(mdates.date2num(self._to_axis(when)))
+
+    def _indices_for(self, interval) -> tuple:
+        """Which samples an interval's edges sit on, for coverage."""
+        return ann.snap_span(self._to_num(interval.start_utc),
+                             self._to_num(interval.end_utc), self._xnum)
+
     def span_interval(self, x0: float, x1: float):
         """A dragged span -> (start_utc, end_utc, i0, i1), or None if degenerate.
 
@@ -585,6 +690,11 @@ class ViewWindow(tk.Toplevel):
         """Reload from disk and repaint. The file is the source of truth."""
         for patch in self.mark_patches:
             patch.remove()
+        # Every Band held a patch that has just been removed, so any selection
+        # now points at an artist that is no longer on the axes. Cleared here
+        # rather than left dangling; a caller that wants the selection back
+        # re-selects by value after the redraw.
+        self.selected_band = None
         self._load_marks()
         self._draw_marks()
         self._refresh_legend()
@@ -729,6 +839,8 @@ class ViewWindow(tk.Toplevel):
         # autoscaling, that rectangle drags the x axis back to the matplotlib
         # epoch, so the first redraw after a mark is saved rescales the chart
         # to span 1970 to now and squeezes 45 days of data into a few pixels.
+        # Observed as xlim (-1033, 21704) where the data occupies (20596,
+        # 20641).
         ax.autoscale_view()
         self._xlim, self._ylim = ax.get_xlim(), ax.get_ylim()
         ax.set_xlim(self._xlim)
@@ -1120,13 +1232,6 @@ def _main(argv=None):
         checks.append((f"the new band is on the chart without reopening "
                        f"[{len(spans_now)} bands]", len(spans_now) == 3))
 
-        lo, hi = win.figure.axes[0].get_xlim()
-        first, last = win._xnum[0], win._xnum[-1]
-        checks.append((f"the x axis still frames the data after a save and a "
-                       f"redraw [{lo:.0f}..{hi:.0f} vs data {first:.0f}.."
-                       f"{last:.0f}]",
-                       lo > first - 5 and hi < last + 5))
-
         cov = next(i.coverage for i in on_disk.intervals
                    if i.start_utc == idx[500].to_pydatetime())
         n_expected = 61                       # samples 500..560 inclusive
@@ -1192,6 +1297,72 @@ def _main(argv=None):
                        == "third occurrence"))
         dlg._cancel()
         checks.append(("cancelling yields nothing", dlg.result_value is None))
+
+        # ---- clicking a band selects it ------------------------------------
+        win.redraw_marks()
+        target = win.bands[0]
+        mid = target.patch.get_x() + target.patch.get_width() / 2
+
+        checks.append((f"a band is found by the x it covers "
+                       f"[{len(win.bands)} bands indexed]",
+                       win.band_at(mid) is target))
+        checks.append(("clicking a band selects that occurrence, not merely "
+                       "some band",
+                       win.select_band_at(mid) is target
+                       and win.selected_band is target
+                       and win.selection == (target.interval.start_utc,
+                                             target.interval.end_utc)))
+        checks.append((f"the readout names the selected mark "
+                       f"[{win.span_text.get()}]",
+                       target.markset.name in win.span_text.get()
+                       and ann.local_text(target.interval.start_utc)
+                       in win.span_text.get()))
+        checks.append(("the selected band is styled apart from the others",
+                       all(target.patch.get_linewidth() > b.patch.get_linewidth()
+                           for b in win.bands if b is not target)))
+        checks.append(("selecting resolves to the interval's samples, so a "
+                       "later edit can recompute coverage",
+                       win._selected_indices
+                       == win._indices_for(target.interval)))
+
+        # A gap between two bands, to click on nothing.
+        gap = max(b.patch.get_x() + b.patch.get_width() for b in win.bands) \
+            + 0.01
+        checks.append(("clicking away from every band clears the selection",
+                       win.select_band_at(gap) is None
+                       and win.selected_band is None
+                       and win.selection is None))
+        checks.append((f"and the hint comes back [{win.span_text.get()[:38]}...]",
+                       win.span_text.get() == SPAN_HINT))
+
+        win.select_band(target)
+        win.redraw_marks()
+        checks.append(("a redraw drops the selection rather than leaving it "
+                       "pointing at a patch removed from the axes",
+                       win.selected_band is None
+                       and all(b.patch in win.figure.axes[0].patches
+                               for b in win.bands)))
+
+        # Through the real event path, not the method behind it.
+        target = win.bands[0]
+        mid = target.patch.get_x() + target.patch.get_width() / 2
+        px, py = win.figure.axes[0].transData.transform((mid, 0.0))
+        for name in ("button_press_event", "button_release_event"):
+            win.canvas.callbacks.process(
+                name, MouseEvent(name, win.canvas, int(px), int(py),
+                                 button=MouseButton.LEFT))
+        checks.append((f"a real click selects, through the event path "
+                       f"[{win.selected_band.markset.name if win.selected_band else None}]",
+                       win.selected_band is not None))
+        checks.append(("a click did not create a mark",
+                       len(win.bands) == 3))
+
+        lo, hi = win.figure.axes[0].get_xlim()
+        first, last = win._xnum[0], win._xnum[-1]
+        checks.append((f"the x axis still frames the data after a save and a "
+                       f"redraw [{lo:.0f}..{hi:.0f} vs data {first:.0f}.."
+                       f"{last:.0f}]",
+                       lo > first - 5 and hi < last + 5))
 
         colors = {p.get_facecolor()[:3] for p in spans}
         series_rgb = {tuple(round(int(c[i:i + 2], 16) / 255, 6)
