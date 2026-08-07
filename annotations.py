@@ -632,6 +632,21 @@ class Store:
         interval = Interval(start_utc=start, end_utc=end,
                             coverage=dict(coverage or {}))
 
+        # An occurrence is identified by its (set, start, end). Two identical
+        # intervals in one set would make that identity ambiguous, and
+        # update_interval and delete_interval both depend on it -- adjusting
+        # "one of the two identical ones" is not a thing anybody can mean.
+        # Refusing the duplicate is also the right answer on its own terms: a
+        # double-click, or re-marking a region already marked, is a mistake.
+        if match is not None and any(i.start_utc == start and i.end_utc == end
+                                     for i in match.intervals):
+            raise AnnotationError(
+                f"“{name}” already records this exact occurrence "
+                f"({format_utc(start)} -> {format_utc(end)}). Marking the same "
+                f"region twice under one name would make the two "
+                f"indistinguishable, and neither could then be adjusted or "
+                f"deleted on its own.")
+
         if match is not None:
             match.intervals.append(interval)
             match.intervals.sort(key=lambda i: i.start_utc)
@@ -652,6 +667,93 @@ class Store:
                      study_id=study_id, pair=pair, tz=tz, intervals=[interval])
         self.save(ms)
         return ms
+
+    # ------------------------------------------------------ adjust and delete
+
+    def _one_set(self, set_id: str) -> MarkSet:
+        path = self.path_for(set_id)
+        if not path.is_file():
+            raise AnnotationError(
+                f"no annotation set {set_id!r} in {self.dir}. It may have been "
+                f"deleted by another window since this one loaded.")
+        return self.load_file(path)
+
+    @staticmethod
+    def _find(ms: MarkSet, start, end) -> int:
+        """Where an occurrence sits, found by VALUE.
+
+        Never by position. Intervals are stored sorted by start time, so
+        adjusting one occurrence's start MOVES it within the set -- an index
+        captured before the edit can address a different occurrence after it,
+        and the failure is silent because both are valid intervals.
+        """
+        want = (coerce_utc(start, "start_utc"), coerce_utc(end, "end_utc"))
+        for i, iv in enumerate(ms.intervals):
+            if (iv.start_utc, iv.end_utc) == want:
+                return i
+        raise AnnotationError(
+            f"“{ms.name}” has no occurrence at {format_utc(want[0])} -> "
+            f"{format_utc(want[1])}. It may already have been adjusted or "
+            f"deleted; reload before trying again.")
+
+    def update_interval(self, set_id: str, old_start, old_end, *,
+                        start_utc, end_utc, coverage=None) -> MarkSet:
+        """Move one occurrence's edges, and write. Returns the updated set.
+
+        `coverage` REPLACES what was recorded. It describes the marked window,
+        so moving an edge makes the old numbers describe a window that no
+        longer exists -- keeping them would turn a captured fact into a quiet
+        lie. Pass the recomputed values; passing None clears them rather than
+        preserving stale ones.
+        """
+        start = coerce_utc(start_utc, "start_utc")
+        end = coerce_utc(end_utc, "end_utc")
+        if end <= start:
+            raise AnnotationError(
+                f"a mark must have a duration; got {format_utc(start)} -> "
+                f"{format_utc(end)}. An interval with no duration marks nothing.")
+
+        ms = self._one_set(set_id)
+        i = self._find(ms, old_start, old_end)
+
+        clash = any(j != i and iv.start_utc == start and iv.end_utc == end
+                    for j, iv in enumerate(ms.intervals))
+        if clash:
+            raise AnnotationError(
+                f"“{ms.name}” already records an occurrence at "
+                f"{format_utc(start)} -> {format_utc(end)}. Adjusting this one "
+                f"onto it would make the two indistinguishable.")
+
+        ms.intervals[i] = replace(ms.intervals[i], start_utc=start,
+                                  end_utc=end, coverage=dict(coverage or {}))
+        ms.intervals.sort(key=lambda iv: iv.start_utc)
+        self.save(ms)
+        return ms
+
+    def delete_interval(self, set_id: str, start, end):
+        """Remove one occurrence. Returns the set, or None if the file went.
+
+        Deleting the LAST occurrence removes the file. A set with no intervals
+        is a name that draws nothing, and it would go on being offered in the
+        create dialog as a grouping to join. The set's reason dies with it,
+        which is why the caller is expected to have said so before asking.
+        """
+        ms = self._one_set(set_id)
+        i = self._find(ms, start, end)
+        del ms.intervals[i]
+        if not ms.intervals:
+            self.path_for(set_id).unlink(missing_ok=True)
+            return None
+        self.save(ms)
+        return ms
+
+    def delete_set(self, set_id: str) -> bool:
+        """Remove a whole set, occurrences and all. True if a file went."""
+        path = self.path_for(set_id)
+        if not path.is_file():
+            return False
+        path.unlink()
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +971,104 @@ def _main(argv=None):
            len(good) == 2 and len(bad) == 1 and "broken.json" in bad[0],
            f"{len(good)} loaded, {len(bad)} rejected: "
            f"{bad[0][:70] if bad else ''}...")
+
+        # ---- adjusting and deleting ----------------------------------------
+        edits = Store(tmp / "edits")
+        made = edits.confirm(
+            study_id=study_id, pair=pair, name="edited", reason="r",
+            start_utc=sent[0][0], end_utc=sent[0][1], coverage=cov)
+        for start, end in sent[1:]:
+            edits.confirm(study_id=study_id, pair=pair, name="edited",
+                          reason="", start_utc=start, end_utc=end)
+        sibling = edits.confirm(
+            study_id=study_id, pair=pair, name="untouched", reason="",
+            start_utc=dt.datetime(2026, 8, 1, 0, tzinfo=utc),
+            end_utc=dt.datetime(2026, 8, 1, 6, tzinfo=utc))
+        sibling_bytes = edits.path_for(sibling.set_id).read_bytes()
+
+        rejects("marking the same region twice under one name is refused, so "
+                "an occurrence has a real identity",
+                lambda: edits.confirm(
+                    study_id=study_id, pair=pair, name="edited", reason="",
+                    start_utc=sent[0][0], end_utc=sent[0][1]),
+                "already records this exact occurrence", "indistinguishable")
+
+        # Adjust the FIRST occurrence so far right that it re-sorts to last.
+        # This is precisely what matching by index gets wrong, and silently:
+        # both before and after are valid intervals, so nothing raises.
+        moved_start = dt.datetime(2026, 7, 24, 0, tzinfo=utc)
+        moved_end = dt.datetime(2026, 7, 24, 6, tzinfo=utc)
+        new_cov = {"LJAC1.sea_water_temperature": coverage_entry(6, 1, 0),
+                   "LJAC1.water_level": coverage_entry(6, 0, None)}
+        after_edit = edits.update_interval(
+            made.set_id, sent[0][0], sent[0][1],
+            start_utc=moved_start, end_utc=moved_end, coverage=new_cov)
+
+        ok("adjusting an occurrence past its neighbours re-sorts the set",
+           [i.start_utc for i in after_edit.intervals]
+           == [sent[1][0], sent[2][0], moved_start],
+           " / ".join(format_utc(i.start_utc) for i in after_edit.intervals))
+        ok("the OTHER occurrences are untouched by the adjustment",
+           [(i.start_utc, i.end_utc) for i in after_edit.intervals[:2]]
+           == [sent[1], sent[2]])
+
+        reread = edits.load_file(edits.path_for(made.set_id))
+        ok("round trip after an edit returns the adjusted interval",
+           any(i.start_utc == moved_start and i.end_utc == moved_end
+               for i in reread.intervals))
+        ok("coverage is REPLACED on adjust, not left describing the old window",
+           next(i.coverage for i in reread.intervals
+                if i.start_utc == moved_start) == new_cov)
+        ok("adjusting one set leaves another byte-identical",
+           edits.path_for(sibling.set_id).read_bytes() == sibling_bytes)
+
+        rejects("adjusting an occurrence that is no longer there is refused, "
+                "and says to reload",
+                lambda: edits.update_interval(
+                    made.set_id, sent[0][0], sent[0][1],
+                    start_utc=moved_start, end_utc=moved_end),
+                "no occurrence at", "reload")
+        rejects("adjusting one occurrence onto another is refused",
+                lambda: edits.update_interval(
+                    made.set_id, sent[1][0], sent[1][1],
+                    start_utc=moved_start, end_utc=moved_end),
+                "already records an occurrence", "indistinguishable")
+        rejects("adjusting to no duration is refused",
+                lambda: edits.update_interval(
+                    made.set_id, sent[1][0], sent[1][1],
+                    start_utc=sent[1][0], end_utc=sent[1][0]),
+                "must have a duration")
+
+        left = edits.delete_interval(made.set_id, sent[1][0], sent[1][1])
+        ok("deleting a middle occurrence leaves the rest",
+           left is not None and len(left.intervals) == 2
+           and all(i.start_utc != sent[1][0] for i in left.intervals),
+           " / ".join(format_utc(i.start_utc) for i in left.intervals))
+        ok("round trip after a delete returns what is left",
+           [(i.start_utc, i.end_utc)
+            for i in edits.load_file(edits.path_for(made.set_id)).intervals]
+           == [(i.start_utc, i.end_utc) for i in left.intervals])
+        ok("deleting from one set leaves another byte-identical",
+           edits.path_for(sibling.set_id).read_bytes() == sibling_bytes)
+
+        edits.delete_interval(made.set_id, sent[2][0], sent[2][1])
+        gone = edits.delete_interval(made.set_id, moved_start, moved_end)
+        ok("deleting the LAST occurrence removes the file, so no named set "
+           "survives with nothing in it",
+           gone is None and not edits.path_for(made.set_id).exists())
+        survivors, problems = edits.load_all()
+        ok("the store is valid afterwards and the other set is intact",
+           not problems and [s.name for s in survivors] == ["untouched"],
+           f"{[s.name for s in survivors]}, {problems}")
+
+        rejects("deleting from a set that is gone is refused, naming it",
+                lambda: edits.delete_interval(made.set_id, moved_start,
+                                              moved_end),
+                made.set_id, "may have been deleted")
+        ok("delete_set removes a whole set and reports whether it did",
+           edits.delete_set(sibling.set_id) is True
+           and edits.delete_set(sibling.set_id) is False
+           and edits.load_all() == ([], []))
 
         # ---- pair matching --------------------------------------------------
         keys = [r.key for r in pair]
