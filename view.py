@@ -36,10 +36,12 @@ THREADING
 
 from __future__ import annotations
 
+import datetime as dt
 import tkinter as tk
 from tkinter import ttk
 from zoneinfo import ZoneInfo
 
+import annotations as ann
 import identity
 import sensorkit as sk
 
@@ -56,11 +58,15 @@ try:
     from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                    NavigationToolbar2Tk)
     from matplotlib.figure import Figure
+    from matplotlib.widgets import SpanSelector
     IMPORT_ERROR: Exception | None = None
 except Exception as exc:                       # pragma: no cover - environment
     matplotlib = mdates = None
     FigureCanvasTkAgg = NavigationToolbar2Tk = Figure = None
+    SpanSelector = None
     IMPORT_ERROR = exc
+
+SPAN_HINT = "Drag across the chart to define a region."
 
 UNAVAILABLE_MESSAGE = (
     "The chart view needs matplotlib, which is not installed.\n\n"
@@ -95,6 +101,16 @@ def subtitle_for(result) -> str:
             f"{n:,} intervals")
 
 
+def duration_text(td: dt.timedelta) -> str:
+    """'6 h', '1 d 4 h' -- how long a marked region lasts, in words."""
+    total = int(round(td.total_seconds() / 60.0))
+    days, rem = divmod(total, 1440)
+    hours, minutes = divmod(rem, 60)
+    parts = [f"{days} d" if days else "", f"{hours} h" if hours else "",
+             f"{minutes} min" if minutes else ""]
+    return " ".join(p for p in parts if p) or "0 min"
+
+
 class ViewWindow(tk.Toplevel):
     """The z-score chart of a pair, in a window. Read-only for now."""
 
@@ -107,6 +123,16 @@ class ViewWindow(tk.Toplevel):
         self.cols = list(result.data.columns)
         self.zframe = sk.zscore(result.data)     # the SAME function the
                                                  # workbook standardises with
+
+        # The UTC index is the TRUTH about time in this window. `_xnum` is the
+        # same instants as matplotlib date numbers on the naive-local axis,
+        # built position for position from it, which is what lets a drag be
+        # resolved to an index and read back out of `_utc` without any zone
+        # ever being inferred. See annotations.snap_span.
+        self._utc = result.data.index
+        self._xnum = []
+        self.selection: tuple | None = None
+
         self.title(self._title_text(study))
         self.geometry("1180x680")
         self.minsize(720, 420)
@@ -146,11 +172,105 @@ class ViewWindow(tk.Toplevel):
 
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
+        # The readout sits directly under the chart because it is read WHILE
+        # dragging, not after. Its whole purpose is that the hour being aimed
+        # at is legible -- placing a band by eye against an axis labelled
+        # `mm-dd` is the thing this feature replaces.
+        self.span_text = tk.StringVar(value=SPAN_HINT)
+        readout = ttk.Frame(frame)
+        readout.pack(fill="x", pady=(6, 0))
+        ttk.Label(readout, textvariable=self.span_text,
+                  font=("Segoe UI", 10)).pack(side="left")
+
+        self._install_span_selector()
+
         note = ttk.Frame(frame)
         note.pack(fill="x", pady=(8, 0))
         ttk.Label(note, text=self._coverage_note(),
                   foreground="#777").pack(side="left")
         ttk.Button(note, text="Close", command=self.destroy).pack(side="right")
+
+    # ------------------------------------------------------------- selecting
+
+    def _install_span_selector(self):
+        """Drag horizontally to define a region.
+
+        `snap_values` makes the rubber band itself land on sample boundaries,
+        so the rectangle on screen is the interval that would be stored rather
+        than an approximation of it. The authority is still
+        `annotations.snap_span`, which is applied to whatever comes back --
+        snapping an already-snapped value is idempotent, and the rule belongs
+        in the module a gate can reach without opening a window.
+
+        No conflict with the toolbar: `_SelectorWidget.ignore` consults
+        `canvas.widgetlock`, which zoom and pan hold while active, so a drag
+        means one thing at a time.
+        """
+        # Marking is refused outright on an axis that doubles back. Local time
+        # runs 01:00, 01:30, 01:00, 01:30 across the November fall-back, so an
+        # hour of the axis is not ascending and a bisect through it would
+        # return a confident wrong index. Better to say so than to store a mark
+        # that means an hour other than the one that was dragged.
+        self.descent = ann.first_descent(self._xnum)
+        if self.descent is not None:
+            when = ann.local_text(self._utc[self.descent])
+            self.span = None
+            self.span_text.set(
+                f"Marking is off for this window: local time runs backwards "
+                f"around {when}, where a DST fall-back makes one wall clock "
+                f"hour cover two different hours of real time. Rebuild the "
+                f"window to exclude it.")
+            return
+
+        ax = self.figure.axes[0]
+        self.span = SpanSelector(
+            ax, self._on_span_select, "horizontal",
+            onmove_callback=self._on_span_move,
+            useblit=False, button=1, minspan=0,
+            snap_values=self._xnum or None,
+            props=dict(facecolor="#808080", alpha=0.20),
+        )
+
+    def span_interval(self, x0: float, x1: float):
+        """A dragged span -> (start_utc, end_utc, i0, i1), or None if degenerate.
+
+        The conversion never touches wall time. `snap_span` resolves the drag to
+        two SAMPLE INDICES and the instants are read straight out of the UTC
+        index, so the November hour that happens twice and the March hour that
+        never happens cannot arise. Returns None when the drag was shorter than
+        one sample, which marks nothing and must be refused rather than stored.
+        """
+        i0, i1 = ann.snap_span(x0, x1, self._xnum)
+        if i0 == i1:
+            return None
+        return self._utc[i0], self._utc[i1], i0, i1
+
+    def _span_summary(self, start, end, i0: int, i1: int) -> str:
+        return (f"{ann.local_text(start)}  →  {ann.local_text(end)}  local"
+                f"  ·  {duration_text(end - start)}"
+                f"  ·  {i1 - i0} × {self.result.interval}")
+
+    def _on_span_move(self, x0: float, x1: float):
+        """Live, while the mouse is still down. Shows the SNAPPED times."""
+        got = self.span_interval(x0, x1)
+        if got is None:
+            self.span_text.set(
+                f"Shorter than one {self.result.interval} interval — "
+                f"nothing to mark.")
+            return
+        self.span_text.set("Marking:  " + self._span_summary(*got))
+
+    def _on_span_select(self, x0: float, x1: float):
+        """On release. Slice 4 records the region; storing it lands next."""
+        got = self.span_interval(x0, x1)
+        self.selection = None if got is None else (got[0], got[1])
+        if got is None:
+            self.span_text.set(
+                f"That drag was shorter than one {self.result.interval} "
+                f"interval, so there is nothing to mark. Drag further.")
+            return
+        self.span_text.set("Region:  " + self._span_summary(*got)
+                           + "   (not stored yet)")
 
     def _coverage_note(self) -> str:
         """Say what is missing. An empty stretch must never pass for agreement."""
@@ -181,6 +301,11 @@ class ViewWindow(tk.Toplevel):
         # display zone, which is exactly the class of mistake this repo has
         # already paid for once.
         x = self.result.data.index.tz_convert(LOCAL_TZ).tz_localize(None)
+
+        # Plain floats, in the same order as `_utc`. A list rather than an
+        # array so that `annotations.snap_span` stays pure-Python and can be
+        # exercised with no numeric stack present at all.
+        self._xnum = [float(v) for v in mdates.date2num(x)]
 
         fig = Figure(figsize=(11.5, 5.0), dpi=100)
         ax = fig.add_subplot(111)
@@ -234,10 +359,19 @@ class ViewWindow(tk.Toplevel):
 
 def _main(argv=None):
     import argparse
+    import sys
 
     import numpy as np
 
     import study as st
+
+    # The readout reads better with real arrows, and Tk renders them happily,
+    # but a Windows console defaults to cp1252 and cannot encode one -- which
+    # would crash the gate on the way to printing a PASS.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
     ap = argparse.ArgumentParser(
         description="Open the z-score view on a pair of series.")
@@ -350,6 +484,74 @@ def _main(argv=None):
                    for g in (geom.get(c, "") for c in res.data.columns)
                    if g)
     checks.append((f"legend carries depth/frame {legend_texts}", has_geom))
+
+    # ---- marking ----------------------------------------------------------
+    checks.append(("this window's local axis ascends, so marking is on",
+                   win.descent is None and win.span is not None))
+
+    i0, i1 = 20, 40
+    want0, want1 = res.data.index[i0], res.data.index[i1]
+
+    # The pure conversion, asserted EXACTLY. Pixel rounding cannot blur this
+    # one, so it is the place to demand identity rather than proximity.
+    got = win.span_interval(win._xnum[i0], win._xnum[i1])
+    checks.append((f"a span resolves to exactly the sampled instants "
+                   f"[{i0}, {i1}]",
+                   got is not None and got[0] == want0 and got[1] == want1
+                   and (got[2], got[3]) == (i0, i1)))
+    checks.append(("a right-to-left drag yields the same interval",
+                   win.span_interval(win._xnum[i1], win._xnum[i0]) == got))
+    checks.append(("the stored instants are tz-aware UTC, not wall time",
+                   want0.tzinfo is not None
+                   and want0.utcoffset() == dt.timedelta(0)))
+
+    tiny = win.span_interval(win._xnum[i0], win._xnum[i0] + 1e-9)
+    checks.append(("a drag shorter than one sample is refused, not stored",
+                   tiny is None))
+
+    # The readout must show the local rendering of the SAME instants that
+    # would be stored -- a readout drifting from the record is how someone
+    # marks one hour and saves another.
+    win._on_span_select(win._xnum[i0], win._xnum[i1])
+    text = win.span_text.get()
+    checks.append((f"readout shows local time of the stored instants "
+                   f"[{text[:64]}...]",
+                   ann.local_text(want0) in text
+                   and ann.local_text(want1) in text))
+    checks.append(("release records the selection",
+                   win.selection == (want0, want1)))
+
+    win._on_span_move(win._xnum[i0], win._xnum[i0] + 1e-9)
+    checks.append((f"a sub-sample drag says so while dragging "
+                   f"[{win.span_text.get()[:52]}...]",
+                   "nothing to mark" in win.span_text.get()))
+
+    # Drive the REAL widget through synthetic mouse events, so the wiring is
+    # exercised and not only the function behind it. Asserted to within one
+    # sample: at ~1,000 points across ~1,100 px the samples are about a pixel
+    # apart, and integer pixel coordinates cannot address them more finely
+    # than that. Exactness is the check above; this one is that it is CONNECTED.
+    from matplotlib.backend_bases import MouseButton, MouseEvent
+    ax = win.figure.axes[0]
+    win.selection = None
+
+    def _at(name, xdata):
+        px, py = ax.transData.transform((xdata, 0.0))
+        return MouseEvent(name, win.canvas, int(px), int(py),
+                          button=MouseButton.LEFT)
+
+    for name, xd in [("button_press_event", win._xnum[i0]),
+                     ("motion_notify_event", win._xnum[i1]),
+                     ("button_release_event", win._xnum[i1])]:
+        win.canvas.callbacks.process(name, _at(name, xd))
+
+    step = res.data.index[1] - res.data.index[0]
+    sel = win.selection
+    near = (sel is not None
+            and abs(sel[0] - want0) <= step and abs(sel[1] - want1) <= step)
+    checks.append((f"a real mouse drag sets the selection, within one sample "
+                   f"[{sel[0] if sel else None} .. {sel[1] if sel else None}]",
+                   near))
 
     print("\nview gate:")
     for what, ok in checks:

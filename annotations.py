@@ -479,6 +479,25 @@ def snap_span(x0: float, x1: float, xnum) -> tuple[int, int]:
     return _nearest(xnum, lo), _nearest(xnum, hi)
 
 
+def first_descent(values):
+    """Index where an ascending sequence first goes backwards, or None.
+
+    `snap_span` bisects, and bisecting an unsorted sequence returns a confident
+    wrong answer rather than an error. Plotted local time is NOT guaranteed
+    ascending: a chart drawn on naive local time runs 01:00, 01:30, 01:00,
+    01:30 across the November fall-back, so an hour of the axis doubles back on
+    itself and two distinct instants occupy one wall time.
+
+    That hour is exactly where a mark would be silently wrong, so the caller
+    checks once and refuses to mark rather than snapping into it. Returns the
+    index so the refusal can say WHEN, not merely that.
+    """
+    for i in range(1, len(values)):
+        if values[i] < values[i - 1]:
+            return i
+    return None
+
+
 def _nearest(xnum, x: float) -> int:
     """Index of the closest value in an ascending sequence. Clamps at the ends."""
     n = len(xnum)
@@ -886,6 +905,25 @@ def _main(argv=None):
            snap_span(-50.0, 500.0, xnum) == (0, 99))
         ok("a drag shorter than one sample collapses, for the caller to refuse",
            snap_span(10.1, 10.2, xnum) == (10, 10))
+        ok("an ascending axis reports no descent",
+           first_descent(xnum) is None)
+
+        # The case snapping exists to avoid, demonstrated rather than asserted
+        # in prose: a chart drawn on naive local time doubles back across the
+        # November fall-back, and two distinct instants land on one wall time.
+        instants = [dt.datetime(2026, 11, 1, 8, 0, tzinfo=utc)
+                    + dt.timedelta(minutes=30 * k) for k in range(5)]
+        wall = [t.astimezone(ZoneInfo(DISPLAY_TZ)).replace(tzinfo=None)
+                for t in instants]
+        ok("two distinct instants share one local wall time at the fall-back",
+           instants[1] != instants[3] and wall[1] == wall[3],
+           f"{format_utc(instants[1])} and {format_utc(instants[3])} "
+           f"both render as {wall[1]:%Y-%m-%d %H:%M} local")
+        ok("a local axis crossing the fall-back is detected as descending, "
+           "so the caller can refuse to snap into it",
+           first_descent(wall) == 2,
+           f"first descent at index {first_descent(wall)} "
+           f"({wall[1]:%H:%M} -> {wall[2]:%H:%M})")
 
         # ---- palette --------------------------------------------------------
         import identity                     # pure; imported HERE, not at module
