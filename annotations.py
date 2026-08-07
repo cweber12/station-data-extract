@@ -27,6 +27,13 @@ STANDARD LIBRARY ONLY
     `study.slugify`: taking that one function would drag pandas and pyyaml into
     a module whose whole value is being light enough to test anywhere.
 
+    One caveat, since "standard library only" is a claim someone may lean on:
+    that is true of what is IMPORTED. At runtime `ZoneInfo` needs an IANA zone
+    database, and Windows ships none, so the local rendering depends on the
+    `tzdata` package. It is not listed in requirements.txt because pandas
+    already requires it on win32 -- but a copy of this module lifted somewhere
+    pandas is absent would need it named.
+
 TIME
     Display is local. Storage is UTC with an explicit offset. Every byte on
     disk is UTC; every string a human reads is local.
