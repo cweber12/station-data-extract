@@ -638,7 +638,6 @@ class ViewWindow(tk.Toplevel):
         self.mark_tree.tag_configure("borrowed", foreground="#5A5A5A")
         self.mark_tree.bind("<<TreeviewSelect>>", self._on_row_selected)
         self._row_for = {}
-        self._syncing = False
         self.refresh_mark_list()
 
     def refresh_mark_list(self):
@@ -646,64 +645,71 @@ class ViewWindow(tk.Toplevel):
         tree = getattr(self, "mark_tree", None)
         if tree is None:
             return
-        self._syncing = True
-        try:
-            tree.delete(*tree.get_children())
-            self._row_for = {}
-            by_set = {}
-            for entry in self.occurrences:
-                by_set.setdefault(entry.markset.set_id, []).append(entry)
-            for set_id, entries in by_set.items():
-                ms = entries[0].markset
-                foreign = entries[0].is_foreign
-                node = tree.insert("", "end",
-                                   text=f"{ms.name}  ({len(entries)})",
-                                   values=("other pair" if foreign else "",),
-                                   tags=("borrowed",) if foreign else (),
-                                   open=True)
-                for entry in entries:
-                    iv = entry.interval
-                    outside = entry.patch is None
-                    tags = ("borrowed",) if foreign else ()
-                    if outside:
-                        tags = tags + ("offwindow",)
-                    row = tree.insert(
-                        node, "end",
-                        text=f"   {ann.local_text(iv.start_utc)} → "
-                             f"{ann.local_text(iv.end_utc)}",
-                        values=("outside" if outside else "",),
-                        tags=tags)
-                    self._row_for[row] = entry
-        finally:
-            self._syncing = False
+        tree.delete(*tree.get_children())
+        self._row_for = {}
+        by_set = {}
+        for entry in self.occurrences:
+            by_set.setdefault(entry.markset.set_id, []).append(entry)
+        for set_id, entries in by_set.items():
+            ms = entries[0].markset
+            foreign = entries[0].is_foreign
+            node = tree.insert("", "end",
+                               text=f"{ms.name}  ({len(entries)})",
+                               values=("other pair" if foreign else "",),
+                               tags=("borrowed",) if foreign else (),
+                               open=True)
+            for entry in entries:
+                iv = entry.interval
+                outside = entry.patch is None
+                tags = ("borrowed",) if foreign else ()
+                if outside:
+                    tags = tags + ("offwindow",)
+                row = tree.insert(
+                    node, "end",
+                    text=f"   {ann.local_text(iv.start_utc)} → "
+                         f"{ann.local_text(iv.end_utc)}",
+                    values=("outside" if outside else "",),
+                    tags=tags)
+                self._row_for[row] = entry
         self._sync_row_selection()
 
     def _on_row_selected(self, _event=None):
-        """A row picked in the list selects that occurrence."""
-        if self._syncing:
-            return
+        """A row picked in the list selects that occurrence.
+
+        Selected `from_list`, because the tree is ALREADY showing this row.
+        Sending the selection back would be a second write to the tree, and
+        every write to the tree is another queued event to answer.
+        """
         rows = self.mark_tree.selection()
         entry = self._row_for.get(rows[0]) if rows else None
         # A set header is not an occurrence; clicking one selects nothing
         # rather than guessing which of its occurrences was meant.
-        self.select_band(entry)
+        self.select_band(entry, from_list=True)
 
     def _sync_row_selection(self):
-        """Point the list at whatever is selected, without looping back."""
+        """Point the list at whatever is selected. Writes only if it must.
+
+        Comparing before writing is the ONLY thing that ends the loop here.
+        Tk *queues* <<TreeviewSelect>> rather than dispatching it, so a flag
+        set around `selection_set` and cleared in a `finally` is always back
+        to False by the time the handler reads it -- it never suppressed a
+        single event. And `selection_set` fires the event even when it names
+        the row that is already selected, so a sync that always writes always
+        calls itself back, with nothing to stop it.
+        """
         tree = getattr(self, "mark_tree", None)
         if tree is None:
             return
-        self._syncing = True
-        try:
-            wanted = next((row for row, entry in self._row_for.items()
-                           if entry is self.selected_band), None)
-            if wanted is None:
-                tree.selection_remove(*tree.selection())
-            else:
-                tree.selection_set(wanted)
-                tree.see(wanted)
-        finally:
-            self._syncing = False
+        wanted = next((row for row, entry in self._row_for.items()
+                       if entry is self.selected_band), None)
+        current = tuple(tree.selection())
+        if wanted is None:
+            if current:
+                tree.selection_remove(*current)
+            return
+        if current != (wanted,):
+            tree.selection_set(wanted)
+        tree.see(wanted)
 
     # ----------------------------------------------------------------- marks
 
@@ -1258,12 +1264,19 @@ class ViewWindow(tk.Toplevel):
         """Select the mark under x, or clear the selection. Returns the entry."""
         return self.select_band(self.band_at(x))
 
-    def select_band(self, entry):
-        """Make `entry` the selected mark, or clear when None."""
+    def select_band(self, entry, *, from_list=False):
+        """Make `entry` the selected mark, or clear when None.
+
+        `from_list` when the selection was made IN the list. The round trip
+        back into the tree exists so that a click on the chart moves the
+        highlight in the list; a list selection is already there, and pushing
+        it back only queues another <<TreeviewSelect>> to answer.
+        """
         self.selected_band = entry
         self._restyle_bands()
         self._sync_delete_button()
-        self._sync_row_selection()
+        if not from_list:
+            self._sync_row_selection()
 
         if entry is None:
             if self.span is not None:
@@ -2767,8 +2780,43 @@ def _main(argv=None):
                        f"[{win.mark_tree.item(row, 'values')}]",
                        win.mark_tree.item(row, "values")[0] == "outside"))
 
-        win.mark_tree.selection_set(row)
-        win._on_row_selected()
+        # Drive the list the way a click does: selection_set, then update() so
+        # Tk delivers the queued <<TreeviewSelect>> itself. Calling
+        # _on_row_selected by hand -- what this gate used to do -- skips the
+        # only part of the path that ever broke, and a runaway re-entry
+        # shipped straight past it. The chart checks above already drive real
+        # MouseEvents through canvas.callbacks.process; this is the same rule,
+        # finally applied to the list.
+        #
+        # BOUNDED, because an unbounded runaway hangs update() forever and a
+        # gate that hangs reads as a slow machine. Past the bound the wrapper
+        # stops feeding the real handler, so the loop starves, update()
+        # returns, and the count fails the check instead.
+        row_calls = [0]
+        ROW_CALL_BOUND = 20
+        _row_handler = win._on_row_selected
+
+        def _counted_row_select(event=None):
+            row_calls[0] += 1
+            if row_calls[0] > ROW_CALL_BOUND:
+                return
+            return _row_handler(event)
+
+        win.mark_tree.bind("<<TreeviewSelect>>", _counted_row_select)
+        row_counts = []
+
+        def pick_row(target):
+            """Select a row through Tk. Returns how many times it dispatched."""
+            win.update()            # drain anything already queued
+            row_calls[0] = 0
+            win.mark_tree.selection_set(target)
+            win.update()            # deliver the queued event, and its answers
+            row_counts.append(row_calls[0])
+            return row_calls[0]
+
+        n = pick_row(row)
+        checks.append((f"picking a row runs the handler ONCE through the real "
+                       f"Tk event, not by hand [{n} dispatch(es)]", n == 1))
         checks.append(("picking that row selects the occurrence",
                        win.selected_band is offscreen))
         checks.append((f"the readout says why it has no handles "
@@ -2783,8 +2831,7 @@ def _main(argv=None):
         checks.append((f"adjusting it is refused, saying what to do instead "
                        f"[{why}...]", adjust_refused))
 
-        win.mark_tree.selection_set(row)
-        win._on_row_selected()
+        pick_row(row)
         gone = win.delete_selected()
         still_there = any(o.markset.name == "long ago" and o.patch is None
                           for o in win.occurrences)
@@ -2799,11 +2846,19 @@ def _main(argv=None):
         checks.append(("selecting on the chart highlights the matching row",
                        bool(sel) and win._row_for.get(sel[0]) is drawn_one))
         header = win.mark_tree.parent(sel[0])
-        win.mark_tree.selection_set(header)
-        win._on_row_selected()
+        pick_row(header)
         checks.append(("picking a set header selects nothing, rather than "
                        "guessing which occurrence was meant",
                        win.selected_band is None))
+
+        # The regression this issue is about is a COUNT, not a wrong value:
+        # every check above passes just as well when the handler ran sixty
+        # times on its way there. Assert the count itself, once, over every
+        # selection the gate made.
+        worst = max(row_counts) if row_counts else 0
+        checks.append((f"no list selection re-entered -- every one dispatched "
+                       f"at most once [{row_counts}]",
+                       bool(row_counts) and worst <= 1))
 
         lo, hi = win.figure.axes[0].get_xlim()
         first, last = win._xnum[0], win._xnum[-1]
