@@ -26,6 +26,32 @@ EXACTLY TWO SERIES
     unit -- is deliberately NOT inherited. Temperature against water level is
     the intended use, and it is legitimate because a z-score is unitless.
 
+SHOWING A SET MARKED ON ANOTHER PAIR
+    A set marked on a DIFFERENT pair can be shown here when it shares exactly
+    one series with what is on screen, because then its other member is a
+    candidate explanation that is not currently plotted. Its regions are drawn
+    as open brackets rather than as shaded blocks, the legend names the pair
+    they were marked on, and the absent member is fetched by its stable key and
+    drawn as a faint solid ghost line.
+
+    The word "borrowed" was used for this throughout an earlier revision and is
+    gone from everything a user reads: it named the mechanism rather than the
+    thing, and someone opening the window for the first time could not act on
+    it. Internal identifiers still say `foreign` and `overlay`; see
+    docs/adr/0002 for why the code's vocabulary and the screen's differ.
+
+    THE CORRELATING IS DONE BY EYE, DELIBERATELY. Nothing here computes a
+    relationship between the borrowed series and the plotted ones. An earlier
+    version of this idea ranked all-pairs correlations and offered the best;
+    it was dropped because these series share tidal and diurnal harmonics, so
+    raw-level correlation between any two of them produces confident nonsense.
+    What this shows is where someone judged something interesting and what the
+    series was doing there. The judgement stays with the person.
+
+    A borrowed band is READ-ONLY here, and everything a borrowed set draws is
+    attributed on the chart itself, not only in this window's state: a printed
+    or exported copy has to carry the same warning the screen did.
+
 THREADING
     Everything here runs on the main thread. A ViewWindow is constructed from
     the Tk event loop with a BuildResult a worker has already finished
@@ -39,6 +65,7 @@ from __future__ import annotations
 import datetime as dt
 import tkinter as tk
 from dataclasses import dataclass
+from pathlib import Path
 from tkinter import messagebox, ttk
 from zoneinfo import ZoneInfo
 
@@ -47,6 +74,7 @@ import identity
 import sensorkit as sk
 
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+ROOT = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
 # Optional dependency. Import failure is recorded, never raised at import time,
@@ -60,12 +88,13 @@ try:
     from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                    NavigationToolbar2Tk)
     from matplotlib.figure import Figure
+    from matplotlib.patches import Patch
     from matplotlib.widgets import SpanSelector
     IMPORT_ERROR: Exception | None = None
 except Exception as exc:                       # pragma: no cover - environment
     matplotlib = mdates = np = None
     FigureCanvasTkAgg = NavigationToolbar2Tk = Figure = None
-    SpanSelector = None
+    SpanSelector = Patch = None
     IMPORT_ERROR = exc
 
 SPAN_HINT = ("Drag across the chart to define a region.  "
@@ -121,15 +150,138 @@ class Band:
     A patch on its own is a rectangle. Clicking one has to resolve to the set
     and the interval it came from, or neither adjusting nor deleting can say
     what it is acting on.
+
+    A BORROWED occurrence carries the `candidate` it came from and is otherwise
+    the same record. One collection, one flag: keeping foreign bands in a
+    second parallel list would mean every hit test, restyle and redraw had to
+    remember both, which is exactly the accretion that had to be cleaned up
+    once already.
     """
     patch: object          # what is on the axes, or None when not drawn
     markset: object
     interval: object       # the ORIGINAL stored occurrence -- its identity
     drawn: object = None   # the same occurrence clamped to this window
+    candidate: object = None   # set when the band was borrowed from another pair
+    # The colour bar, and the edge rules on a region from another pair. Kept
+    # beside the patch rather than looked up later: `patch` stays the ONE
+    # artist carrying the geometry, so hit testing, selection and removal each
+    # have a single thing to ask, and these ride along with it.
+    decorations: tuple = ()
 
     @property
     def is_drawn(self) -> bool:
         return self.patch is not None
+
+    @property
+    def artists(self) -> list:
+        """Everything this occurrence put on the axes."""
+        return ([] if self.patch is None else [self.patch]) \
+            + list(self.decorations)
+
+    @property
+    def is_foreign(self) -> bool:
+        """Drawn from a set belonging to a DIFFERENT pair.
+
+        Read-only here on purpose. Deleting one would remove a mark from a
+        comparison that is not on screen, behind a confirmation naming a set
+        the person is not currently looking at.
+        """
+        return self.candidate is not None
+
+
+class GhostError(RuntimeError):
+    """A borrowed set's absent partner could not be fetched.
+
+    Always names the key that failed and the label it was stored under. A key
+    stops resolving when the study it points into is not the one it was drawn
+    against, or when the series it named is no longer there -- and the LABEL is
+    what still communicates when the key does not, which is precisely why a
+    SeriesRef carries both.
+    """
+
+
+@dataclass
+class Ghost:
+    """The absent partner of a borrowed pair, standardised over THIS window."""
+    ref: object            # the SeriesRef it was fetched by
+    label: str             # legend text, carrying depth and reference frame
+    x: object              # naive local time, the axis this chart is drawn on
+    values: object         # z-scores, computed over the window on screen
+    line: object = None    # the artist, once drawn
+    borrowers: tuple = ()  # the sets that asked for it
+
+
+def resolve_series(study, key: str, config_root=None):
+    """(TableInfo, ColumnInfo) for a stable key, inside ONE study.
+
+    The key is `file::table::column` and is study-scoped by construction:
+    `scan_parquet` gives every study the identical key for the same station and
+    variable, so resolving one against a different study would silently answer
+    with another snapshot's data. That is the mechanical reason cross-study
+    overlay is out of scope, and it is enforced here by only ever scanning the
+    study handed in.
+    """
+    if study is None:
+        raise GhostError(
+            f"there is no study to resolve {key!r} against, so the absent "
+            f"partner of that pair cannot be fetched.")
+    catalog = sk.build_catalog_study(study, config_root=config_root)
+    available = []
+    for _f, tables in sorted(catalog.items()):
+        for t in tables:
+            for c in t.data_columns:
+                if c.key == key:
+                    return t, c
+                available.append(c.key)
+    raise GhostError(
+        f"no series with the key {key!r} is in study "
+        f"{getattr(study, 'study_id', '?')}. It held {len(available)} series "
+        f"when this was checked. The key is what re-fetches a series, and a "
+        f"renamed or rebuilt source breaks it.")
+
+
+def load_ghost(study, ref, *, interval: str, aggregation: str, lo, hi,
+               config_root=None) -> Ghost:
+    """Fetch a series by key and standardise it OVER THE CURRENT WINDOW.
+
+    Standardised over this window rather than over its whole extent, and with
+    `sensorkit.zscore` rather than an expression written here, so the ghost is
+    comparable to the lines already plotted instead of to itself. `ddof=0` is
+    the detail that would drift if this reimplemented it; see zscore.
+
+    Built through `build_comparison` at the SAME interval and aggregation as
+    the chart, so a 1 h mean is compared with a 1 h mean.
+    """
+    table, col = resolve_series(study, ref.key, config_root)
+    try:
+        res = sk.build_comparison(
+            [(table, col)], interval=interval, aggregation=aggregation,
+            overlap="union", min_samples=1, start=lo, end=hi,
+            convert_units_flag=True, stratification=False)
+    except Exception as exc:
+        raise GhostError(
+            f"{ref.label} ({ref.key}) could not be loaded: {exc}") from None
+    if res.data.empty or not res.data.columns.size:
+        raise GhostError(
+            f"{ref.label} ({ref.key}) resolved, but has no data inside this "
+            f"window. There is nothing to draw, which is not the same as a "
+            f"flat line and must not look like one.")
+
+    column = res.data.columns[0]
+    z = sk.zscore(res.data)[column]
+    if not bool(z.notna().any()):
+        raise GhostError(
+            f"{ref.label} ({ref.key}) is entirely empty inside this window "
+            f"after standardising, so a ghost line would be a blank claim.")
+
+    # Depth and reference frame on the ghost's legend entry too. It is a series
+    # on a chart, and the rule that every legend entry states where the sensor
+    # sits does not stop applying because the line is faint.
+    label = identity.legend_label(column, res.units.get(column, ""), False,
+                                  res.geometry.get(column, ""))
+    return Ghost(ref=ref, label=f"{label} — ghost: context, not compared",
+                 x=res.data.index.tz_convert(LOCAL_TZ).tz_localize(None),
+                 values=z.to_numpy())
 
 
 class MarkDialog(tk.Toplevel):
@@ -257,6 +409,23 @@ class ViewWindow(tk.Toplevel):
         self.occurrences = []
         self.selected_band = None
 
+        # Which foreign sets are borrowed onto this chart. Held as IDS, not as
+        # loaded sets: every redraw reloads from disk, because the file is the
+        # source of truth, and a set held in memory across a redraw would go on
+        # drawing bands that another window had already deleted.
+        self.overlay_ids = []
+        self.candidates = []
+        self.overlays = []
+
+        # The absent partner of each borrowed pair. Cached by key -- including
+        # the FAILURES, so a key that does not resolve is not re-scanned on
+        # every redraw -- because the study is immutable evidence and cannot
+        # answer differently between two redraws of one window.
+        self.ghosts = []
+        self.ghost_problems = []
+        self._ghost_cache = {}
+        self._ghost_ylim = None
+
         self.study = study
         self.study_id = getattr(study, "study_id", None)
         if annotations_dir is None and study is not None:
@@ -264,8 +433,19 @@ class ViewWindow(tk.Toplevel):
         self.annotations_dir = annotations_dir
 
         self.title(self._title_text(study))
-        self.geometry("1180x680")
-        self.minsize(720, 420)
+        # Open filling the screen. Everything this window has to SAY sits below
+        # the chart -- the omitted-region counts, the missing-ghost error, the
+        # control for showing another pair's regions -- and a fixed 1180x680
+        # was smaller than its own content, so those were not merely cramped,
+        # they were never mapped. A window whose controls are off the bottom is
+        # the same failure as the dialog that was populated but withdrawn.
+        self.geometry(f"{max(900, self.winfo_screenwidth() - 60)}x"
+                      f"{max(560, self.winfo_screenheight() - 120)}+20+20")
+        try:
+            self.state("zoomed")            # a real maximise where there is one
+        except tk.TclError:                 # pragma: no cover - platform
+            pass
+        self.minsize(900, 620)
         # Never become transient for a master that is not on screen, or this
         # window inherits its withdrawn state and is built but never seen.
         if parent is not None and parent.winfo_viewable():
@@ -293,14 +473,20 @@ class ViewWindow(tk.Toplevel):
         self._draw_marks()
         self._refresh_legend()
 
-        # Chart on the left, the list of marks on the right. The list is not a
-        # convenience: an occurrence clipped out of this window is drawn
-        # nowhere, so without it there would be no way to select one, and no
-        # way to delete it short of rebuilding a wider window.
+        # PACKING ORDER IS LOAD-BEARING, and this is the whole of a bug that
+        # shipped twice. Tk gives space to the slaves packed FIRST. The chart
+        # expands, so packed first it takes everything and every fixed-height
+        # row below it is allocated nothing -- not squeezed, NOT MAPPED. At
+        # 1180x680 the content needed 754 px and the overlay controls, both
+        # status lines and the buttons were simply absent from the window, so
+        # "the omitted count is reported in the window" was true only for
+        # someone who thought to drag it taller.
+        #
+        # So the furniture is packed against the bottom FIRST, in reverse
+        # visual order, and the chart is packed last and takes what is left.
+        # It cannot push anything off, because there is nothing left to push.
         body = ttk.Frame(frame)
-        body.pack(fill="both", expand=True)
         left = ttk.Frame(body)
-        left.pack(side="left", fill="both", expand=True)
 
         canvas = FigureCanvasTkAgg(self.figure, master=left)
         self.canvas = canvas
@@ -315,7 +501,13 @@ class ViewWindow(tk.Toplevel):
 
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
+        # The list claims its width, then the chart takes the rest. The same
+        # rule as the rows below, and the same bug it prevents: the figure asks
+        # for 1150 px and expands, so packed first it took the lot and the list
+        # was allocated 10 px and never mapped. A window had to be dragged
+        # wider than this screen before the list appeared at all.
         self._build_mark_list(body)
+        left.pack(side="left", fill="both", expand=True)
 
         # The readout sits directly under the chart because it is read WHILE
         # dragging, not after. Its whole purpose is that the hour being aimed
@@ -323,18 +515,16 @@ class ViewWindow(tk.Toplevel):
         # `mm-dd` is the thing this feature replaces.
         self.span_text = tk.StringVar(value=SPAN_HINT)
         readout = ttk.Frame(frame)
-        readout.pack(fill="x", pady=(6, 0))
         ttk.Label(readout, textvariable=self.span_text,
                   font=("Segoe UI", 10)).pack(side="left")
 
         self._install_span_selector()
 
         note = ttk.Frame(frame)
-        note.pack(fill="x", pady=(8, 0))
         ttk.Label(note, text=self._coverage_note(),
                   foreground="#777").pack(side="left")
         ttk.Button(note, text="Close", command=self.destroy).pack(side="right")
-        self.delete_btn = ttk.Button(note, text="Delete mark",
+        self.delete_btn = ttk.Button(note, text="Delete region",
                                      command=self.prompt_delete,
                                      state="disabled")
         self.delete_btn.pack(side="right", padx=(0, 6))
@@ -343,11 +533,57 @@ class ViewWindow(tk.Toplevel):
         self.bind("<Delete>", lambda _e: self.prompt_delete())
 
         marks = ttk.Frame(frame)
-        marks.pack(fill="x", pady=(2, 0))
         self.marks_label = ttk.Label(
             marks, text=self.marks_note, wraplength=1100, justify="left",
             foreground="#B4531A" if self._marks_need_attention() else "#777")
         self.marks_label.pack(side="left")
+
+        # Borrowing. The dropdown offers only sets sharing EXACTLY ONE series
+        # with this pair -- see annotations.eligible_overlays for why that is
+        # the rule rather than "everything in the study".
+        controls = ttk.Frame(frame)
+        ttk.Label(controls, text="Show regions from another pair:").pack(side="left")
+        self.overlay_var = tk.StringVar()
+        self.overlay_box = ttk.Combobox(controls, textvariable=self.overlay_var,
+                                        state="readonly", width=62)
+        self.overlay_box.pack(side="left", padx=(6, 6))
+        self.overlay_btn = ttk.Button(controls, text="Show on chart",
+                                      command=self.prompt_overlay)
+        self.overlay_btn.pack(side="left")
+        self.remove_btn = ttk.Button(controls, text="Stop showing",
+                                     command=self.prompt_remove_overlay,
+                                     state="disabled")
+        self.remove_btn.pack(side="left", padx=(6, 0))
+        self.overlay_hint = ttk.Label(controls, foreground="#777", text="")
+        self.overlay_hint.pack(side="left", padx=(10, 0))
+
+        # What is borrowed, and what of it is NOT drawn. Its own line rather
+        # than appended to the marks note: the counts belong to different
+        # pairs, and one sentence carrying both would attribute neither.
+        borrowed = ttk.Frame(frame)
+        self.overlay_label = ttk.Label(
+            borrowed, text=self.overlay_note, wraplength=1100, justify="left",
+            foreground="#B4531A" if self._overlay_needs_attention() else "#777")
+        self.overlay_label.pack(side="left")
+
+        # THE CONTROL GOES ABOVE THE CHART, not below it. It was at the very
+        # bottom, under three status lines, and it fitted the window by ten
+        # pixels -- which is not a layout, it is a coin toss, and it came up
+        # tails on a screen with a taskbar. Above the chart it cannot be
+        # pushed anywhere by anything, and it is the first thing seen rather
+        # than the last, which is the right order for the only control that
+        # brings another pair's regions onto this chart.
+        controls.pack(side="top", fill="x", pady=(0, 8))
+
+        # The rest bottom-up, then the chart. See the note above `body`.
+        borrowed.pack(side="bottom", fill="x", pady=(2, 0))
+        marks.pack(side="bottom", fill="x", pady=(2, 0))
+        note.pack(side="bottom", fill="x", pady=(8, 0))
+        readout.pack(side="bottom", fill="x", pady=(6, 0))
+        body.pack(side="top", fill="both", expand=True)
+
+        self._offer_ids = []
+        self._refresh_overlay_controls()
 
         # NOTE the dialog is NOT raised here. A modal box opened during
         # construction blocks whoever is building the window -- including a
@@ -377,7 +613,10 @@ class ViewWindow(tk.Toplevel):
         right = ttk.Frame(parent, padding=(10, 0, 0, 0))
         right.pack(side="right", fill="y")
 
-        ttk.Label(right, text="Marks on this pair",
+        # "in this view", not "on this pair": once a set can be borrowed from
+        # another pair, the older heading would be a small lie about half the
+        # rows under it.
+        ttk.Label(right, text="Regions of interest",
                   font=("Segoe UI", 9, "bold")).pack(anchor="w")
 
         holder = ttk.Frame(right)
@@ -385,8 +624,8 @@ class ViewWindow(tk.Toplevel):
         self.mark_tree = ttk.Treeview(holder, columns=("where",),
                                       show="tree headings", height=16,
                                       selectmode="browse")
-        self.mark_tree.heading("#0", text="set / occurrence")
-        self.mark_tree.heading("where", text="")
+        self.mark_tree.heading("#0", text="Set / region")
+        self.mark_tree.heading("where", text="Status")
         self.mark_tree.column("#0", width=250, stretch=False)
         self.mark_tree.column("where", width=86, stretch=False, anchor="e")
         bar = ttk.Scrollbar(holder, orient="vertical",
@@ -396,6 +635,7 @@ class ViewWindow(tk.Toplevel):
         bar.pack(side="right", fill="y")
 
         self.mark_tree.tag_configure("offwindow", foreground="#B4531A")
+        self.mark_tree.tag_configure("borrowed", foreground="#5A5A5A")
         self.mark_tree.bind("<<TreeviewSelect>>", self._on_row_selected)
         self._row_for = {}
         self._syncing = False
@@ -415,18 +655,24 @@ class ViewWindow(tk.Toplevel):
                 by_set.setdefault(entry.markset.set_id, []).append(entry)
             for set_id, entries in by_set.items():
                 ms = entries[0].markset
+                foreign = entries[0].is_foreign
                 node = tree.insert("", "end",
                                    text=f"{ms.name}  ({len(entries)})",
-                                   values=("",), open=True)
+                                   values=("other pair" if foreign else "",),
+                                   tags=("borrowed",) if foreign else (),
+                                   open=True)
                 for entry in entries:
                     iv = entry.interval
                     outside = entry.patch is None
+                    tags = ("borrowed",) if foreign else ()
+                    if outside:
+                        tags = tags + ("offwindow",)
                     row = tree.insert(
                         node, "end",
                         text=f"   {ann.local_text(iv.start_utc)} → "
                              f"{ann.local_text(iv.end_utc)}",
                         values=("outside" if outside else "",),
-                        tags=("offwindow",) if outside else ())
+                        tags=tags)
                     self._row_for[row] = entry
         finally:
             self._syncing = False
@@ -470,6 +716,11 @@ class ViewWindow(tk.Toplevel):
         self.omitted = 0
         self.mark_legend = []
         self.occurrences = []
+        self.candidates = []
+        self.overlays = []
+        self.overlay_omitted = {}
+        self.overlay_lost = []
+        self.overlay_note = ""
 
         if self.annotations_dir is None:
             self.marks_note = (
@@ -492,18 +743,96 @@ class ViewWindow(tk.Toplevel):
                                for c in self.cols)
         self.store = ann.Store(self.annotations_dir)
         sets, self.mark_problems = self.store.load_all()
-        self.marks = ann.sets_for_pair(sets, [r.key for r in self.pair_refs],
-                                       self.study_id)
+        keys = [r.key for r in self.pair_refs]
+        self.marks = ann.sets_for_pair(sets, keys, self.study_id)
+
+        # The sets that could be BORROWED. Recomputed on every load rather than
+        # cached: a set drawn in another window since this one opened should be
+        # offered here without reopening, and one deleted there must stop being
+        # offered rather than failing when it is picked.
+        self.candidates = ann.eligible_overlays(sets, keys, self.study_id)
+        by_id = {c.markset.set_id: c for c in self.candidates}
+        live = [by_id[i] for i in self.overlay_ids if i in by_id]
+        # An overlay whose set is gone or no longer eligible is dropped, and
+        # said so. Silently keeping the id would leave a chart that claims to
+        # show a set it is not drawing.
+        self.overlay_lost = [i for i in self.overlay_ids if i not in by_id]
+        self.overlay_ids = [c.markset.set_id for c in live]
+        self.overlays = live
         self.marks_note = ""            # filled in by _draw_marks
 
     def _draw_marks(self):
-        """One band per interval, per set, clipped to this window."""
+        """Native bands, then borrowed ones. Both clipped to this window."""
         self.mark_legend = []
         self.occurrences = []
         self.omitted = 0
+        self.overlay_omitted = {}
+        self._draw_native()
+        self._draw_borrowed()
+        self._draw_ghosts()
+        self._append_rejection_note()
+
+    def _band_patch(self, ax, clamped, color: str, foreign: bool):
+        """(patch, decorations) for one region. A BLOCK, or a BRACKET.
+
+        This pair's own regions are a shaded block with the set's colour along
+        the TOP. A region marked on another pair is not shaded at all: two
+        edge rules and the set's colour along the BOTTOM -- an open bracket
+        rather than a block.
+
+        Shape carries the distinction, and position of the colour bar
+        reinforces it, because both survive a glance. The first version used a
+        diagonal hatch, and hatching is the loudest thing that can be put on a
+        chart: it competed with the data it was supposed to be pointing at.
+
+        Nothing is obscured either way. Shading is deliberately light -- what
+        the series were doing INSIDE a marked window is the entire question,
+        and a dark block answers it by hiding the evidence. The set's colour
+        survives in the bar, which is what the legend swatch matches.
+
+        `patch` always spans the region even when it draws nothing visible, so
+        hit testing has one artist to ask whatever the treatment.
+
+        EVERY REGION GETS EDGE RULES, and that is not decoration. At 1150 px
+        for a 45-day window an hour is 1.06 px, so a six-hour region -- an
+        ordinary one -- is 6 px wide. A fill alone at that width is a smudge
+        and a light one is nothing at all; the rules are what make a real
+        region findable. The first version of this dropped the edge the old
+        band had and narrow regions effectively disappeared.
+
+        Both kinds also carry a marker near the TOP, so every region on the
+        chart can be found by scanning one line rather than two. The
+        distinction lives in the fill and in the bar along the bottom, which a
+        region from another pair has and this pair's own does not.
+        """
+        x0, x1 = (self._to_axis(clamped.start_utc),
+                  self._to_axis(clamped.end_utc))
+        if foreign:
+            patch = ax.axvspan(x0, x1, facecolor="none", edgecolor="none",
+                               linewidth=0, zorder=0.5)
+            # The bar along the BOTTOM is the identifying mark, and it is first
+            # so that anything asking "which bar is this" gets the one that
+            # distinguishes rather than the one that merely locates.
+            bar = ax.axvspan(x0, x1, ymin=0.0, ymax=0.025,
+                             facecolor="#" + color, linewidth=0, zorder=0.6)
+            tick = ax.axvspan(x0, x1, ymin=0.965, ymax=0.99,
+                              facecolor="#" + color, alpha=0.55, linewidth=0,
+                              zorder=0.6)
+            rules = [ax.axvline(x, color="#" + color, linewidth=1.6,
+                                zorder=0.6) for x in (x0, x1)]
+            return patch, (bar, tick, *rules)
+        patch = ax.axvspan(x0, x1, facecolor="#1A1A1A", alpha=0.15,
+                           edgecolor="none", linewidth=0, zorder=0.4)
+        bar = ax.axvspan(x0, x1, ymin=0.975, ymax=1.0, facecolor="#" + color,
+                         linewidth=0, zorder=0.6)
+        rules = [ax.axvline(x, color="#" + color, linewidth=1.1, zorder=0.6)
+                 for x in (x0, x1)]
+        return patch, (bar, *rules)
+
+    def _draw_native(self):
+        """One band per interval, per set drawn on THIS pair."""
         if not self.marks:
             self.marks_note = self.marks_note or "No marks on this pair yet."
-            self._append_rejection_note()
             return
 
         ax = self.figure.axes[0]
@@ -530,17 +859,23 @@ class ViewWindow(tk.Toplevel):
                 if clamped is None:
                     self.occurrences.append(Band(None, ms, original, None))
                     continue
-                patch = ax.axvspan(
-                    self._to_axis(clamped.start_utc),
-                    self._to_axis(clamped.end_utc),
-                    facecolor="#" + ms.color, alpha=0.22,
-                    edgecolor="#" + ms.color, linewidth=1.0, zorder=0)
-                self.occurrences.append(Band(patch, ms, original, clamped))
+                patch, extra = self._band_patch(ax, clamped, ms.color,
+                                                foreign=False)
+                self.occurrences.append(
+                    Band(patch, ms, original, clamped, decorations=extra))
                 drawn += 1
             # One legend entry per SET, not per band -- the whole point of a
             # set is that many occurrences are one phenomenon.
+            #
+            # The swatch is a PROXY, not a band off the axes: the band's own
+            # fill is a neutral shade so that the data underneath survives, and
+            # a swatch of that would identify nothing. The proxy carries the
+            # set's colour, filled, matching the bar along the top of its
+            # bands. See _draw_borrowed for the open swatch that answers it.
             if pairs:
-                self.mark_legend.append((patch, f"{ms.name}  ({len(pairs)}×)"))
+                self.mark_legend.append(
+                    (Patch(facecolor="#" + ms.color, alpha=0.85,
+                           edgecolor="none"), f"{ms.name}  ({len(pairs)}×)"))
 
         n_sets = len({id(m) for m in self.marks})
         parts = [f"{drawn} mark(s) in {n_sets} set(s) on this pair."]
@@ -549,7 +884,203 @@ class ViewWindow(tk.Toplevel):
                 f"{self.omitted} fall outside this window and are NOT drawn — "
                 f"rebuild wider to see them.")
         self.marks_note = "  ".join(parts)
-        self._append_rejection_note()
+
+    def _draw_borrowed(self):
+        """The bands of every set borrowed from another pair.
+
+        Counted and reported PER SET, separately from the native count. Merging
+        the two totals would leave "3 outside this window" naming no set, and
+        the whole reason the number is here is that a partial overlay must not
+        pass for a complete one.
+        """
+        lines = []
+        for set_id in self.overlay_lost:
+            lines.append(
+                f"An overlay was dropped: the set {set_id} is no longer in "
+                f"this study, or no longer shares exactly one series with "
+                f"this pair.")
+        if not self.overlays:
+            self.overlay_note = "\n".join(lines)
+            return
+
+        ax = self.figure.axes[0]
+        lo, hi = self._utc[0], self._utc[-1]
+
+        for cand in self.overlays:
+            ms = cand.markset
+            pairs, omitted = ann.clip_to_window(ms.intervals, lo, hi)
+            self.overlay_omitted[ms.set_id] = omitted
+            clamped_for = {id(original): clamped for original, clamped in pairs}
+            any_drawn = False
+            for original in ms.intervals:
+                clamped = clamped_for.get(id(original))
+                if clamped is None:
+                    self.occurrences.append(
+                        Band(None, ms, original, None, candidate=cand))
+                    continue
+                patch, extra = self._band_patch(ax, clamped, ms.color,
+                                                foreign=True)
+                self.occurrences.append(
+                    Band(patch, ms, original, clamped, candidate=cand,
+                         decorations=extra))
+                any_drawn = True
+            # An OPEN swatch, answering the filled one this pair's own sets
+            # get: the same distinction the bands make, made again where the
+            # names are read.
+            if any_drawn:
+                self.mark_legend.append(
+                    (Patch(facecolor="none", edgecolor="#" + ms.color,
+                           linewidth=1.4),
+                     f"{ms.name}  ({len(pairs)}×)  ·  marked on "
+                     f"{ms.pair_text}"))
+
+            line = (f"“{ms.name}”, marked on {ms.pair_text} — "
+                    f"{len(pairs)} region(s) drawn")
+            line += (f", {omitted} outside this window and NOT drawn."
+                     if omitted else ".")
+            lines.append(line)
+        self.overlay_note = "\n".join(lines)
+
+    def _draw_ghosts(self):
+        """The absent partner of every borrowed pair, as a faint dashed line.
+
+        ONE PER DISTINCT KEY. Two borrowed sets drawn against the same series
+        are two interpretations of one thing, and drawing that series twice
+        would put two identical lines on the chart and two entries in a legend
+        that is already carrying four categories.
+
+        A band says "I judged this window interesting". The ghost is what the
+        series was actually doing inside it, which is the difference between
+        being told and being shown.
+        """
+        self.ghosts = []
+        self.ghost_problems = []
+        wanted = {}
+        for cand in self.overlays:
+            ref, names = wanted.setdefault(cand.foreign.key,
+                                           (cand.foreign, []))
+            names.append(cand.markset.name)
+
+        ax = self.figure.axes[0]
+        lo, hi = self._utc[0], self._utc[-1]
+        for _key, (ref, names) in wanted.items():
+            try:
+                ghost = self._ghost_for(ref, lo, hi)
+            except GhostError as exc:
+                # Loud, and on the same line as the omitted counts. The bands
+                # stay: they are still an attributed claim about windows. What
+                # must never happen is a chart that simply has no ghost on it
+                # and says nothing about why.
+                self.ghost_problems.append(
+                    f"The ghost line for “{'”, “'.join(names)}” is MISSING: "
+                    f"{exc}")
+                continue
+            # Grey, thin, dashed, and under the series lines. It is context: a
+            # reader must not be able to mistake it for one of the two series
+            # being compared, and colour is the only thing identifying a line
+            # on a chart whose y axis has no units.
+            # Solid, mid grey, under the series lines. It was dashed once, and
+            # a dashed line plus hatched bands put two competing textures on a
+            # chart whose whole job is showing the shape of two lines. Mid grey
+            # rather than light: a light line reads beautifully inside a shaded
+            # region and vanishes outside it, so the one line you are meant to
+            # follow end to end would fade in and out along its length.
+            ghost.line, = ax.plot(ghost.x, ghost.values, color="#6E6E6E",
+                                  linewidth=1.3, zorder=1.5, label=ghost.label)
+            ghost.borrowers = tuple(names)
+            self.ghosts.append(ghost)
+            self.mark_legend.append((ghost.line, ghost.label))
+
+        if self.ghost_problems:
+            self.overlay_note = "\n".join(
+                [self.overlay_note] + self.ghost_problems).strip()
+        # NOTE the frame is NOT touched here. Drawing is not a reason to move
+        # the view; see _apply_ylim, called by the two actions that are.
+
+    def _ghost_for(self, ref, lo, hi) -> Ghost:
+        """One fetch per key per window, failures included. Raises GhostError."""
+        got = self._ghost_cache.get(ref.key)
+        if got is None:
+            try:
+                got = load_ghost(self.study, ref,
+                                 interval=self.result.interval,
+                                 aggregation=self.result.aggregation,
+                                 lo=lo, hi=hi, config_root=ROOT)
+            except GhostError as exc:
+                got = exc
+            except Exception as exc:            # anything else, still visibly
+                got = GhostError(f"{ref.label} ({ref.key}): {exc}")
+            self._ghost_cache[ref.key] = got
+        if isinstance(got, GhostError):
+            raise got
+        return got
+
+    def _apply_ylim(self):
+        """Widen y to fit the ghosts. Called by BORROWING, never by drawing.
+
+        THE VIEW BELONGS TO WHOEVER IS LOOKING AT IT. Zoom, pan, home and an
+        action taken on purpose may move the frame; a redraw may not. This ran
+        inside the drawing path once, and saving a region while zoomed snapped
+        the vertical scale back to full range -- measured as y (-1.47, 1.46) ->
+        (-4.90, 4.86) on a save, with the x zoom surviving, which is worse than
+        either being consistent.
+
+        Widening for a ghost is legitimate because BORROWING IS AN ACTION. A
+        ghost standardised over a window it does not dominate exceeds the range
+        of the two plotted series easily, and a line whose entire job is to
+        show what a series was doing must not be cropped by a frame that says
+        nothing about having cropped it.
+
+        Only y. The x pin stays exactly as the rubber-band fix left it: a band
+        contributes nothing to the y limits at all -- axvspan spans y in AXES
+        coordinates -- which is why y can be recomputed and x cannot.
+        """
+        ax = self.figure.axes[0]
+        base = getattr(self, "_series_ylim", None)
+        if base is None:
+            return
+        if not self.ghosts:
+            # Restore the frame this widened -- but ONLY if it is still the one
+            # this widened. Anything else means the view was moved since, and
+            # handing back a borrowed set is not a reason to undo a zoom.
+            if self._ghost_ylim is not None \
+                    and ax.get_ylim() == self._ghost_ylim:
+                ax.set_ylim(base)
+            self._ghost_ylim = None
+            return
+        lows = [base[0]]
+        highs = [base[1]]
+        for g in self.ghosts:
+            finite = g.values[np.isfinite(g.values)]
+            if finite.size:
+                lows.append(float(finite.min()))
+                highs.append(float(finite.max()))
+        span = max(highs) - min(lows)
+        pad = 0.05 * span if span > 0 else 0.5
+        ax.set_ylim(min(lows) - pad, max(highs) + pad)
+        # Remembered so that removing the ghost can tell "the frame I set" from
+        # "the frame the user has since chosen", and only undo the former.
+        self._ghost_ylim = ax.get_ylim()
+
+    def ghost_message(self) -> str:
+        """What to tell someone about a ghost that could not be drawn, or ''.
+
+        Split from showing it for the reason every other message here is: a
+        modal dialog raised from inside the drawing path blocks whoever is
+        driving the window, including a gate, with no error.
+        """
+        if not self.ghost_problems:
+            return ""
+        return ("The regions of that set ARE drawn, but the series they "
+                "were drawn against could not be fetched, so there is no "
+                "ghost line showing what it was doing:\n\n"
+                + "\n\n".join(self.ghost_problems[:5]))
+
+    def report_ghost_problems(self):
+        """Raise the dialog, if there is anything to say. Caller's job."""
+        msg = self.ghost_message()
+        if msg:
+            messagebox.showwarning("Ghost line not drawn", msg, parent=self)
 
     def _to_axis(self, when):
         """A UTC instant -> the naive local value the axis is drawn on.
@@ -568,6 +1099,10 @@ class ViewWindow(tk.Toplevel):
 
     def _marks_need_attention(self) -> bool:
         return bool(self.mark_problems or self.omitted)
+
+    def _overlay_needs_attention(self) -> bool:
+        return bool(self.overlay_lost or self.ghost_problems
+                    or any(self.overlay_omitted.values()))
 
     def rejection_message(self) -> str:
         """What to tell someone about files that would not load, or ''.
@@ -601,9 +1136,20 @@ class ViewWindow(tk.Toplevel):
         for patch, label in self.mark_legend:
             handles.append(patch)
             labels.append(label)
+        # Two columns while the entries are short, one once a borrowed set has
+        # made them long. A borrowed entry NAMES ITS SOURCE PAIR -- that is the
+        # attribution, and it is most of a line on its own; two of them side by
+        # side would be truncated into saying nothing.
+        ncol = 1 if any(len(t) > 44 for t in labels) else 2
+        rows = -(-len(labels) // ncol)
         ax.legend(handles, labels, loc="upper center",
-                  bbox_to_anchor=(0.5, -0.16), ncol=2, frameon=False,
+                  bbox_to_anchor=(0.5, -0.16), ncol=ncol, frameon=False,
                   fontsize=9)
+        # And give it the room it needs. The strip was sized for two entries;
+        # attribution and a ghost line make four categories, and a legend that
+        # outgrows its margin walks off the bottom of the figure unremarked.
+        self.figure.subplots_adjust(
+            bottom=min(0.50, max(0.28, 0.14 + 0.07 * rows)))
 
     # ------------------------------------------------------------- selecting
 
@@ -695,8 +1241,14 @@ class ViewWindow(tk.Toplevel):
         y coordinate carries no information about which mark was clicked, and
         consulting it would only make a click near the top or bottom edge fail
         for no reason a user could see.
+
+        NATIVE BANDS WIN a tie. Where a borrowed band overlaps one of this
+        pair's own -- the coincidence the overlay exists to look for -- the
+        click resolves to the mark that can actually be edited from here.
         """
-        for entry in self.bands:
+        drawn = self.bands
+        for entry in [e for e in drawn if not e.is_foreign] + \
+                [e for e in drawn if e.is_foreign]:
             if entry.patch.get_x() <= x <= entry.patch.get_x() \
                     + entry.patch.get_width():
                 return entry
@@ -724,8 +1276,15 @@ class ViewWindow(tk.Toplevel):
         # Put the selector's handles ON the chosen band, so its edges are what
         # a drag adjusts. Setting extents marks the selection completed, which
         # is what makes the handles live.
+        #
+        # NOT for a borrowed band: it belongs to a pair that is not on screen,
+        # and handles on it would invite a drag that has to be refused. It is
+        # selectable so that clicking one says where it came from, and that is
+        # all it is.
         shown = entry.drawn or entry.interval
-        if self.span is not None:
+        if entry.is_foreign and self.span is not None:
+            self.span.set_visible(False)
+        elif self.span is not None:
             self.span.set_visible(True)
             self.span.extents = (self._to_num(shown.start_utc),
                                  self._to_num(shown.end_utc))
@@ -741,6 +1300,14 @@ class ViewWindow(tk.Toplevel):
                 f"{ann.local_text(iv.start_utc)}  →  "
                 f"{ann.local_text(iv.end_utc)}  local"
                 f"  ·  {duration_text(iv.end_utc - iv.start_utc)}")
+        if entry.is_foreign:
+            # Where it came from, on selection rather than only in the legend.
+            # It is read-only here and the readout has to say so, or the first
+            # thing anyone learns about the rule is that Delete did nothing.
+            text += (f"   ·   marked on {entry.markset.pair_text}, not on this "
+                     f"pair, so it is read-only here — open that pair to "
+                     f"change it.")
+            return text
         if entry.patch is None:
             # Say why there is nothing to drag, rather than leaving someone
             # hunting for handles that cannot exist.
@@ -749,12 +1316,28 @@ class ViewWindow(tk.Toplevel):
         return text
 
     def _restyle_bands(self):
-        """The selected band reads as selected. Colour still identifies the set."""
+        """The selected region reads as selected, without changing what it is.
+
+        A selected region from another pair stays an open bracket, and a
+        selected one of this pair's own stays a block. Selection is not allowed
+        to be the one moment the two look alike.
+        """
         for entry in self.bands:
             chosen = entry is self.selected_band
-            entry.patch.set_alpha(0.34 if chosen else 0.22)
-            entry.patch.set_linewidth(2.2 if chosen else 1.0)
-            entry.patch.set_linestyle("solid" if chosen else "dotted")
+            if entry.is_foreign:
+                # The edge RULES only. A colour bar is a patch and also has a
+                # linewidth, and giving it one draws a border round the bar
+                # that appears from nowhere the moment a region is selected.
+                for art in entry.decorations:
+                    if hasattr(art, "get_xdata"):
+                        art.set_linewidth(2.6 if chosen else 1.6)
+                # A faint wash only while selected, so the bracket still reads
+                # as a bracket the rest of the time.
+                entry.patch.set_facecolor(
+                    "#" + entry.markset.color if chosen else "none")
+                entry.patch.set_alpha(0.12 if chosen else None)
+                continue
+            entry.patch.set_alpha(0.30 if chosen else 0.15)
 
     def _to_num(self, when) -> float:
         return float(mdates.date2num(self._to_axis(when)))
@@ -908,6 +1491,8 @@ class ViewWindow(tk.Toplevel):
             raise RuntimeError("no mark is selected")
         if self.store is None:
             raise RuntimeError("this window has nowhere to store a mark")
+        if entry.is_foreign:
+            raise RuntimeError(self.foreign_refusal(entry, "Adjusting"))
         if entry.patch is None:
             raise RuntimeError(
                 f"“{entry.markset.name}” falls outside this window, so it is "
@@ -925,6 +1510,146 @@ class ViewWindow(tk.Toplevel):
         self.redraw_marks()
         self.select_interval(ms.set_id, start_utc, end_utc)
         return ms
+
+    # ------------------------------------------------------------- borrowing
+
+    def foreign_refusal(self, entry, verb: str) -> str:
+        """Why a borrowed band cannot be edited from here. Names the pair.
+
+        The pair is the point of the message. Editing a borrowed band would
+        change a set belonging to a comparison that is not on screen, and the
+        person doing it would be looking at a chart of two other series while
+        it happened.
+        """
+        return (f"{verb} “{entry.markset.name}” from here is refused: it is "
+                f"marked on {entry.markset.pair_text}, which is not the "
+                f"pair on this chart. It is drawn so you can see whether its "
+                f"windows line up with what is here, not to be edited through "
+                f"them. Open that pair to change it.")
+
+    def _no_candidates_reason(self) -> str:
+        """Why the dropdown is empty. Never merely disabled and silent."""
+        if self.store is None:
+            return "There is no study here to show regions from."
+        return ("Nothing to show: no saved set in this study shares exactly one "
+                "series with this pair.")
+
+    def _refresh_overlay_controls(self):
+        """Rebuild the dropdown from the candidates. Selection survives it.
+
+        Kept by SET ID rather than by the displayed string, because the string
+        changes the moment a set goes on the chart -- and a selection that
+        silently moved to a different set would borrow one thing while the box
+        showed another.
+        """
+        box = getattr(self, "overlay_box", None)
+        if box is None:
+            return
+        was = self.overlay_choice()
+        self._offer_ids = [c.markset.set_id for c in self.candidates]
+        values = [c.offer_text + ("   ·   on chart"
+                                  if c.markset.set_id in self.overlay_ids
+                                  else "")
+                  for c in self.candidates]
+        box.configure(values=values)
+        if was in self._offer_ids:
+            box.current(self._offer_ids.index(was))
+        elif values:
+            box.current(0)
+        else:
+            self.overlay_var.set("")
+
+        live = "readonly" if values else "disabled"
+        box.configure(state=live)
+        self.overlay_btn.configure(state="normal" if values else "disabled")
+        self.overlay_hint.configure(
+            text="" if values else self._no_candidates_reason())
+
+    def overlay_choice(self):
+        """The set id the dropdown is showing, or None. The seam under the UI."""
+        box = getattr(self, "overlay_box", None)
+        if box is None:
+            return None
+        i = box.current()
+        return self._offer_ids[i] if 0 <= i < len(self._offer_ids) else None
+
+    def prompt_overlay(self):
+        """Borrow whatever is chosen. UI only; the rule is in overlay()."""
+        set_id = self.overlay_choice()
+        if set_id is None:
+            return
+        # The ghost is fetched from the study's parquet on this thread. It is
+        # one series over one window and the frame is cached after the first
+        # read, but the first one is not instant, and a window that stops
+        # repainting with no explanation reads as a hang.
+        self.configure(cursor="watch")
+        self.update_idletasks()
+        try:
+            cand = self.overlay(set_id)
+        except Exception as exc:
+            messagebox.showerror("Could not show that set", str(exc),
+                                 parent=self)
+            return
+        finally:
+            self.configure(cursor="")
+        self.span_text.set(
+            f"Showing “{cand.markset.name}”, marked on {cand.markset.pair_text}. "
+            f"Its regions are bracketed, not shaded.")
+        # A key that no longer resolves gets a dialog, not only the note under
+        # the chart. The bands are drawn and attributed; what is missing is the
+        # line showing what the borrowed pair's other series was doing, and
+        # that absence is exactly what nobody would notice.
+        self.report_ghost_problems()
+
+    def prompt_remove_overlay(self):
+        """Stop borrowing the selected band's set. UI only.
+
+        Deliberately says that nothing was deleted. This button sits beside
+        Delete mark, acts on a band, and removes bands from the chart -- three
+        good reasons for someone to wonder whether their marks are gone.
+        """
+        entry = self.selected_band
+        if entry is None or not entry.is_foreign:
+            return
+        name, pair_text = entry.markset.name, entry.markset.pair_text
+        self.remove_overlay(entry.markset.set_id)
+        self.span_text.set(
+            f"Stopped showing “{name}” from {pair_text}. Nothing was "
+            f"deleted — the set is still saved on its own pair.")
+
+    def overlay(self, set_id: str):
+        """Borrow a saved set onto this chart, and redraw. Returns its offer.
+
+        The seam, matching commit_mark and delete_selected: the rule lives
+        here, and the dropdown above it only calls this. Eligibility is
+        re-checked rather than trusted from whatever the widget was showing --
+        the offer may have been built before another window deleted the set.
+        """
+        cand = next((c for c in self.candidates
+                     if c.markset.set_id == set_id), None)
+        if cand is None:
+            raise RuntimeError(
+                f"{set_id!r} cannot be shown on this pair. A set is "
+                f"offered only when it shares EXACTLY ONE series with what is "
+                f"on screen, in this study: sharing both makes it the same "
+                f"comparison, which loads as native marks, and sharing neither "
+                f"gives it no bearing on what is drawn.")
+        if set_id not in self.overlay_ids:
+            self.overlay_ids.append(set_id)
+        self.redraw_marks()
+        # Here, and not inside the redraw: borrowing is an action, and an
+        # action may move the frame. Drawing may not.
+        self._apply_ylim()
+        return cand
+
+    def remove_overlay(self, set_id: str) -> bool:
+        """Stop drawing a borrowed set. True if it was on the chart."""
+        if set_id not in self.overlay_ids:
+            return False
+        self.overlay_ids = [i for i in self.overlay_ids if i != set_id]
+        self.redraw_marks()
+        self._apply_ylim()
+        return True
 
     # ------------------------------------------------------------- deleting
 
@@ -970,6 +1695,12 @@ class ViewWindow(tk.Toplevel):
             raise RuntimeError("no mark is selected")
         if self.store is None:
             raise RuntimeError("this window has nowhere to delete from")
+        if entry.is_foreign:
+            # The trap this rule exists to close: #6 shipped click-a-band and
+            # press Delete, and a borrowed band joined to that selection model
+            # would remove an occurrence from another pair's set behind a
+            # confirmation naming a comparison nobody is looking at.
+            raise RuntimeError(self.foreign_refusal(entry, "Deleting"))
         ms = self.store.delete_interval(entry.markset.set_id,
                                         entry.interval.start_utc,
                                         entry.interval.end_utc)
@@ -980,6 +1711,14 @@ class ViewWindow(tk.Toplevel):
     def prompt_delete(self):
         """Confirm, then delete. UI only; see delete_selected."""
         if self.selected_band is None or self.store is None:
+            return
+        if self.selected_band.is_foreign:
+            # Reached by the Delete key, which is bound window-wide; the button
+            # is already disabled. Says why rather than doing nothing, which
+            # would read as a bug.
+            messagebox.showinfo(
+                "Region from another pair", self.foreign_refusal(self.selected_band,
+                                                      "Deleting"), parent=self)
             return
         name = self.selected_band.markset.name
         if not messagebox.askyesno("Delete mark", self.deletion_message(),
@@ -995,10 +1734,18 @@ class ViewWindow(tk.Toplevel):
         self.span_text.set(f"Deleted an occurrence of “{name}”.")
 
     def _sync_delete_button(self):
+        """The buttons that act on a selection follow it. Exactly one applies:
+        a native mark can be deleted, a borrowed one can only be handed back."""
+        entry = self.selected_band
         button = getattr(self, "delete_btn", None)
         if button is not None:
-            button.configure(state=("normal" if self.selected_band is not None
-                                    and self.store is not None else "disabled"))
+            live = (entry is not None and self.store is not None
+                    and not entry.is_foreign)
+            button.configure(state="normal" if live else "disabled")
+        remove = getattr(self, "remove_btn", None)
+        if remove is not None:
+            remove.configure(state="normal" if entry is not None
+                             and entry.is_foreign else "disabled")
 
     def select_interval(self, set_id: str, start_utc, end_utc):
         """Re-select an occurrence by VALUE after the bands were rebuilt."""
@@ -1011,8 +1758,13 @@ class ViewWindow(tk.Toplevel):
 
     def redraw_marks(self):
         """Reload from disk and repaint. The file is the source of truth."""
-        for patch in self.mark_patches:
-            patch.remove()
+        for entry in self.bands:
+            for art in entry.artists:
+                art.remove()
+        for ghost in self.ghosts:
+            if ghost.line is not None:
+                ghost.line.remove()
+        self.ghosts = []
         # Every Band held a patch that has just been removed, so any selection
         # now points at an artist that is no longer on the axes. Cleared here
         # rather than left dangling; a caller that wants the selection back
@@ -1028,6 +1780,12 @@ class ViewWindow(tk.Toplevel):
                 text=self.marks_note,
                 foreground="#B4531A" if self._marks_need_attention()
                 else "#777")
+        if getattr(self, "overlay_label", None) is not None:
+            self.overlay_label.configure(
+                text=self.overlay_note,
+                foreground="#B4531A" if self._overlay_needs_attention()
+                else "#777")
+        self._refresh_overlay_controls()
         if getattr(self, "canvas", None) is not None:
             self.canvas.draw_idle()
 
@@ -1175,6 +1933,10 @@ class ViewWindow(tk.Toplevel):
         ax.autoscale_view()
         ax.set_xlim(ax.get_xlim())
         ax.set_ylim(ax.get_ylim())
+        # Kept so the frame can be restored EXACTLY when a ghost that widened
+        # it is handed back. Recomputing it later from the lines would include
+        # whatever else has since been drawn.
+        self._series_ylim = ax.get_ylim()
 
         # The legend is built by _refresh_legend once the mark bands exist, so
         # that sets are named alongside the series rather than in a second
@@ -1269,6 +2031,13 @@ def _main(argv=None):
     ap.add_argument("--overlap", default="union")
     ap.add_argument("--check", action="store_true",
                     help="assert the window is viewable and correct, then exit")
+    ap.add_argument("--shot", default=None, metavar="PATH",
+                    help="write the chart to a PNG and exit. With --check it "
+                         "writes the gate's own window, which carries a native "
+                         "set, two borrowed ones and a ghost line at once -- "
+                         "the picture the overlay's visual review is of, since "
+                         "no gate can assert that a borrowed band READS as "
+                         "borrowed")
     args = ap.parse_args(argv)
 
     from pathlib import Path
@@ -1332,6 +2101,10 @@ def _main(argv=None):
     win.update_idletasks()
 
     if not args.check:
+        if args.shot:
+            win.figure.savefig(args.shot, dpi=110, facecolor="white")
+            print(f"shot  : {args.shot}")
+            return 0
         root_tk.mainloop()
         return 0
 
@@ -1342,6 +2115,49 @@ def _main(argv=None):
 
     mapped = bool(win.winfo_ismapped())
     checks.append(("window is mapped", mapped))
+
+    # Asserted at the size the window OPENS at, never after a resize -- being
+    # visible only to someone who thought to drag the window bigger is what
+    # made this invisible for three slices. Tk allocates space to the slaves
+    # packed first, so an expanding chart packed first left every fixed-height
+    # row below it unmapped, including the two lines that carry the counts
+    # this feature promises to report.
+    furniture = {"overlay dropdown": win.overlay_box,
+                 "Overlay button": win.overlay_btn,
+                 "Remove button": win.remove_btn,
+                 "Delete button": win.delete_btn,
+                 "regions note": win.overlay_label,
+                 "marks note": win.marks_label,
+                 "the regions list": win.mark_tree}
+    absent = [n for n, w in furniture.items() if not w.winfo_ismapped()]
+    checks.append((f"every control and status line is on screen at the size "
+                   f"the window opens at "
+                   f"[{len(furniture) - len(absent)}/{len(furniture)}"
+                   f"{'; MISSING ' + ', '.join(absent) if absent else ''}]",
+                   not absent))
+
+    # Mapped is not the same as REACHABLE. A row can be mapped and still sit
+    # past the bottom edge of the window, which is what a user sees as "it is
+    # overflowing". Asserted against the window's own height, not its request.
+    def below_edge(w):
+        return (w.winfo_rooty() - win.winfo_rooty()) + w.winfo_height() \
+            > win.winfo_height()
+
+    over = [n for n, w in furniture.items() if below_edge(w)]
+    checks.append((f"and none of them runs past the bottom edge of the window "
+                   f"[{'; OVER: ' + ', '.join(over) if over else 'all inside'}]",
+                   not over))
+
+    # The control that brings another pair's regions onto the chart sits ABOVE
+    # the chart. Below it, it was the last thing on a window it fitted by ten
+    # pixels, and the first thing to disappear on a shorter screen.
+    canvas_top = (win.canvas.get_tk_widget().winfo_rooty()
+                  - win.winfo_rooty())
+    control_top = win.overlay_box.winfo_rooty() - win.winfo_rooty()
+    checks.append((f"the 'regions from another pair' control is above the "
+                   f"chart, where nothing can push it off "
+                   f"[control at y={control_top}, chart at y={canvas_top}]",
+                   control_top < canvas_top))
 
     expected = sk.zscore(res.data)
     drawn = win.plotted()
@@ -1502,12 +2318,31 @@ def _main(argv=None):
         # rubber-band Rectangle on the same axes, so it is excluded by
         # IDENTITY rather than by type or colour, either of which would start
         # silently swallowing real bands the day one of them matched.
+        # The colour bar along a region's edge is a patch too, and it is
+        # excluded the same way and for the same reason: by identity, from the
+        # window's own record of what it drew as decoration, never by type or
+        # position -- either of which would start swallowing real regions the
+        # day one matched.
+        def geometry_spans():
+            rubber = getattr(win.span, "_selection_artist", None)
+            decor = {id(a) for b in win.occurrences for a in b.decorations}
+            return [p for p in win.figure.axes[0].patches
+                    if p is not rubber and id(p) not in decor]
+
         rubber_band = getattr(win.span, "_selection_artist", None)
-        spans = [p for p in win.figure.axes[0].patches if p is not rubber_band]
+        spans = geometry_spans()
         checks.append(("the drag rubber-band is on the axes and was excluded",
                        rubber_band is not None
                        and any(p is rubber_band
                                for p in win.figure.axes[0].patches)))
+        checks.append((f"each region's colour bar is on the axes beside its "
+                       f"band, and was excluded too "
+                       f"[{sum(len(b.decorations) for b in win.bands)} "
+                       f"decoration(s)]",
+                       all(all(a in win.figure.axes[0].patches
+                               or a in win.figure.axes[0].get_lines()
+                               for a in b.decorations) for b in win.bands)
+                       and bool(win.bands)))
         checks.append((f"one band is drawn per interval inside the window "
                        f"[{len(spans)} bands]", len(spans) == len(inside)))
         checks.append(("the derived band views agree with the axes exactly",
@@ -1572,8 +2407,7 @@ def _main(argv=None):
                            and i.end_utc == idx[560].to_pydatetime()
                            for i in on_disk.intervals)))
 
-        spans_now = [p for p in win.figure.axes[0].patches
-                     if p is not getattr(win.span, "_selection_artist", None)]
+        spans_now = geometry_spans()
         checks.append((f"the new band is on the chart without reopening "
                        f"[{len(spans_now)} bands]", len(spans_now) == 3))
 
@@ -1662,9 +2496,13 @@ def _main(argv=None):
                        target.markset.name in win.span_text.get()
                        and ann.local_text(target.interval.start_utc)
                        in win.span_text.get()))
-        checks.append(("the selected band is styled apart from the others",
-                       all(target.patch.get_linewidth() > b.patch.get_linewidth()
-                           for b in win.bands if b is not target)))
+        others = [b for b in win.bands if b is not target]
+        checks.append((f"the selected region reads apart from the others "
+                       f"[{target.patch.get_alpha():.2f} vs "
+                       f"{[round(b.patch.get_alpha(), 2) for b in others]}]",
+                       bool(others)
+                       and all(target.patch.get_alpha() > b.patch.get_alpha()
+                               for b in others)))
         checks.append(("selecting resolves to the interval's samples, so a "
                        "later edit can recompute coverage",
                        win._selected_indices
@@ -1982,6 +2820,540 @@ def _main(argv=None):
         checks.append((f"no band is drawn in a series colour "
                        f"[{len(rounded)} band colour(s) checked]",
                        bool(rounded) and not (rounded & series_rgb)))
+
+        # ---- borrowing a set drawn on another pair --------------------------
+        # The case the whole feature exists for: a set drawn on this pair's
+        # first series against a THIRD series, which is therefore a candidate
+        # explanation that is not on screen.
+        on_screen = {c.key for _t, c in chosen}
+        third_key = next(k for k in sorted(by_key) if k not in on_screen)
+        third = by_key[third_key][1]
+        foreign_ref = ann.SeriesRef(third_key, third.label)
+        home = (refs[0], foreign_ref)
+
+        borrow = ann.Store(tmp)
+        for a, b in [(idx[200], idx[260]), (idx[400], idx[470])]:
+            borrow.confirm(study_id=info.study_id, pair=home,
+                           name="third series", reason="candidate explanation",
+                           start_utc=a, end_utc=b)
+        borrow.confirm(study_id=info.study_id, pair=home, name="third series",
+                       reason="", start_utc=idx[0] - dt.timedelta(days=20),
+                       end_utc=idx[0] - dt.timedelta(days=19))
+        # A set sharing NEITHER series with what is on screen.
+        borrow.confirm(study_id=info.study_id, name="unrelated", reason="",
+                       pair=(foreign_ref, ann.SeriesRef("p::q::r", "p.q.r")),
+                       start_utc=idx[200], end_utc=idx[260])
+        win.redraw_marks()
+        pinned_x = win.figure.axes[0].get_xlim()   # must survive every overlay
+
+        offered = {c.markset.name for c in win.candidates}
+        native_names = {m.name for m in win.marks}
+        checks.append((f"the sets sharing exactly one series are offered "
+                       f"[{sorted(offered)}]",
+                       offered == {"third series", "other pair"}))
+        checks.append((f"a set on THIS pair is not offered as an overlay — it "
+                       f"is already native here [{sorted(native_names)}]",
+                       bool(native_names) and not (native_names & offered)))
+        checks.append(("a set sharing neither series is not offered",
+                       "unrelated" not in offered))
+
+        wl = next(c for c in win.candidates
+                  if c.markset.name == "third series")
+        checks.append((f"the offer names the absent partner, which is what "
+                       f"gets borrowed [{wl.foreign.label}]",
+                       wl.foreign.key == third_key
+                       and wl.shared.key == refs[0].key))
+
+        def native_state():
+            """What this pair's own bands are, and where they are drawn."""
+            return [(b.markset.set_id, b.interval.start_utc, b.interval.end_utc,
+                     round(b.patch.get_x(), 9), round(b.patch.get_width(), 9))
+                    for b in win.bands if not b.is_foreign]
+
+        native_before = native_state()
+        cand = win.overlay(wl.markset.set_id)
+        foreign_bands = [b for b in win.bands if b.is_foreign]
+        native_bands = [b for b in win.bands if not b.is_foreign]
+        checks.append((f"borrowing draws one band per occurrence inside the "
+                       f"window [{len(foreign_bands)} borrowed]",
+                       cand is not None and len(foreign_bands) == 2))
+        checks.append((f"and leaves every native band exactly where it was "
+                       f"[{len(native_before)} compared]",
+                       bool(native_before)
+                       and native_state() == native_before))
+
+        # Read off the AXES. What is on the chart is the claim being made, and
+        # the distinction this issue is HITL for is a property of the artists.
+        # A BLOCK against a BRACKET: shape carries it, so the assertions are
+        # about fill and about where the colour bar sits, not about texture.
+        fill_alpha = [b.patch.get_facecolor()[3] for b in foreign_bands]
+        native_fill = [b.patch.get_facecolor()[3] for b in native_bands]
+        checks.append((f"a region from another pair is UNFILLED where this "
+                       f"pair's own are shaded [fill {fill_alpha} vs "
+                       f"{native_fill}]",
+                       bool(foreign_bands) and bool(native_bands)
+                       and all(a == 0 for a in fill_alpha)
+                       and all(0 < a < 0.4 for a in native_fill)))
+        checks.append((f"the shading is light enough that the data underneath "
+                       f"survives it -- a dark block would hide the very thing "
+                       f"a marked window is asking about [{native_fill}]",
+                       all(a <= 0.2 for a in native_fill)))
+        checks.append(("nothing is hatched any more, on either kind",
+                       not any(b.patch.get_hatch()
+                               for b in foreign_bands + native_bands)))
+
+        def bar_of(band):
+            """The colour bar: the one decoration that is a patch."""
+            return next(a for a in band.decorations if hasattr(a, "get_xy"))
+
+        native_bar_y = [bar_of(b).get_y() for b in native_bands]
+        foreign_bar_y = [bar_of(b).get_y() for b in foreign_bands]
+        checks.append((f"the set's colour is a bar along the TOP of this "
+                       f"pair's regions and the BOTTOM of another pair's, so "
+                       f"position says which before colour does "
+                       f"[{[round(v, 2) for v in native_bar_y]} vs "
+                       f"{[round(v, 2) for v in foreign_bar_y]}]",
+                       bool(native_bar_y) and bool(foreign_bar_y)
+                       and all(v > 0.9 for v in native_bar_y)
+                       and all(v < 0.1 for v in foreign_bar_y)))
+        set_rgb = {tuple(round(int(wl.markset.color[i:i + 2], 16) / 255, 4)
+                         for i in (0, 2, 4))}
+        # The regression this exists to prevent: at 1150 px for a 45-day window
+        # an hour is about one pixel, so an ordinary six-hour region is 6 px
+        # wide and a fill alone is a smudge. Edge rules are what make a real
+        # region findable, and they were dropped once already.
+        def rules_of(band):
+            return [a for a in band.decorations if hasattr(a, "get_xdata")]
+
+        edged = []
+        for b in native_bands + foreign_bands:
+            rules = rules_of(b)
+            # The rule holds the naive local datetime it was drawn at; the
+            # span holds the same instant as a matplotlib date number.
+            at = sorted(float(mdates.date2num(r.get_xdata()[0]))
+                        for r in rules)
+            want = sorted((b.patch.get_x(),
+                           b.patch.get_x() + b.patch.get_width()))
+            edged.append(
+                len(rules) == 2
+                and all(abs(g - w) < 1e-6 for g, w in zip(at, want))
+                and all(r.get_color().lstrip("#").upper()
+                        == b.markset.color.upper() for r in rules))
+        checks.append((f"EVERY region has an edge rule at each of its bounds, "
+                       f"in its set's colour -- a fill alone is invisible at "
+                       f"the width of a real region [{len(edged)} regions]",
+                       bool(edged) and all(edged)))
+
+        def top_marks(band):
+            return [a for a in band.decorations
+                    if hasattr(a, "get_y") and a.get_y() > 0.9]
+
+        checks.append(("and a marker near the top, so every region on the "
+                       "chart is found by scanning one line rather than two",
+                       all(top_marks(b)
+                           for b in native_bands + foreign_bands)))
+
+        checks.append(("and the bar carries the SET's colour, which is what "
+                       "the legend swatch matches",
+                       all(tuple(round(v, 4)
+                                 for v in bar_of(b).get_facecolor()[:3])
+                           in set_rgb for b in foreign_bands)))
+        checks.append(("a region from another pair is drawn ABOVE this pair's, "
+                       "so a coincidence between them still reads as both",
+                       min(b.patch.get_zorder() for b in foreign_bands)
+                       > max(b.patch.get_zorder() for b in native_bands)))
+
+        legend = [t.get_text()
+                  for t in win.figure.axes[0].get_legend().get_texts()]
+        attributed = [t for t in legend if "marked on" in t]
+        checks.append((f"the legend names the SOURCE PAIR of the borrowed set "
+                       f"{attributed}",
+                       len(attributed) == 1
+                       and wl.markset.pair_text in attributed[0]
+                       and "third series" in attributed[0]))
+
+        checks.append((f"the interval outside the window is omitted and "
+                       f"COUNTED against its own set "
+                       f"[{win.overlay_omitted}]",
+                       win.overlay_omitted[wl.markset.set_id] == 1))
+        checks.append((f"and the window says so, naming the set and the pair "
+                       f"[{win.overlay_note}]",
+                       "third series" in win.overlay_note
+                       and wl.markset.pair_text in win.overlay_note
+                       and "NOT drawn" in win.overlay_note))
+        checks.append(("the borrowed count is reported apart from the native "
+                       "one, so neither is attributed to the wrong pair",
+                       "borrowed" not in win.marks_note.lower()
+                       and str(win.overlay_omitted[wl.markset.set_id])
+                       in win.overlay_note))
+
+        rows = [r for r, entry in win._row_for.items() if entry.is_foreign]
+        parents = {win.mark_tree.item(win.mark_tree.parent(r), "values")[0]
+                   for r in rows}
+        checks.append((f"the list flags rows from another pair [{parents}]",
+                       len(rows) == 3 and parents == {"other pair"}))
+
+        # ---- a borrowed band is read-only -----------------------------------
+        edge = foreign_bands[0]
+        win.select_band(edge)
+        checks.append(("a borrowed band can be selected, so clicking one says "
+                       "where it came from",
+                       win.selected_band is edge))
+        checks.append((f"the readout says which pair it was marked on, and "
+                       f"that it is read-only here "
+                       f"[...{win.span_text.get()[-78:]}]",
+                       "marked on" in win.span_text.get()
+                       and "read-only" in win.span_text.get()
+                       and wl.markset.pair_text in win.span_text.get()))
+        checks.append(("no adjust handles are put on it, so there is no drag "
+                       "to have to refuse",
+                       not win.span.get_visible()))
+        checks.append(("the Delete button is OFF for a region from another pair",
+                       str(win.delete_btn.cget("state")) == "disabled"))
+
+        borrowed_bytes = (tmp / f"{wl.markset.set_id}.json").read_bytes()
+        try:
+            win.delete_selected()
+            del_refused, del_why = False, "it was allowed"
+        except RuntimeError as exc:
+            del_refused, del_why = True, str(exc)
+        checks.append((f"deleting it is refused, naming the set and the pair "
+                       f"it belongs to [{del_why[:60]}...]",
+                       del_refused and "third series" in del_why
+                       and wl.markset.pair_text in del_why))
+        try:
+            win.adjust_selected(idx[210], idx[250])
+            adj_refused, adj_why = False, "it was allowed"
+        except RuntimeError as exc:
+            adj_refused, adj_why = True, str(exc)
+        checks.append((f"and so is adjusting it [{adj_why[:52]}...]",
+                       adj_refused and wl.markset.pair_text in adj_why))
+        checks.append(("neither attempt wrote anything to the borrowed set's "
+                       "file",
+                       (tmp / f"{wl.markset.set_id}.json").read_bytes()
+                       == borrowed_bytes))
+
+        # ---- the dropdown ----------------------------------------------------
+        offers = list(win.overlay_box.cget("values"))
+        checks.append((f"the dropdown offers exactly the eligible sets, each "
+                       f"naming its source pair {offers}",
+                       len(offers) == len(win.candidates) == 2
+                       and all(c.markset.name in o and c.markset.pair_text in o
+                               for c, o in zip(win.candidates, offers))))
+        checks.append((f"and marks the one already on the chart "
+                       f"[{[o[-9:] for o in offers if 'on chart' in o]}]",
+                       sum("on chart" in o for o in offers) == 1))
+
+        # Hand it back through the button, then borrow it again through the
+        # button, so the control is exercised and not only the seam under it.
+        win.select_band(next(b for b in win.bands if b.is_foreign))
+        checks.append(("Remove overlay is live only while a BORROWED band is "
+                       "selected",
+                       str(win.remove_btn.cget("state")) == "normal"))
+        win.prompt_remove_overlay()
+        checks.append((f"pressing it stops the borrowing and says nothing was "
+                       f"deleted [...{win.span_text.get()[-46:]}]",
+                       not [b for b in win.bands if b.is_foreign]
+                       and "Nothing was deleted" in win.span_text.get()
+                       and (tmp / f"{wl.markset.set_id}.json").exists()))
+        win.select_band(next(b for b in win.bands if not b.is_foreign))
+        checks.append(("and it is off again for a native mark, which is "
+                       "deleted rather than handed back",
+                       str(win.remove_btn.cget("state")) == "disabled"
+                       and str(win.delete_btn.cget("state")) == "normal"))
+
+        win.overlay_box.current(win._offer_ids.index(wl.markset.set_id))
+        checks.append(("the choice resolves to a SET ID, not to the label the "
+                       "box happens to be showing",
+                       win.overlay_choice() == wl.markset.set_id))
+        win.prompt_overlay()
+        checks.append((f"pressing Overlay draws its bands "
+                       f"[{len([b for b in win.bands if b.is_foreign])} "
+                       f"borrowed]",
+                       [b.markset.set_id for b in win.bands if b.is_foreign]
+                       == [wl.markset.set_id] * 2))
+
+        bare = ViewWindow(root_tk, res, study=info,
+                          annotations_dir=tmp / "no-sets-here")
+        bare.update_idletasks()
+        hint = str(bare.overlay_hint.cget("text"))
+        checks.append((f"with nothing eligible the control is disabled and "
+                       f"SAYS WHY [{hint}]",
+                       str(bare.overlay_box.cget("state")) == "disabled"
+                       and str(bare.overlay_btn.cget("state")) == "disabled"
+                       and "exactly one series" in hint))
+        bare.destroy()
+
+        # ---- the ghost line --------------------------------------------------
+        ghosts = win.ghosts
+        ghost_lines = [g.line for g in ghosts]
+        checks.append((f"the absent partner is fetched by its stable key and "
+                       f"drawn [{[g.ref.label for g in ghosts]}]",
+                       len(ghosts) == 1 and ghosts[0].ref.key == third_key
+                       and all(ln in win.figure.axes[0].get_lines()
+                               for ln in ghost_lines)))
+
+        gt, gc = resolve_series(info, third_key, ROOT)
+        checks.append((f"resolve_series finds it in THIS study, without a "
+                       f"window [{gc.key}]", gc.key == third_key))
+
+        ghost_res = sk.build_comparison(
+            [(gt, gc)], interval=args.interval, aggregation=args.aggregation,
+            overlap="union", min_samples=1, start=idx[0], end=idx[-1],
+            convert_units_flag=True, stratification=False)
+        want_z = sk.zscore(ghost_res.data)[ghost_res.data.columns[0]].to_numpy()
+        got_z = ghosts[0].values
+        checks.append((f"its y data is sk.zscore of that series, exactly — the "
+                       f"same function the workbook standardises with "
+                       f"[{len(got_z)} points]",
+                       len(got_z) == len(want_z)
+                       and np.allclose(got_z, want_z, equal_nan=True,
+                                       rtol=0, atol=0)))
+        drawn_y = ghost_lines[0].get_ydata()
+        checks.append(("and that is what was handed to matplotlib, not merely "
+                       "what was computed",
+                       len(drawn_y) == len(want_z)
+                       and np.allclose(drawn_y, want_z, equal_nan=True,
+                                       rtol=0, atol=0)))
+        checks.append((f"standardised over THIS window: mean {np.nanmean(got_z):+.1e}, "
+                       f"sd {np.nanstd(got_z):.6f} — a series standardised over "
+                       f"its own wider extent would not centre here",
+                       abs(float(np.nanmean(got_z))) < 1e-9
+                       and abs(float(np.nanstd(got_z)) - 1.0) < 1e-9))
+
+        legend = [t.get_text()
+                  for t in win.figure.axes[0].get_legend().get_texts()]
+        context = [t for t in legend if "ghost" in t]
+        checks.append((f"the legend labels it as CONTEXT, not as a compared "
+                       f"series {context}",
+                       len(context) == 1 and "not compared" in context[0]
+                       and gc.geometry_label in context[0]))
+        checks.append(("it is not one of the compared series: two lines are "
+                       "still the pair, and the ghost is neither",
+                       len(win.plotted()) == 2
+                       and ghost_lines[0] not in win.series_lines.values()))
+        checks.append((f"it is SOLID and thinner than a compared series, and "
+                       f"sits under them [lw {ghost_lines[0].get_linewidth()} "
+                       f"vs {[ln.get_linewidth() for ln in win.series_lines.values()]}]",
+                       ghost_lines[0].get_linestyle() in ("-", "solid")
+                       and ghost_lines[0].get_linewidth()
+                       < min(ln.get_linewidth()
+                             for ln in win.series_lines.values())
+                       and ghost_lines[0].get_zorder()
+                       < min(ln.get_zorder()
+                             for ln in win.series_lines.values())))
+        ghost_rgb = ghost_lines[0].get_color().lstrip("#").upper()
+        r, g, b = (int(ghost_rgb[i:i + 2], 16) for i in (0, 2, 4))
+        grey = abs(r - g) < 8 and abs(g - b) < 8
+        checks.append((f"and grey, at no series colour, and mid rather than "
+                       f"light -- a light line reads inside a shaded region "
+                       f"and vanishes outside it [{ghost_rgb}]",
+                       grey and 0x50 <= r <= 0x90
+                       and ghost_rgb not in
+                       {c.upper() for c in identity.SERIES_COLORS}))
+
+        # The frame. Only the X pin was ever load-bearing; y is recomputed so
+        # that a line whose whole job is to show what a series did is never
+        # silently cropped. Forced with a synthetic ghost, because real data
+        # may happen to fit inside the pinned range and a check that passes
+        # only when the situation does not arise asserts nothing.
+        axis = win.figure.axes[0]
+        with_ghost = axis.get_ylim()
+        checks.append((f"the real ghost is inside the frame "
+                       f"[{with_ghost[0]:.2f}..{with_ghost[1]:.2f}]",
+                       float(np.nanmin(got_z)) >= with_ghost[0]
+                       and float(np.nanmax(got_z)) <= with_ghost[1]))
+        win.ghosts.append(Ghost(ref=wl.foreign, label="synthetic", x=None,
+                                values=np.array([-9.0, 11.0])))
+        win._apply_ylim()
+        widened = axis.get_ylim()
+        win.ghosts.pop()
+        win._apply_ylim()
+        checks.append((f"a ghost exceeding the pinned range WIDENS it rather "
+                       f"than being cropped [{with_ghost[0]:.2f}.."
+                       f"{with_ghost[1]:.2f} -> {widened[0]:.2f}.."
+                       f"{widened[1]:.2f}]",
+                       widened[0] <= -9.0 and widened[1] >= 11.0))
+        checks.append(("and dropping it restores the frame exactly",
+                       axis.get_ylim() == with_ghost))
+        checks.append((f"the X pin is untouched throughout "
+                       f"[{axis.get_xlim()[0]:.0f}..{axis.get_xlim()[1]:.0f}]",
+                       axis.get_xlim() == pinned_x))
+
+        # Two sets drawn against the SAME absent series are two readings of one
+        # thing. One ghost, named for both.
+        twin = ann.Store(tmp)
+        twin.confirm(study_id=info.study_id, name="same partner", reason="",
+                     pair=(refs[1], foreign_ref),
+                     start_utc=idx[600], end_utc=idx[650])
+        win.redraw_marks()
+        twin_id = next(c.markset.set_id for c in win.candidates
+                       if c.markset.name == "same partner")
+        win.overlay(twin_id)
+        checks.append((f"two borrowed sets sharing one absent series get ONE "
+                       f"ghost line, named for both "
+                       f"[{sorted(win.ghosts[0].borrowers) if win.ghosts else []}]",
+                       len(win.ghosts) == 1
+                       and sorted(win.ghosts[0].borrowers)
+                       == ["same partner", "third series"]))
+        win.remove_overlay(twin_id)
+        checks.append(("removing one of them keeps the ghost the other still "
+                       "needs", len(win.ghosts) == 1))
+        # By IDENTITY, not by counting lines: a region from another pair draws
+        # edge rules, which are Line2D too, so a count would be measuring the
+        # bands going away rather than the ghost.
+        doomed_line = win.ghosts[0].line
+        doomed_artists = [a for b in win.bands if b.is_foreign
+                          for a in b.artists]
+        win.remove_overlay(wl.markset.set_id)
+        checks.append((f"removing the last borrower takes the ghost off the "
+                       f"axes [{len(win.figure.axes[0].get_lines())} lines "
+                       f"left]",
+                       not win.ghosts
+                       and doomed_line not in win.figure.axes[0].get_lines()
+                       and win.figure.axes[0].get_ylim() == win._series_ylim))
+        checks.append((f"and takes EVERY artist of its regions with it, "
+                       f"leaving no colour bar or edge rule behind "
+                       f"[{len(doomed_artists)} checked]",
+                       bool(doomed_artists)
+                       and not any(a in win.figure.axes[0].patches
+                                   or a in win.figure.axes[0].get_lines()
+                                   for a in doomed_artists)))
+        win.overlay(wl.markset.set_id)
+
+        # ---- the view belongs to whoever is looking at it --------------------
+        # docs/adr/0001. This is the assertion the frame code cannot make about
+        # itself: _apply_ylim ran inside the drawing path, so saving a region
+        # while zoomed snapped the vertical scale back to full range while the
+        # x zoom survived. Nothing above would have noticed -- band positions
+        # are asserted in DATA coordinates, which stay correct however absurd
+        # the view becomes.
+        zoomed_x = (float(win._xnum[300]), float(win._xnum[380]))
+        zoomed_y = (-1.5, 1.5)
+        axis.set_xlim(zoomed_x)
+        axis.set_ylim(zoomed_y)
+        win.selection = (idx[320], idx[340])
+        win._selected_indices = (320, 340)
+        win.commit_mark("zoomed in", "saved without leaving the zoom")
+        moved = (axis.get_xlim(), axis.get_ylim())
+        checks.append((f"saving a region while zoomed leaves the view exactly "
+                       f"where it was [y {moved[1][0]:.2f}..{moved[1][1]:.2f}, "
+                       f"wanted {zoomed_y[0]:.2f}..{zoomed_y[1]:.2f}]",
+                       moved == (zoomed_x, zoomed_y)))
+        checks.append(("and the region saved at that zoom is on the chart, so "
+                       "the frame was kept by not moving it rather than by "
+                       "not drawing",
+                       any(b.markset.name == "zoomed in" for b in win.bands)))
+        axis.set_xlim(pinned_x)
+        win._apply_ylim()          # back to the borrowed frame for what follows
+
+        # ---- native wins a tie ----------------------------------------------
+        overlap = ann.Store(tmp)
+        overlap.confirm(study_id=info.study_id, pair=refs, name="coincides",
+                        reason="drawn over a borrowed band on purpose",
+                        start_utc=idx[210], end_utc=idx[250])
+        win.redraw_marks()
+        checks.append(("borrowing survives a redraw rather than quietly "
+                       "falling off the chart",
+                       len([b for b in win.bands if b.is_foreign]) == 2))
+        mine = next(b for b in win.bands if b.markset.name == "coincides")
+        mid = mine.patch.get_x() + mine.patch.get_width() / 2
+        hit = win.band_at(mid)
+        checks.append((f"where a borrowed band overlaps a native one, the "
+                       f"click resolves to the NATIVE mark — the one that can "
+                       f"be edited from here [{hit.markset.name}]",
+                       hit is mine and not hit.is_foreign))
+
+        # ---- more than one set at a time -------------------------------------
+        second = next(c for c in win.candidates
+                      if c.markset.name == "other pair")
+        win.overlay(second.markset.set_id)
+        sets_drawn = {b.markset.name for b in win.bands if b.is_foreign}
+        legend = [t.get_text()
+                  for t in win.figure.axes[0].get_legend().get_texts()]
+        checks.append((f"two sets can be borrowed at once [{sorted(sets_drawn)}]",
+                       sets_drawn == {"third series", "other pair"}
+                       and len(win.overlays) == 2))
+        checks.append((f"and the legend attributes BOTH "
+                       f"[{len([t for t in legend if 'marked on' in t])} "
+                       f"attributed]",
+                       len([t for t in legend if "marked on" in t]) == 2))
+
+        # Everything the visual review is about is on the chart at exactly this
+        # point: this pair's own solid bands, two borrowed sets outlined and
+        # hatched, and a ghost line. Whether a borrowed band READS as borrowed
+        # is a judgement about visual weight, and no assertion above can make
+        # it -- so the gate can hand over the picture instead of a window
+        # someone has to open.
+        if args.shot:
+            win.figure.savefig(args.shot, dpi=110, facecolor="white")
+            print(f"shot  : {args.shot}")
+
+        # ---- a key that no longer resolves ----------------------------------
+        # "other pair" was drawn against x::y::z, which is in no study. Its
+        # bands are still an attributed claim about windows and stay on the
+        # chart; what must not happen is a chart with no ghost on it saying
+        # nothing about why.
+        checks.append((f"the unresolvable partner is REPORTED, not left as a "
+                       f"silently absent line "
+                       f"[{len(win.ghost_problems)} problem(s)]",
+                       len(win.ghost_problems) == 1
+                       and len(win.ghosts) == 1))
+        checks.append((f"the report names the set, the key and the label "
+                       f"[{win.ghost_problems[0][:96]}...]",
+                       "other pair" in win.ghost_problems[0]
+                       and "x::y::z" in win.ghost_problems[0]
+                       and "MISSING" in win.ghost_problems[0]))
+        gmsg = win.ghost_message()
+        checks.append(("the dialog wording says the bands are drawn and the "
+                       "ghost is not, and is readable without a modal box "
+                       "standing in the way",
+                       "regions of that set ARE drawn" in gmsg
+                       and "x::y::z" in gmsg
+                       and "no ghost line" in gmsg))
+        checks.append((f"and the note under the chart says so too, in orange "
+                       f"[{win._overlay_needs_attention()}]",
+                       "MISSING" in win.overlay_note
+                       and win._overlay_needs_attention()))
+
+        try:
+            resolve_series(info, "nowhere::in::this-study", ROOT)
+            resolved, why = True, ""
+        except GhostError as exc:
+            resolved, why = False, str(exc)
+        checks.append((f"resolve_series refuses an unknown key by name, "
+                       f"without a window [{why[:70]}...]",
+                       not resolved and "nowhere::in::this-study" in why
+                       and info.study_id in why))
+
+        win.remove_overlay(second.markset.set_id)
+        checks.append(("removing one leaves the other drawn",
+                       {b.markset.name for b in win.bands if b.is_foreign}
+                       == {"third series"}))
+        checks.append(("and removing something not borrowed reports it rather "
+                       "than pretending",
+                       win.remove_overlay(second.markset.set_id) is False))
+
+        native_id = win.marks[0].set_id
+        try:
+            win.overlay(native_id)
+            refused_native, why = False, "it was allowed"
+        except RuntimeError as exc:
+            refused_native, why = True, str(exc)
+        checks.append((f"a set drawn on THIS pair cannot be borrowed onto it, "
+                       f"and the refusal says why [{why[:56]}...]",
+                       refused_native and "EXACTLY ONE" in why))
+
+        # A borrowed set deleted elsewhere must stop being drawn, and say so,
+        # rather than leaving a chart claiming a set it no longer has.
+        vanishing = win.overlays[0].markset.set_id
+        ann.Store(tmp).delete_set(vanishing)
+        win.redraw_marks()
+        checks.append((f"a borrowed set deleted from under the window is "
+                       f"dropped and REPORTED [{win.overlay_note[:64]}...]",
+                       not [b for b in win.bands if b.is_foreign]
+                       and vanishing in win.overlay_note
+                       and win.overlay_ids == []))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
