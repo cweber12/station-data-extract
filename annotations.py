@@ -778,6 +778,16 @@ def _main(argv=None):
     import argparse
     import shutil
     import tempfile
+    import sys
+
+    # Messages here quote mark names, which carry typographic
+    # quotes; a Windows console defaults to cp1252 and cannot
+    # encode them, which would crash the gate on its way to
+    # printing a PASS.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
     ap = argparse.ArgumentParser(
         description="Annotation store: schema, validation, round-trip.")
