@@ -122,9 +122,10 @@ class Band:
     and the interval it came from, or neither adjusting nor deleting can say
     what it is acting on.
     """
-    patch: object
+    patch: object          # what is on the axes, drawn at `drawn` extent
     markset: object
-    interval: object
+    interval: object       # the ORIGINAL stored occurrence -- its identity
+    drawn: object = None   # the same occurrence clamped to this window
 
 
 class MarkDialog(tk.Toplevel):
@@ -393,21 +394,28 @@ class ViewWindow(tk.Toplevel):
         drawn = 0
 
         for ms in self.marks:
-            kept, omitted = ann.clip_to_window(ms.intervals, lo, hi)
+            # Pairs, not just the clamped form. The clamped interval says where
+            # to draw; the ORIGINAL is the occurrence's identity, and it is what
+            # update_interval and delete_interval match on. Keeping only the
+            # clamped one meant any mark overlapping the window edge could be
+            # selected but never adjusted or deleted, because the store had
+            # never held the value being looked up.
+            pairs, omitted = ann.clip_pairs(ms.intervals, lo, hi)
             self.omitted += omitted
-            if not kept:
+            if not pairs:
                 continue
-            for iv in kept:
+            for original, clamped in pairs:
                 patch = ax.axvspan(
-                    self._to_axis(iv.start_utc), self._to_axis(iv.end_utc),
+                    self._to_axis(clamped.start_utc),
+                    self._to_axis(clamped.end_utc),
                     facecolor="#" + ms.color, alpha=0.22,
                     edgecolor="#" + ms.color, linewidth=1.0, zorder=0)
                 self.mark_patches.append(patch)
-                self.bands.append(Band(patch, ms, iv))
+                self.bands.append(Band(patch, ms, original, clamped))
                 drawn += 1
             # One legend entry per SET, not per band -- the whole point of a
             # set is that many occurrences are one phenomenon.
-            self.mark_legend.append((patch, f"{ms.name}  ({len(kept)}×)"))
+            self.mark_legend.append((patch, f"{ms.name}  ({len(pairs)}×)"))
 
         n_sets = len({id(m) for m in self.marks})
         parts = [f"{drawn} mark(s) in {n_sets} set(s) on this pair."]
@@ -590,12 +598,13 @@ class ViewWindow(tk.Toplevel):
         # Put the selector's handles ON the chosen band, so its edges are what
         # a drag adjusts. Setting extents marks the selection completed, which
         # is what makes the handles live.
+        shown = entry.drawn or entry.interval
         if self.span is not None:
             self.span.set_visible(True)
-            self.span.extents = (self._to_num(entry.interval.start_utc),
-                                 self._to_num(entry.interval.end_utc))
+            self.span.extents = (self._to_num(shown.start_utc),
+                                 self._to_num(shown.end_utc))
         self.selection = (entry.interval.start_utc, entry.interval.end_utc)
-        self._selected_indices = self._indices_for(entry.interval)
+        self._selected_indices = self._indices_for(shown)
         self.span_text.set(self._selected_summary(entry))
         self.canvas.draw_idle()
         return entry
@@ -1697,6 +1706,33 @@ def _main(argv=None):
         checks.append((f"the store is still valid afterwards "
                        f"[{len(_sets)} set(s), {len(_bad)} rejected]",
                        len(_bad) == 1 and "corrupt.json" in _bad[0]))
+
+        # A mark overlapping the window EDGE is drawn clamped, but its identity
+        # in the store is the original. Selecting one and deleting it must find
+        # it -- keeping only the clamped form made every such mark permanently
+        # unadjustable and undeletable.
+        straddle = ann.Store(tmp)
+        straddle_start = idx[0] - dt.timedelta(days=2)
+        straddle.confirm(study_id=info.study_id, pair=refs, name="straddler",
+                         reason="starts before this window does",
+                         start_utc=straddle_start, end_utc=idx[30])
+        win.redraw_marks()
+        edge = next(b for b in win.bands if b.markset.name == "straddler")
+        checks.append((f"a mark overlapping the window edge keeps its ORIGINAL "
+                       f"extent as identity, and is drawn clamped "
+                       f"[{ann.local_text(edge.interval.start_utc)} stored, "
+                       f"{ann.local_text(edge.drawn.start_utc)} drawn]",
+                       edge.interval.start_utc == straddle_start
+                       and edge.drawn.start_utc == win._utc[0]))
+        win.select_band(edge)
+        try:
+            win.delete_selected()
+            edge_ok, why = True, ""
+        except Exception as exc:
+            edge_ok, why = False, str(exc)[:70]
+        checks.append((f"and it can actually be deleted [{why}]",
+                       edge_ok and not any(b.markset.name == "straddler"
+                                           for b in win.bands)))
 
         # A window whose axis was refused for marking must still be deletable.
         # #5 turns the selector off across a DST fall-back; only creating and

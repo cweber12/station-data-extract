@@ -430,6 +430,26 @@ def sets_for_pair(sets, keys, study_id: str | None = None) -> list:
             and (study_id is None or s.study_id == study_id)]
 
 
+def clip_pairs(intervals, lo: dt.datetime, hi: dt.datetime):
+    """([(original, clamped)], count omitted entirely).
+
+    BOTH forms are returned because they answer different questions and
+    confusing them is a real bug. The CLAMPED interval says where to draw. The
+    ORIGINAL is the occurrence's identity -- it is what `update_interval` and
+    `delete_interval` match on -- so a caller that keeps only the clamped form
+    can no longer name the thing it is drawing, and any edit to a mark
+    overlapping the window edge looks for a value the store has never held.
+    """
+    pairs, omitted = [], 0
+    for iv in intervals:
+        if iv.end_utc <= lo or iv.start_utc >= hi:
+            omitted += 1
+            continue
+        pairs.append((iv, replace(iv, start_utc=max(iv.start_utc, lo),
+                                  end_utc=min(iv.end_utc, hi))))
+    return pairs, omitted
+
+
 def clip_to_window(intervals, lo: dt.datetime, hi: dt.datetime):
     """(intervals clamped to the window, count omitted entirely).
 
@@ -442,15 +462,8 @@ def clip_to_window(intervals, lo: dt.datetime, hi: dt.datetime):
     edge of the chart rather than vanishing. Only intervals with no overlap at
     all are counted as omitted.
     """
-    kept, omitted = [], 0
-    for iv in intervals:
-        if iv.end_utc <= lo or iv.start_utc >= hi:
-            omitted += 1
-            continue
-        kept.append(replace(iv,
-                            start_utc=max(iv.start_utc, lo),
-                            end_utc=min(iv.end_utc, hi)))
-    return kept, omitted
+    pairs, omitted = clip_pairs(intervals, lo, hi)
+    return [clamped for _original, clamped in pairs], omitted
 
 
 def snap_span(x0: float, x1: float, xnum) -> tuple[int, int]:
@@ -1093,6 +1106,15 @@ def _main(argv=None):
            len(kept) == 2 and omitted == 1 and kept[1].start_utc == lo,
            f"{len(kept)} kept, {omitted} omitted, "
            f"straddler clamped to {format_utc(kept[1].start_utc)}")
+
+        pairs, omitted2 = clip_pairs(ivs, lo, hi)
+        ok("clip_pairs keeps the ORIGINAL beside the clamped one, so a "
+           "straddling mark can still be named in the store",
+           omitted2 == omitted and len(pairs) == 2
+           and pairs[1][0].start_utc == ivs[1].start_utc
+           and pairs[1][1].start_utc == lo,
+           f"original {format_utc(pairs[1][0].start_utc)} vs clamped "
+           f"{format_utc(pairs[1][1].start_utc)}")
 
         # ---- snapping -------------------------------------------------------
         xnum = [float(i) for i in range(100)]        # 100 evenly spaced samples
