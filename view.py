@@ -784,22 +784,42 @@ class ViewWindow(tk.Toplevel):
 
         `patch` always spans the region even when it draws nothing visible, so
         hit testing has one artist to ask whatever the treatment.
+
+        EVERY REGION GETS EDGE RULES, and that is not decoration. At 1150 px
+        for a 45-day window an hour is 1.06 px, so a six-hour region -- an
+        ordinary one -- is 6 px wide. A fill alone at that width is a smudge
+        and a light one is nothing at all; the rules are what make a real
+        region findable. The first version of this dropped the edge the old
+        band had and narrow regions effectively disappeared.
+
+        Both kinds also carry a marker near the TOP, so every region on the
+        chart can be found by scanning one line rather than two. The
+        distinction lives in the fill and in the bar along the bottom, which a
+        region from another pair has and this pair's own does not.
         """
         x0, x1 = (self._to_axis(clamped.start_utc),
                   self._to_axis(clamped.end_utc))
         if foreign:
             patch = ax.axvspan(x0, x1, facecolor="none", edgecolor="none",
                                linewidth=0, zorder=0.5)
+            # The bar along the BOTTOM is the identifying mark, and it is first
+            # so that anything asking "which bar is this" gets the one that
+            # distinguishes rather than the one that merely locates.
             bar = ax.axvspan(x0, x1, ymin=0.0, ymax=0.025,
                              facecolor="#" + color, linewidth=0, zorder=0.6)
-            rules = [ax.axvline(x, color="#" + color, linewidth=1.3,
+            tick = ax.axvspan(x0, x1, ymin=0.965, ymax=0.99,
+                              facecolor="#" + color, alpha=0.55, linewidth=0,
+                              zorder=0.6)
+            rules = [ax.axvline(x, color="#" + color, linewidth=1.6,
                                 zorder=0.6) for x in (x0, x1)]
-            return patch, (bar, *rules)
+            return patch, (bar, tick, *rules)
         patch = ax.axvspan(x0, x1, facecolor="#1A1A1A", alpha=0.15,
                            edgecolor="none", linewidth=0, zorder=0.4)
         bar = ax.axvspan(x0, x1, ymin=0.975, ymax=1.0, facecolor="#" + color,
                          linewidth=0, zorder=0.6)
-        return patch, (bar,)
+        rules = [ax.axvline(x, color="#" + color, linewidth=1.1, zorder=0.6)
+                 for x in (x0, x1)]
+        return patch, (bar, *rules)
 
     def _draw_native(self):
         """One band per interval, per set drawn on THIS pair."""
@@ -1297,9 +1317,12 @@ class ViewWindow(tk.Toplevel):
         for entry in self.bands:
             chosen = entry is self.selected_band
             if entry.is_foreign:
+                # The edge RULES only. A colour bar is a patch and also has a
+                # linewidth, and giving it one draws a border round the bar
+                # that appears from nowhere the moment a region is selected.
                 for art in entry.decorations:
-                    if hasattr(art, "set_linewidth"):
-                        art.set_linewidth(2.6 if chosen else 1.3)
+                    if hasattr(art, "get_xdata"):
+                        art.set_linewidth(2.6 if chosen else 1.6)
                 # A faint wash only while selected, so the bracket still reads
                 # as a bracket the rest of the time.
                 entry.patch.set_facecolor(
@@ -2864,6 +2887,41 @@ def _main(argv=None):
                        and all(v < 0.1 for v in foreign_bar_y)))
         set_rgb = {tuple(round(int(wl.markset.color[i:i + 2], 16) / 255, 4)
                          for i in (0, 2, 4))}
+        # The regression this exists to prevent: at 1150 px for a 45-day window
+        # an hour is about one pixel, so an ordinary six-hour region is 6 px
+        # wide and a fill alone is a smudge. Edge rules are what make a real
+        # region findable, and they were dropped once already.
+        def rules_of(band):
+            return [a for a in band.decorations if hasattr(a, "get_xdata")]
+
+        edged = []
+        for b in native_bands + foreign_bands:
+            rules = rules_of(b)
+            # The rule holds the naive local datetime it was drawn at; the
+            # span holds the same instant as a matplotlib date number.
+            at = sorted(float(mdates.date2num(r.get_xdata()[0]))
+                        for r in rules)
+            want = sorted((b.patch.get_x(),
+                           b.patch.get_x() + b.patch.get_width()))
+            edged.append(
+                len(rules) == 2
+                and all(abs(g - w) < 1e-6 for g, w in zip(at, want))
+                and all(r.get_color().lstrip("#").upper()
+                        == b.markset.color.upper() for r in rules))
+        checks.append((f"EVERY region has an edge rule at each of its bounds, "
+                       f"in its set's colour -- a fill alone is invisible at "
+                       f"the width of a real region [{len(edged)} regions]",
+                       bool(edged) and all(edged)))
+
+        def top_marks(band):
+            return [a for a in band.decorations
+                    if hasattr(a, "get_y") and a.get_y() > 0.9]
+
+        checks.append(("and a marker near the top, so every region on the "
+                       "chart is found by scanning one line rather than two",
+                       all(top_marks(b)
+                           for b in native_bands + foreign_bands)))
+
         checks.append(("and the bar carries the SET's colour, which is what "
                        "the legend swatch matches",
                        all(tuple(round(v, 4)
