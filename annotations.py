@@ -430,15 +430,25 @@ def sets_for_pair(sets, keys, study_id: str | None = None) -> list:
             and (study_id is None or s.study_id == study_id)]
 
 
-def clip_pairs(intervals, lo: dt.datetime, hi: dt.datetime):
+def clip_to_window(intervals, lo: dt.datetime, hi: dt.datetime):
     """([(original, clamped)], count omitted entirely).
 
-    BOTH forms are returned because they answer different questions and
-    confusing them is a real bug. The CLAMPED interval says where to draw. The
+    BOTH forms are returned because they answer different questions, and
+    confusing them was a real bug. The CLAMPED interval says where to draw. The
     ORIGINAL is the occurrence's identity -- it is what `update_interval` and
-    `delete_interval` match on -- so a caller that keeps only the clamped form
-    can no longer name the thing it is drawing, and any edit to a mark
-    overlapping the window edge looks for a value the store has never held.
+    `delete_interval` match on -- so a caller holding only the clamped form can
+    no longer name the thing it is drawing, and any edit to a mark overlapping
+    the window edge looks for a value the store has never held.
+
+    An earlier version returned the clamped form alone, and every caller that
+    needed to act on what it had drawn was broken by it. Returning one without
+    the other is not offered.
+
+    Omitted is counted, not discarded silently: a mark drawn on a wide window
+    and revisited on a narrow one falls outside it entirely, and a band that
+    quietly disappears reads as a region nobody ever marked. An interval
+    overlapping an edge is KEPT and clamped, so it draws to the edge of the
+    chart rather than vanishing.
     """
     pairs, omitted = [], 0
     for iv in intervals:
@@ -448,22 +458,6 @@ def clip_pairs(intervals, lo: dt.datetime, hi: dt.datetime):
         pairs.append((iv, replace(iv, start_utc=max(iv.start_utc, lo),
                                   end_utc=min(iv.end_utc, hi))))
     return pairs, omitted
-
-
-def clip_to_window(intervals, lo: dt.datetime, hi: dt.datetime):
-    """(intervals clamped to the window, count omitted entirely).
-
-    Both halves are returned because "nothing is dropped silently" has to be an
-    assertion rather than an intention. A mark drawn on a wide window and
-    revisited on a narrow one can fall entirely outside it, and a band that
-    quietly disappears reads as a region nobody ever marked.
-
-    An interval overlapping an edge is KEPT and clamped, so it draws to the
-    edge of the chart rather than vanishing. Only intervals with no overlap at
-    all are counted as omitted.
-    """
-    pairs, omitted = clip_pairs(intervals, lo, hi)
-    return [clamped for _original, clamped in pairs], omitted
 
 
 def snap_span(x0: float, x1: float, xnum) -> tuple[int, int]:
@@ -1111,19 +1105,15 @@ def _main(argv=None):
                         dt.datetime(2026, 7, 11, 0, tzinfo=utc))]   # outside
         lo = dt.datetime(2026, 7, 19, 22, tzinfo=utc)
         hi = dt.datetime(2026, 7, 21, 0, tzinfo=utc)
-        kept, omitted = clip_to_window(ivs, lo, hi)
-        ok("clipping keeps and clamps a straddling interval, omits one outside",
-           len(kept) == 2 and omitted == 1 and kept[1].start_utc == lo,
-           f"{len(kept)} kept, {omitted} omitted, "
-           f"straddler clamped to {format_utc(kept[1].start_utc)}")
-
-        pairs, omitted2 = clip_pairs(ivs, lo, hi)
-        ok("clip_pairs keeps the ORIGINAL beside the clamped one, so a "
-           "straddling mark can still be named in the store",
-           omitted2 == omitted and len(pairs) == 2
-           and pairs[1][0].start_utc == ivs[1].start_utc
-           and pairs[1][1].start_utc == lo,
-           f"original {format_utc(pairs[1][0].start_utc)} vs clamped "
+        pairs, omitted = clip_to_window(ivs, lo, hi)
+        ok("clipping keeps a straddling interval and omits one outside",
+           len(pairs) == 2 and omitted == 1,
+           f"{len(pairs)} kept, {omitted} omitted")
+        ok("it returns the clamped form to draw AND the original to name, so "
+           "a straddling mark can still be found in the store",
+           pairs[1][1].start_utc == lo
+           and pairs[1][0].start_utc == ivs[1].start_utc,
+           f"original {format_utc(pairs[1][0].start_utc)}, clamped "
            f"{format_utc(pairs[1][1].start_utc)}")
 
         # ---- snapping -------------------------------------------------------

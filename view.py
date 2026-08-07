@@ -122,10 +122,14 @@ class Band:
     and the interval it came from, or neither adjusting nor deleting can say
     what it is acting on.
     """
-    patch: object          # what is on the axes, drawn at `drawn` extent
+    patch: object          # what is on the axes, or None when not drawn
     markset: object
     interval: object       # the ORIGINAL stored occurrence -- its identity
     drawn: object = None   # the same occurrence clamped to this window
+
+    @property
+    def is_drawn(self) -> bool:
+        return self.patch is not None
 
 
 class MarkDialog(tk.Toplevel):
@@ -250,7 +254,6 @@ class ViewWindow(tk.Toplevel):
         self._xnum = []
         self.selection: tuple | None = None
         self._selected_indices = (0, 0)
-        self.bands = []
         self.occurrences = []
         self.selected_band = None
 
@@ -353,6 +356,20 @@ class ViewWindow(tk.Toplevel):
         # ProgressDialog exists to prevent. The caller raises it once the
         # window is up; see report_rejections().
 
+    # `occurrences` is the only stored collection; these are views of it.
+    # Three lists kept in step by hand is three chances for them to drift, and
+    # the chart-facing code only ever wants the drawn subset.
+
+    @property
+    def bands(self) -> list:
+        """The occurrences that are actually on the axes."""
+        return [o for o in self.occurrences if o.is_drawn]
+
+    @property
+    def mark_patches(self) -> list:
+        """Their patches, in the same order."""
+        return [o.patch for o in self.bands]
+
     # ------------------------------------------------------------ mark list
 
     def _build_mark_list(self, parent):
@@ -451,9 +468,7 @@ class ViewWindow(tk.Toplevel):
         self.marks = []
         self.mark_problems = []
         self.omitted = 0
-        self.mark_patches = []
         self.mark_legend = []
-        self.bands = []
         self.occurrences = []
 
         if self.annotations_dir is None:
@@ -483,9 +498,7 @@ class ViewWindow(tk.Toplevel):
 
     def _draw_marks(self):
         """One band per interval, per set, clipped to this window."""
-        self.mark_patches = []
         self.mark_legend = []
-        self.bands = []
         self.occurrences = []
         self.omitted = 0
         if not self.marks:
@@ -504,31 +517,30 @@ class ViewWindow(tk.Toplevel):
             # clamped one meant any mark overlapping the window edge could be
             # selected but never adjusted or deleted, because the store had
             # never held the value being looked up.
-            pairs, omitted = ann.clip_pairs(ms.intervals, lo, hi)
+            pairs, omitted = ann.clip_to_window(ms.intervals, lo, hi)
             self.omitted += omitted
-            if not pairs:
-                continue
-            drawn_originals = {id(o) for o, _c in pairs}
+            clamped_for = {id(original): clamped for original, clamped in pairs}
+
+            # Walked in stored order, so the list reads chronologically, and
+            # EVERY occurrence is indexed -- including the ones clipped out of
+            # this window, which are drawn nowhere and would otherwise be
+            # reported as omitted and then impossible to select or delete.
             for original in ms.intervals:
-                if id(original) not in drawn_originals:
-                    # Clipped out of this window. Indexed anyway, so the list
-                    # can reach it -- otherwise it is reported as omitted and
-                    # then impossible to select, adjust or delete.
+                clamped = clamped_for.get(id(original))
+                if clamped is None:
                     self.occurrences.append(Band(None, ms, original, None))
-            for original, clamped in pairs:
+                    continue
                 patch = ax.axvspan(
                     self._to_axis(clamped.start_utc),
                     self._to_axis(clamped.end_utc),
                     facecolor="#" + ms.color, alpha=0.22,
                     edgecolor="#" + ms.color, linewidth=1.0, zorder=0)
-                self.mark_patches.append(patch)
-                band = Band(patch, ms, original, clamped)
-                self.bands.append(band)
-                self.occurrences.append(band)
+                self.occurrences.append(Band(patch, ms, original, clamped))
                 drawn += 1
             # One legend entry per SET, not per band -- the whole point of a
             # set is that many occurrences are one phenomenon.
-            self.mark_legend.append((patch, f"{ms.name}  ({len(pairs)}×)"))
+            if pairs:
+                self.mark_legend.append((patch, f"{ms.name}  ({len(pairs)}×)"))
 
         n_sets = len({id(m) for m in self.marks})
         parts = [f"{drawn} mark(s) in {n_sets} set(s) on this pair."]
@@ -639,7 +651,7 @@ class ViewWindow(tk.Toplevel):
             ax, self._on_span_select, "horizontal",
             onmove_callback=self._on_span_move,
             useblit=False, button=1, minspan=0,
-            snap_values=self._xsnap if len(self._xsnap) else None,
+            snap_values=self._xnum if len(self._xnum) else None,
             # Edge handles, so a selected mark can be adjusted by dragging its
             # ends. Turned on only now that dragging one does something.
             interactive=True,
@@ -782,9 +794,6 @@ class ViewWindow(tk.Toplevel):
         verb = (f"Adjusting “{self.selected_band.markset.name}”:  "
                 if self._adjusting() else "Marking:  ")
         self.span_text.set(verb + self._span_summary(*got))
-
-    def _selection_indices(self):
-        return self._selected_indices
 
     def _adjusting(self) -> bool:
         """True when this drag moved an edge of the selected mark.
@@ -1120,14 +1129,13 @@ class ViewWindow(tk.Toplevel):
         # already paid for once.
         x = self.result.data.index.tz_convert(LOCAL_TZ).tz_localize(None)
 
-        # Plain floats, in the same order as `_utc`. A list rather than an
-        # array so that `annotations.snap_span` stays pure-Python and can be
-        # exercised with no numeric stack present at all.
-        self._xnum = [float(v) for v in mdates.date2num(x)]
-        # matplotlib's own snapping does arithmetic on this directly, so it
-        # needs the array form. Kept separate rather than converting _xnum,
-        # which several pure-Python callers walk.
-        self._xsnap = np.asarray(self._xnum, dtype=float)
+        # The plotted x of every sample, in the same order as `_utc`. An
+        # ARRAY, because matplotlib's own snapping does arithmetic on it
+        # directly and a list raises inside _set_extents. `snap_span` and
+        # `first_descent` bisect and compare, which work on any sequence, so
+        # one representation serves both -- annotations stays free of the
+        # numeric stack because of what it IMPORTS, not what it is handed.
+        self._xnum = np.asarray(mdates.date2num(x), dtype=float)
 
         fig = Figure(figsize=(11.5, 5.0), dpi=100)
         ax = fig.add_subplot(111)
@@ -1161,11 +1169,12 @@ class ViewWindow(tk.Toplevel):
         # to span 1970 to now and squeezes 45 days of data into a few pixels.
         # Observed as xlim (-1033, 21704) where the data occupies (20596,
         # 20641).
+        # autoscale_view computes the limits from the series; setting them
+        # explicitly is what turns autoscaling off, so no further call is
+        # needed and adding one would only imply it was load-bearing.
         ax.autoscale_view()
-        self._xlim, self._ylim = ax.get_xlim(), ax.get_ylim()
-        ax.set_xlim(self._xlim)
-        ax.set_ylim(self._ylim)
-        ax.set_autoscale_on(False)
+        ax.set_xlim(ax.get_xlim())
+        ax.set_ylim(ax.get_ylim())
 
         # The legend is built by _refresh_legend once the mark bands exist, so
         # that sets are named alongside the series rather than in a second
@@ -1501,8 +1510,10 @@ def _main(argv=None):
                                for p in win.figure.axes[0].patches)))
         checks.append((f"one band is drawn per interval inside the window "
                        f"[{len(spans)} bands]", len(spans) == len(inside)))
-        checks.append(("the window's mark bookkeeping matches the axes exactly",
-                       spans == win.mark_patches))
+        checks.append(("the derived band views agree with the axes exactly",
+                       spans == win.mark_patches
+                       and [b.patch for b in win.bands] == spans
+                       and all(o.is_drawn for o in win.bands)))
 
         # The band must sit where the STORED instant says, not merely somewhere.
         # The length is part of the assertion: `all()` over an empty zip is
