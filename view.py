@@ -111,6 +111,100 @@ def duration_text(td: dt.timedelta) -> str:
     return " ".join(p for p in parts if p) or "0 min"
 
 
+class MarkDialog(tk.Toplevel):
+    """Give a region a label and a reason.
+
+    Constructing does NOT block. `ask()` is what makes it modal and waits, so
+    the window can be built and inspected without a modal loop standing in the
+    way -- the same split as ViewWindow.rejection_message / report_rejections,
+    for the same reason.
+    """
+
+    def __init__(self, parent, *, summary: str, coverage_lines, known):
+        super().__init__(parent)
+        self.result_value = None
+        self.known = {s.name: s.reason for s in known}
+
+        self.title("Mark this region")
+        self.resizable(False, False)
+        if parent is not None and parent.winfo_viewable():
+            self.transient(parent)
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text=summary,
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+
+        # What the data under this region actually was. A mark over a stretch
+        # the QC screen emptied would otherwise read exactly like a mark over a
+        # measured event.
+        for line in coverage_lines:
+            ttk.Label(body, text=line, foreground="#777").pack(anchor="w")
+
+        ttk.Label(body, text="Name", font=("Segoe UI", 9, "bold")).pack(
+            anchor="w", pady=(12, 0))
+        ttk.Label(body, foreground="#777", wraplength=460, justify="left",
+                  text="Reuse a name to record this as another occurrence of "
+                       "the same thing.").pack(anchor="w")
+        self.name_var = tk.StringVar()
+        self.name_box = ttk.Combobox(body, textvariable=self.name_var,
+                                     values=sorted(self.known), width=52)
+        self.name_box.pack(anchor="w", pady=(2, 0))
+        self.name_box.bind("<<ComboboxSelected>>", self._prefill_reason)
+
+        ttk.Label(body, text="Reason", font=("Segoe UI", 9, "bold")).pack(
+            anchor="w", pady=(10, 0))
+        ttk.Label(body, foreground="#777", wraplength=460, justify="left",
+                  text="Why it matters. Someone reading this later — "
+                       "including you — has only this.").pack(anchor="w")
+        self.reason_box = tk.Text(body, width=54, height=3, wrap="word")
+        self.reason_box.pack(anchor="w", pady=(2, 0))
+
+        ttk.Label(body, foreground="#777", wraplength=460, justify="left",
+                  text="Saved the moment you confirm. There is no save step.").pack(
+            anchor="w", pady=(10, 0))
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self._cancel).pack(
+            side="right")
+        ttk.Button(buttons, text="Save mark", command=self._accept).pack(
+            side="right", padx=(0, 6))
+
+        self.bind("<Escape>", lambda _e: self._cancel())
+        self.name_box.focus_set()
+
+    def _prefill_reason(self, _event=None):
+        """Adopt the set's existing reason, so it is edited rather than lost."""
+        reason = self.known.get(self.name_var.get())
+        if reason:
+            self.reason_box.delete("1.0", "end")
+            self.reason_box.insert("1.0", reason)
+
+    def _accept(self):
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showinfo(
+                "The mark needs a name",
+                "Its meaning has to survive outside your head, and an unnamed "
+                "band cannot say anything to anyone.", parent=self)
+            return
+        self.result_value = (name,
+                             self.reason_box.get("1.0", "end").strip())
+        self.destroy()
+
+    def _cancel(self):
+        self.result_value = None
+        self.destroy()
+
+    def ask(self):
+        """Go modal and wait. Returns (name, reason) or None."""
+        self.grab_set()
+        self.wait_window(self)
+        return self.result_value
+
+
 class ViewWindow(tk.Toplevel):
     """The z-score chart of a pair, in a window. Read-only for now."""
 
@@ -138,6 +232,7 @@ class ViewWindow(tk.Toplevel):
         self._utc = result.data.index
         self._xnum = []
         self.selection: tuple | None = None
+        self._selected_indices = (0, 0)
 
         self.study = study
         self.study_id = getattr(study, "study_id", None)
@@ -207,10 +302,10 @@ class ViewWindow(tk.Toplevel):
 
         marks = ttk.Frame(frame)
         marks.pack(fill="x", pady=(2, 0))
-        ttk.Label(marks, text=self.marks_note,
-                  foreground="#B4531A" if self._marks_need_attention()
-                  else "#777", wraplength=1100,
-                  justify="left").pack(side="left")
+        self.marks_label = ttk.Label(
+            marks, text=self.marks_note, wraplength=1100, justify="left",
+            foreground="#B4531A" if self._marks_need_attention() else "#777")
+        self.marks_label.pack(side="left")
 
         # NOTE the dialog is NOT raised here. A modal box opened during
         # construction blocks whoever is building the window -- including a
@@ -407,7 +502,7 @@ class ViewWindow(tk.Toplevel):
     def _span_summary(self, start, end, i0: int, i1: int) -> str:
         return (f"{ann.local_text(start)}  →  {ann.local_text(end)}  local"
                 f"  ·  {duration_text(end - start)}"
-                f"  ·  {i1 - i0} × {self.result.interval}")
+                f"  ·  {i1 - i0 + 1} intervals of {self.result.interval}")
 
     def _on_span_move(self, x0: float, x1: float):
         """Live, while the mouse is still down. Shows the SNAPPED times."""
@@ -420,7 +515,7 @@ class ViewWindow(tk.Toplevel):
         self.span_text.set("Marking:  " + self._span_summary(*got))
 
     def _on_span_select(self, x0: float, x1: float):
-        """On release. Slice 4 records the region; storing it lands next."""
+        """On release: record the region, then ask what it means."""
         got = self.span_interval(x0, x1)
         self.selection = None if got is None else (got[0], got[1])
         if got is None:
@@ -428,8 +523,146 @@ class ViewWindow(tk.Toplevel):
                 f"That drag was shorter than one {self.result.interval} "
                 f"interval, so there is nothing to mark. Drag further.")
             return
-        self.span_text.set("Region:  " + self._span_summary(*got)
-                           + "   (not stored yet)")
+        self.span_text.set("Region:  " + self._span_summary(*got))
+        self._selected_indices = (got[2], got[3])
+
+        if self.store is None:
+            return
+        # Deferred rather than opened here. This runs inside the selector's
+        # release handler, and a modal loop entered while the widget is still
+        # settling is asking for re-entrancy trouble. `after` from the MAIN
+        # thread is fine -- what the ProgressDialog contract forbids is a
+        # worker calling it.
+        self.after(0, self._prompt_for_mark)
+
+    # -------------------------------------------------------------- marking
+
+    def _prompt_for_mark(self):
+        """Ask for a label and a reason, then write. UI only; see commit_mark."""
+        if self.selection is None or self.store is None:
+            return
+        start, end = self.selection
+        i0, i1 = self._selected_indices
+        dialog = MarkDialog(
+            self, summary=self._span_summary(start, end, i0, i1),
+            coverage_lines=self.coverage_lines(self.coverage_for(i0, i1)),
+            known=self.marks)
+        got = dialog.ask()
+        if got is None:
+            self.span_text.set(SPAN_HINT)
+            return
+        try:
+            ms = self.commit_mark(*got)
+        except Exception as exc:
+            messagebox.showerror("Could not save the mark", str(exc),
+                                 parent=self)
+            return
+        self.span_text.set(
+            f"Saved to “{ms.name}” — {len(ms.intervals)} occurrence(s). "
+            f"Already on disk; there is no save step.")
+
+    def commit_mark(self, name: str, reason: str):
+        """Write the current selection as a mark, and redraw. Returns the set.
+
+        The seam. Everything above this is a dialog; everything below is the
+        store. It is public so the rule can be exercised without a modal window
+        standing in the way.
+        """
+        if self.selection is None:
+            raise RuntimeError("nothing is selected")
+        if self.store is None or self.pair_refs is None:
+            raise RuntimeError("this window has nowhere to store a mark")
+        start, end = self.selection
+        i0, i1 = self._selected_indices
+        ms = self.store.confirm(
+            study_id=self.study_id, pair=self.pair_refs, name=name,
+            reason=reason, start_utc=start, end_utc=end,
+            coverage=self.coverage_for(i0, i1), tz=str(LOCAL_TZ))
+        self.redraw_marks()
+        return ms
+
+    def redraw_marks(self):
+        """Reload from disk and repaint. The file is the source of truth."""
+        for patch in self.mark_patches:
+            patch.remove()
+        self._load_marks()
+        self._draw_marks()
+        self._refresh_legend()
+        if getattr(self, "marks_label", None) is not None:
+            self.marks_label.configure(
+                text=self.marks_note,
+                foreground="#B4531A" if self._marks_need_attention()
+                else "#777")
+        if getattr(self, "canvas", None) is not None:
+            self.canvas.draw_idle()
+
+    # ------------------------------------------------------------- coverage
+
+    def coverage_for(self, i0: int, i1: int) -> dict:
+        """What the data under samples [i0, i1] actually was, per series.
+
+        Captured at confirmation because it describes THIS window: rebuild at a
+        different interval and the numbers change, so recomputing them later
+        would answer a different question from the one that was marked.
+        """
+        sub = self.result.data.iloc[i0:i1 + 1]
+        start, end = self._utc[i0], self._utc[i1]
+        return {c: ann.coverage_entry(len(sub), int(sub[c].isna().sum()),
+                                      self._suspect_count(c, start, end))
+                for c in self.cols}
+
+    def coverage_lines(self, coverage: dict) -> list:
+        """Coverage as sentences. `None` must never read as 'clean'."""
+        lines = []
+        for label, entry in coverage.items():
+            n, empty = entry["n_intervals"], entry["n_empty"]
+            part = (f"{label}: {n - empty} of {n} intervals have data"
+                    if empty else f"{label}: all {n} intervals have data")
+            suspect = entry["n_suspect_kept"]
+            if suspect is None:
+                part += "  ·  QARTOD not evaluated for this series"
+            elif suspect:
+                part += f"  ·  {suspect} QARTOD-3 (suspect) value(s) kept"
+            lines.append(part)
+        return lines
+
+    def _observations(self):
+        """The study's long frame, loaded once. None when unavailable."""
+        if not hasattr(self, "_obs_cache"):
+            try:
+                self._obs_cache = (None if self.study is None
+                                   else self.study.load_observations())
+            except Exception:
+                self._obs_cache = None
+        return self._obs_cache
+
+    def _suspect_count(self, label: str, start, end):
+        """QARTOD-3 values kept under a mark, or None when not countable.
+
+        None rather than 0 whenever a real count cannot be produced -- the
+        series carries no flags (CO-OPS water level and the yellow buoy logger
+        report qc_flag as null), or it cannot be located in the study's frame.
+        Zero would say CLEAN, and the truth in both cases is NOT EVALUATED.
+
+        The flags survive into the parquet but not into a BuildResult:
+        load_series takes `value` alone, so the count comes from the study's
+        canonical frame rather than from what is on the chart.
+        """
+        import pandas as pd
+
+        info = (getattr(self.result, "columns", None) or {}).get(label)
+        obs = self._observations()
+        if info is None or obs is None or obs.empty or "qc_flag" not in obs:
+            return None
+        sel = obs[(obs["station"].astype(str) == str(info.station))
+                  & (obs["variable"].astype(str) == str(info.variable))]
+        if sel.empty:
+            return None
+        flags = pd.to_numeric(sel["qc_flag"], errors="coerce")
+        if not flags.notna().any():
+            return None                     # no QARTOD on this series at all
+        when = pd.to_datetime(sel["time_utc"], utc=True)
+        return int(((flags == 3) & (when >= start) & (when <= end)).sum())
 
     def _coverage_note(self) -> str:
         """Say what is missing. An empty stretch must never pass for agreement."""
@@ -517,12 +750,48 @@ class ViewWindow(tk.Toplevel):
 # constructed, and that the lines carry the same z-scores the workbook writes.
 # ---------------------------------------------------------------------------
 
+def _default_pair(study, by_key):
+    """One QARTOD-flagged series and one unflagged, when the study has both.
+
+    Not cosmetic. The suspect count has two branches -- a real number, and
+    `null` for a series carrying no flags at all -- and a default pair drawn
+    from one station exercises only one of them, leaving `None == None` to pass
+    for a comparison that never ran. Picking one of each makes the no-argument
+    gate assert the distinction that matters. Falls back to the first two, so
+    this stays study-agnostic rather than naming stations.
+    """
+    import pandas as pd
+
+    try:
+        obs = study.load_observations()
+        flags = pd.to_numeric(obs["qc_flag"], errors="coerce")
+        flagged = {(s, v) for (s, v), any_flag
+                   in obs.assign(_q=flags).groupby(
+                       ["station", "variable"])["_q"].apply(
+                           lambda c: bool(c.notna().any())).items()
+                   if any_flag}
+    except Exception:
+        flagged = set()
+
+    def has_flags(item):
+        _t, c = item
+        return (str(c.station), str(c.variable)) in flagged
+
+    ordered = [by_key[k] for k in sorted(by_key)]
+    with_flags = [i for i in ordered if has_flags(i)]
+    without = [i for i in ordered if not has_flags(i)]
+    if with_flags and without:
+        return [with_flags[0], without[0]]
+    return ordered[:2]
+
+
 def _main(argv=None):
     import argparse
     import json
     import sys
 
     import numpy as np
+    import pandas as pd
 
     import study as st
 
@@ -575,7 +844,7 @@ def _main(argv=None):
             return 1
         chosen = [by_key[k] for k in args.series]
     else:
-        chosen = [by_key[k] for k in sorted(by_key)[:2]]
+        chosen = _default_pair(info, by_key)
 
     refusal = pair_refusal(len(chosen))
     if refusal:
@@ -809,6 +1078,99 @@ def _main(argv=None):
         checks.append((f"the note says what happened [{win.marks_note}]",
                        "REJECTED" in win.marks_note
                        and "NOT drawn" in win.marks_note))
+
+        # ---- confirming a region writes it immediately ---------------------
+        before = {p.name for p in tmp.glob("*.json")}
+        win.selection = (idx[500], idx[560])
+        win._selected_indices = (500, 560)
+        saved = win.commit_mark("internal tide", "third occurrence")
+
+        # The set already holds three: two inside this window and one outside
+        # it. Appending makes four, of which three are drawable.
+        checks.append((f"confirming appends to the existing set rather than "
+                       f"starting a new one [{len(saved.intervals)} occurrences]",
+                       len(saved.intervals) == 4))
+        after = {p.name for p in tmp.glob("*.json")}
+        checks.append((f"no new file was created for an existing name "
+                       f"[{sorted(after - before)}]", after == before))
+
+        on_disk = ann.Store(tmp).load_file(tmp / f"{saved.set_id}.json")
+        checks.append(("the mark is on disk the moment it is confirmed, with "
+                       "no save step",
+                       any(i.start_utc == idx[500].to_pydatetime()
+                           and i.end_utc == idx[560].to_pydatetime()
+                           for i in on_disk.intervals)))
+
+        spans_now = [p for p in win.figure.axes[0].patches
+                     if p is not getattr(win.span, "_selection_artist", None)]
+        checks.append((f"the new band is on the chart without reopening "
+                       f"[{len(spans_now)} bands]", len(spans_now) == 3))
+
+        cov = next(i.coverage for i in on_disk.intervals
+                   if i.start_utc == idx[500].to_pydatetime())
+        n_expected = 61                       # samples 500..560 inclusive
+        checks.append((f"coverage is captured per series {cov}",
+                       set(cov) == set(res.data.columns)
+                       and all(e["n_intervals"] == n_expected
+                               for e in cov.values())))
+
+        empties = {c: int(res.data[c].iloc[500:561].isna().sum())
+                   for c in res.data.columns}
+        checks.append((f"the empty count matches the data under the mark "
+                       f"{empties}",
+                       all(cov[c]["n_empty"] == empties[c] for c in empties)))
+
+        # QARTOD-3 counted from the study's frame, since load_series drops the
+        # flag. Verified against an independent count over the same window.
+        obs = info.load_observations()
+        want_suspect = {}
+        for c in res.data.columns:
+            ci = res.columns[c]
+            sel = obs[(obs["station"].astype(str) == str(ci.station))
+                      & (obs["variable"].astype(str) == str(ci.variable))]
+            flags = pd.to_numeric(sel["qc_flag"], errors="coerce")
+            if not flags.notna().any():
+                want_suspect[c] = None
+            else:
+                when = pd.to_datetime(sel["time_utc"], utc=True)
+                want_suspect[c] = int(((flags == 3) & (when >= idx[500])
+                                       & (when <= idx[560])).sum())
+        checks.append((f"QARTOD-3 kept is counted from the study's frame, "
+                       f"independently reproduced {want_suspect}",
+                       {c: cov[c]["n_suspect_kept"] for c in cov}
+                       == want_suspect))
+        checks.append(("a series with no QARTOD flags records null, never 0 — "
+                       "'not evaluated' must not read as 'clean'",
+                       all(v is None or isinstance(v, int)
+                           for v in want_suspect.values())
+                       and all(cov[c]["n_suspect_kept"] is None
+                               for c, v in want_suspect.items() if v is None)))
+
+        lines = win.coverage_lines(cov)
+        checks.append((f"the dialog would say so in words {lines}",
+                       all(("not evaluated" in ln) ==
+                           (want_suspect[c] is None)
+                           for c, ln in zip(cov, lines))))
+
+        # The dialog itself: constructed and VIEWABLE, not merely built. `ask()`
+        # is what blocks, and it is deliberately not called here.
+        dlg = MarkDialog(win, summary="gate", coverage_lines=lines,
+                         known=win.marks)
+        dlg.update()
+        dlg.update_idletasks()
+        checks.append(("the mark dialog is viewable, not merely constructed",
+                       bool(dlg.winfo_viewable())))
+        checks.append((f"it offers the names already on this pair "
+                       f"[{dlg.name_box.cget('values')}]",
+                       "internal tide" in dlg.name_box.cget("values")))
+        dlg.name_var.set("internal tide")
+        dlg._prefill_reason()
+        checks.append(("picking an existing name adopts its reason rather "
+                       "than losing it",
+                       dlg.reason_box.get("1.0", "end").strip()
+                       == "third occurrence"))
+        dlg._cancel()
+        checks.append(("cancelling yields nothing", dlg.result_value is None))
 
         colors = {p.get_facecolor()[:3] for p in spans}
         series_rgb = {tuple(round(int(c[i:i + 2], 16) / 255, 6)
