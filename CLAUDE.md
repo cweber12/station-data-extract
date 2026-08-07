@@ -166,9 +166,16 @@ zone. Every downstream conclusion built on it was wrong.
 - `outputs/` is never scanned as input. Generated files must not become sources.
 - Studies live **one level above this repo**, in `../studies/`, so the sibling
   extractors can read them. `study.json` is shared; `station-data/` is ours.
-- A study is immutable once created, apart from its `outputs/`. A failed
-  creation is left on disk with `status: incomplete` — a failed pull is evidence
-  about the feed, and deleting it destroys the only record it happened.
+- A study is immutable once created, apart from its `outputs/` and its
+  `annotations/`. A failed creation is left on disk with `status: incomplete` —
+  a failed pull is evidence about the feed, and deleting it destroys the only
+  record it happened.
+- `annotations/` is mutable because the rule protects **evidence** — what the
+  feed said, and when — and a mark is **interpretation**, which is expected to
+  accumulate. Separate directories keep the rule crisp instead of eroding it
+  with an exception inside the evidence directory. Not `outputs/` either:
+  everything there is regenerable and is overwritten on the next export, and a
+  mark is the one thing here that cannot be regenerated from anything.
 - A study's sources are exactly: the script pulls, plus files the user attached.
   **Nothing is included implicitly.** The Power Query workbook is not part of a
   study; it duplicates the feeds.

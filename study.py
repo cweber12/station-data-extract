@@ -17,6 +17,7 @@ study can accumulate several tools' output for one site and one time window:
           cache/observations.parquet
           files/                copies of whatever the user attached
           outputs/              generated comparison workbooks
+          annotations/          marks drawn on a chart -- one JSON file per set
         hf-radar/             <- another tool's namespace, later
         cudem/
       station-data-extract/   <- this repo (code only)
@@ -28,10 +29,33 @@ never be committed by accident.
 
 IMMUTABILITY
 ------------
-A study is written once. Only `<producer>/outputs/` may change afterwards. If
-creation fails partway the directory is LEFT IN PLACE with status "incomplete"
-rather than deleted -- a failed pull is evidence about the feed, and deleting it
-destroys the only record that the failure happened.
+A study is written once. Exactly TWO paths inside a producer's namespace may
+change afterwards:
+
+    <producer>/outputs/        generated artifacts, rewritten on every export
+    <producer>/annotations/    marks a human drew on a chart
+
+If creation fails partway the directory is LEFT IN PLACE with status
+"incomplete" rather than deleted -- a failed pull is evidence about the feed,
+and deleting it destroys the only record that the failure happened.
+
+WHY ANNOTATIONS ARE MUTABLE, AND WHY THEY ARE NOT IN `outputs/`
+---------------------------------------------------------------
+The immutability rule exists to protect EVIDENCE -- what the feed said, and
+when. An annotation is INTERPRETATION, which is expected to accumulate as
+someone looks at the same study again. Those are different kinds of thing, so
+they get different directories and the rule is amended to name the second one
+rather than eroded by an exception carved inside the evidence directory.
+
+Not `outputs/` either, and the distinction is load-bearing: everything under
+`outputs/` is regenerable from the cache, and re-exporting overwrites it.
+Annotations are the one thing here that cannot be regenerated from anything --
+if they were written to `outputs/` the next export would destroy them, which is
+the failure mode this whole feature exists to fix.
+
+A DIRECTORY, not a single file, so that adding one set never rewrites another.
+Nothing scans it as input: `sensorkit.build_catalog_study` reads
+`cache/*.parquet` and nothing else, so an annotation can never become a source.
 """
 
 from __future__ import annotations
@@ -60,7 +84,13 @@ STUDY_META_NAME = "study.json"
 CACHE_DIRNAME = "cache"
 FILES_DIRNAME = "files"
 OUTPUTS_DIRNAME = "outputs"
+ANNOTATIONS_DIRNAME = "annotations"
 OBSERVATIONS_NAME = "observations.parquet"
+
+# The two paths a study may grow after it is created. Named here so the rule is
+# a value the code can be asked about, rather than a sentence in a docstring
+# that a later reader has to take on trust.
+MUTABLE_DIRNAMES = (OUTPUTS_DIRNAME, ANNOTATIONS_DIRNAME)
 
 STATUS_OK = "ok"
 STATUS_FAILED = "failed_validation"
@@ -156,6 +186,17 @@ class StudyInfo:
     @property
     def outputs_dir(self) -> Path:
         return self.producer_dir / OUTPUTS_DIRNAME
+
+    @property
+    def annotations_dir(self) -> Path:
+        """Marks drawn on this study's charts. Mutable; see IMMUTABILITY above.
+
+        May not exist: a study created before annotations were introduced has
+        no such directory, and one that has never been marked has nothing to
+        put in it. The store creates it on first write rather than every reader
+        having to check.
+        """
+        return self.producer_dir / ANNOTATIONS_DIRNAME
 
     @property
     def observations_path(self) -> Path:
@@ -559,6 +600,10 @@ def create_study(repo_root: Path, label: str, *,
     prod = pdir / PRODUCER
     (prod / CACHE_DIRNAME).mkdir(parents=True, exist_ok=True)
     (prod / OUTPUTS_DIRNAME).mkdir(parents=True, exist_ok=True)
+    # Created empty so the layout is uniform and the mutable paths are visible
+    # on disk. Studies made before this existed have no such directory, so the
+    # store still creates it on demand rather than relying on this line.
+    (prod / ANNOTATIONS_DIRNAME).mkdir(parents=True, exist_ok=True)
 
     days = int(window_days if window_days is not None else cfg.window_days)
     end, start = now, now - dt.timedelta(days=days)
