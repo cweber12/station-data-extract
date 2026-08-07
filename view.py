@@ -378,6 +378,92 @@ class MarkDialog(tk.Toplevel):
         return self.result_value
 
 
+def _region_icon(master):
+    """A 20x20 marquee over a trace: "select a span of this chart".
+
+    DRAWN, not shipped. matplotlib resolves its own toolbar icons through the
+    private `cbook._get_data_path`, and a PNG committed here would be the one
+    file in this repo whose content cannot be read in a diff -- an icon that
+    nobody can review is an icon nobody can correct.
+
+    A fresh PhotoImage is fully transparent, so only the inked pixels are set
+    and the button's own background shows through in any theme. The caller
+    must keep the returned image alive: Tk drops an image the moment its last
+    Python reference goes, and the button then renders empty.
+    """
+    ink, trace, wash = "#3C3C3C", "#2A78D6", "#C9D8EC"
+    img = tk.PhotoImage(master=master, width=20, height=20)
+
+    # A VERTICAL marquee, not a square one. A region is a span of time and
+    # nothing else, so the selection that depicts it runs the height of the
+    # chart -- the same shape the drag actually leaves behind. A square
+    # marquee would imply the y range is part of the claim, which is the one
+    # thing CONTEXT.md is at pains to say it is not.
+    x0, x1, y0, y1 = 5, 14, 2, 17
+
+    # The wash first, so the trace and the dashes both sit on top of it.
+    for x in range(x0 + 1, x1):
+        for y in range(y0 + 1, y1):
+            img.put(wash, to=(x, y))
+
+    # The trace runs the FULL width, so the marquee is visibly selecting part
+    # of something longer rather than floating on its own.
+    # Shallow on purpose. A steep polyline at this size reads as scribble
+    # rather than as data: six rows of travel in three columns is a near
+    # vertical stroke, and three of those in a row look like noise.
+    ridge = [(1, 12), (5, 10), (9, 12), (13, 8), (18, 10)]
+    for (ax_, ay), (bx, by) in zip(ridge, ridge[1:]):
+        steps = max(abs(bx - ax_), abs(by - ay))
+        for s in range(steps + 1):
+            x = round(ax_ + (bx - ax_) * s / steps)
+            y = round(ay + (by - ay) * s / steps)
+            img.put(trace, to=(x, y))
+
+    # The dashes last, so nothing paints over the edge that carries the
+    # meaning. Anchored at the corners: a dash pattern that starts wherever
+    # the loop happens to begin leaves gaps at the corners, and a rectangle
+    # missing its corners does not read as a rectangle at all.
+    for y in range(y0, y1 + 1):
+        if y in (y0, y1) or (y - y0) % 4 < 2:
+            img.put(ink, to=(x0, y))
+            img.put(ink, to=(x1, y))
+    for x in range(x0, x1 + 1):
+        if x in (x0, x1) or (x - x0) % 4 < 2:
+            img.put(ink, to=(x, y0))
+            img.put(ink, to=(x, y1))
+    return img
+
+
+def _add_tooltip(widget, text):
+    """A hover label, because an unlabelled icon says nothing on its own.
+
+    matplotlib gives every one of its own toolbar buttons a tooltip, so a
+    neighbour without one is the odd button out. Written here rather than
+    imported from `matplotlib.backends._backend_tk`, which is private.
+    """
+    state = {"tip": None}
+
+    def show(_event=None):
+        if state["tip"] is not None:
+            return
+        tip = tk.Toplevel(widget)
+        tip.wm_overrideredirect(True)
+        tk.Label(tip, text=text, justify="left", relief="solid", borderwidth=1,
+                 background="#FFFFE0", font=("Segoe UI", 8)).pack()
+        tip.wm_geometry(f"+{widget.winfo_rootx()}"
+                        f"+{widget.winfo_rooty() + widget.winfo_height() + 2}")
+        state["tip"] = tip
+
+    def hide(_event=None):
+        if state["tip"] is not None:
+            state["tip"].destroy()
+            state["tip"] = None
+
+    widget.bind("<Enter>", show)
+    widget.bind("<Leave>", hide)
+    widget.bind("<ButtonPress>", hide)
+
+
 _MODE_TOOLBAR = None
 
 
@@ -561,11 +647,19 @@ class ViewWindow(tk.Toplevel):
         # A Checkbutton styled Toolbutton, so "pressed" is what the widget
         # already means rather than something painted on. The mode has to be
         # VISIBLE -- marking being an invisible gesture is the bug.
+        #
+        # An ICON, matching its neighbours: a text button in a row of glyphs
+        # reads as something bolted on rather than as a third mode. The image
+        # is held on the instance because Tk drops an image as soon as its
+        # last Python reference goes, and the button then renders empty.
         self._region_mode = True
         self._region_var = tk.BooleanVar(value=True)
+        self.region_icon = _region_icon(self.toolbar)
         self.region_btn = ttk.Checkbutton(
-            self.toolbar, text="Region", style="Toolbutton",
+            self.toolbar, image=self.region_icon, style="Toolbutton",
             variable=self._region_var, command=self._on_region_button)
+        _add_tooltip(self.region_btn,
+                     "Region: drag on the chart to mark a span of time")
         # Immediately after Zoom, so the three MODES are one group and the
         # actions that follow are another. Appended after Save otherwise --
         # `_buttons` is matplotlib's, and the worst a rename can do here is
@@ -2359,6 +2453,32 @@ def _main(argv=None):
                        f"of Zoom and close to it [same row {same_row}, "
                        f"gap {gap} px]",
                        same_row and to_right and 0 <= gap < 40))
+
+    # An ICON, and one that is still ALIVE. Tk drops an image the moment its
+    # last Python reference goes, and the button then renders empty while
+    # staying mapped, sized and clickable -- `winfo_ismapped()` cannot tell
+    # the difference, which is the withdrawn-dialog lesson wearing a third
+    # costume. So: read the pixels back.
+    shows_image = bool(str(win.region_btn.cget("image")))
+    checks.append((f"the Region button carries an image rather than a text "
+                   f"label [{'image' if shows_image else 'NO IMAGE'}]",
+                   shows_image and not str(win.region_btn.cget("text"))))
+
+    icon = win.region_icon
+    opaque = [(x, y) for x in range(icon.width()) for y in range(icon.height())
+              if not icon.transparency_get(x, y)]
+    inked = {icon.get(x, y) for x, y in opaque}
+    checks.append((f"and the image survived, with pixels actually drawn "
+                   f"[{icon.width()}x{icon.height()}, {len(opaque)} inked]",
+                   (icon.width(), icon.height()) == (20, 20)
+                   and len(opaque) > 40))
+    checks.append((f"which depict a marquee OVER a trace -- both colours are "
+                   f"present, so it is not half an icon [{sorted(inked)}]",
+                   (60, 60, 60) in inked and (42, 120, 214) in inked))
+    checks.append((f"and the button is drawn at least as wide as its icon, so "
+                   f"the image is rendered and not merely attached "
+                   f"[{win.region_btn.winfo_width()} px]",
+                   win.region_btn.winfo_width() >= icon.width()))
 
     # The control that brings another pair's regions onto the chart sits ABOVE
     # the chart. Below it, it was the last thing on a window it fitted by ten
