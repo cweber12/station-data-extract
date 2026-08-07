@@ -317,6 +317,13 @@ class ViewWindow(tk.Toplevel):
         ttk.Label(note, text=self._coverage_note(),
                   foreground="#777").pack(side="left")
         ttk.Button(note, text="Close", command=self.destroy).pack(side="right")
+        self.delete_btn = ttk.Button(note, text="Delete mark",
+                                     command=self.prompt_delete,
+                                     state="disabled")
+        self.delete_btn.pack(side="right", padx=(0, 6))
+        # Delete key as well as the button. There is no text entry in this
+        # window, so the key cannot be stolen from something being typed into.
+        self.bind("<Delete>", lambda _e: self.prompt_delete())
 
         marks = ttk.Frame(frame)
         marks.pack(fill="x", pady=(2, 0))
@@ -486,6 +493,14 @@ class ViewWindow(tk.Toplevel):
         # hour of the axis is not ascending and a bisect through it would
         # return a confident wrong index. Better to say so than to store a mark
         # that means an hour other than the one that was dragged.
+        # Click-to-select is wired up FIRST and unconditionally. Creating and
+        # adjusting need a monotonic axis to snap against; selecting and
+        # deleting do not, and a window that cannot be marked must not become
+        # one whose existing marks can never be removed.
+        self._press_x = None
+        self.canvas.mpl_connect("button_press_event", self._on_press)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
+
         self.descent = ann.first_descent(self._xnum)
         if self.descent is not None:
             when = ann.local_text(self._utc[self.descent])
@@ -493,8 +508,9 @@ class ViewWindow(tk.Toplevel):
             self.span_text.set(
                 f"Marking is off for this window: local time runs backwards "
                 f"around {when}, where a DST fall-back makes one wall clock "
-                f"hour cover two different hours of real time. Rebuild the "
-                f"window to exclude it.")
+                f"hour cover two different hours of real time. Existing marks "
+                f"can still be selected and deleted. Rebuild the window to "
+                f"exclude it.")
             return
 
         ax = self.figure.axes[0]
@@ -511,15 +527,12 @@ class ViewWindow(tk.Toplevel):
         )
         self.span.set_visible(False)
 
-        # Click-to-select needs its own handlers rather than riding on
-        # onselect: a zero-span click only reaches onselect when a selection
-        # ALREADY exists (SpanSelector._release calls it under
-        # `span <= minspan` only if `_selection_completed`), so the first click
-        # on a band would never arrive. Connected after the selector, so these
-        # run after its own press/release handling has settled.
-        self._press_x = None
-        self.canvas.mpl_connect("button_press_event", self._on_press)
-        self.canvas.mpl_connect("button_release_event", self._on_release)
+        # NOTE the press/release handlers are connected above, before this
+        # point, because they must exist even when the selector is refused.
+        # They ride alongside onselect rather than on it: SpanSelector._release
+        # only calls onselect for a zero-span click when a selection ALREADY
+        # exists (`span <= minspan` is guarded by `_selection_completed`), so
+        # the first click on a band would never arrive.
 
     # ------------------------------------------------------- selecting a mark
 
@@ -532,7 +545,11 @@ class ViewWindow(tk.Toplevel):
         """A click that did not move is a SELECT, not a failed drag."""
         if event.inaxes is not self.figure.axes[0] or self._press_x is None:
             return
-        moved = self.span_interval(self._press_x, event.xdata) is not None
+        # With no selector there is no create gesture to be confused with, and
+        # snap_span cannot be trusted on the axis that refused it, so every
+        # release is a click.
+        moved = (self.span is not None
+                 and self.span_interval(self._press_x, event.xdata) is not None)
         self._press_x = None
         if moved:
             return                       # a real drag; onselect owns it
@@ -560,9 +577,11 @@ class ViewWindow(tk.Toplevel):
         """Make `entry` the selected mark, or clear when None."""
         self.selected_band = entry
         self._restyle_bands()
+        self._sync_delete_button()
 
         if entry is None:
-            self.span.set_visible(False)
+            if self.span is not None:
+                self.span.set_visible(False)
             self.selection = None
             self.span_text.set(SPAN_HINT)
             self.canvas.draw_idle()
@@ -571,9 +590,10 @@ class ViewWindow(tk.Toplevel):
         # Put the selector's handles ON the chosen band, so its edges are what
         # a drag adjusts. Setting extents marks the selection completed, which
         # is what makes the handles live.
-        self.span.set_visible(True)
-        self.span.extents = (self._to_num(entry.interval.start_utc),
-                             self._to_num(entry.interval.end_utc))
+        if self.span is not None:
+            self.span.set_visible(True)
+            self.span.extents = (self._to_num(entry.interval.start_utc),
+                                 self._to_num(entry.interval.end_utc))
         self.selection = (entry.interval.start_utc, entry.interval.end_utc)
         self._selected_indices = self._indices_for(entry.interval)
         self.span_text.set(self._selected_summary(entry))
@@ -633,6 +653,9 @@ class ViewWindow(tk.Toplevel):
         verb = (f"Adjusting “{self.selected_band.markset.name}”:  "
                 if self._adjusting() else "Marking:  ")
         self.span_text.set(verb + self._span_summary(*got))
+
+    def _selection_indices(self):
+        return self._selected_indices
 
     def _adjusting(self) -> bool:
         """True when this drag moved an edge of the selected mark.
@@ -759,6 +782,80 @@ class ViewWindow(tk.Toplevel):
         self.select_interval(ms.set_id, start_utc, end_utc)
         return ms
 
+    # ------------------------------------------------------------- deleting
+
+    def deletion_message(self) -> str:
+        """What deleting the selection would destroy, in full, or ''.
+
+        Built separately from being shown so the wording can be asserted
+        without a modal dialog in the way -- the same split as
+        rejection_message, and for the same reason.
+        """
+        entry = self.selected_band
+        if entry is None:
+            return ""
+        ms, iv = entry.markset, entry.interval
+        lines = [f"Delete this mark?", "",
+                 f"    {ms.name}",
+                 f"    {ann.local_text(iv.start_utc)} → "
+                 f"{ann.local_text(iv.end_utc)} local"]
+        if ms.reason:
+            lines.append(f"    “{ms.reason}”")
+        lines.append("")
+        if len(ms.intervals) == 1:
+            # Not an ordinary delete: the set and the written reason go too,
+            # and a reason cannot be regenerated from anything.
+            lines.append(
+                f"This is the only occurrence of “{ms.name}”, so the set is "
+                f"removed as well, along with its reason.")
+        else:
+            lines.append(
+                f"“{ms.name}” has {len(ms.intervals)} occurrences; the other "
+                f"{len(ms.intervals) - 1} are kept.")
+        lines.append("This cannot be undone.")
+        return "\n".join(lines)
+
+    def delete_selected(self):
+        """Delete the selected occurrence, and write. Returns the set, or None.
+
+        The seam. No confirmation here -- the caller asks first, because delete
+        is the undo for this whole feature and has none of its own.
+        """
+        entry = self.selected_band
+        if entry is None:
+            raise RuntimeError("no mark is selected")
+        if self.store is None:
+            raise RuntimeError("this window has nowhere to delete from")
+        ms = self.store.delete_interval(entry.markset.set_id,
+                                        entry.interval.start_utc,
+                                        entry.interval.end_utc)
+        self.redraw_marks()
+        self.span_text.set(SPAN_HINT)
+        return ms
+
+    def prompt_delete(self):
+        """Confirm, then delete. UI only; see delete_selected."""
+        if self.selected_band is None or self.store is None:
+            return
+        name = self.selected_band.markset.name
+        if not messagebox.askyesno("Delete mark", self.deletion_message(),
+                                   icon="warning", default="no", parent=self):
+            return
+        try:
+            self.delete_selected()
+        except Exception as exc:
+            messagebox.showerror("Could not delete the mark", str(exc),
+                                 parent=self)
+            self.redraw_marks()
+            return
+        self.span_text.set(f"Deleted an occurrence of “{name}”.")
+
+    def _sync_delete_button(self):
+        button = getattr(self, "delete_btn", None)
+        if button is not None:
+            button.configure(state=("normal" if self.selected_band is not None
+                                    and self.store is not None else "disabled"))
+
     def select_interval(self, set_id: str, start_utc, end_utc):
         """Re-select an occurrence by VALUE after the bands were rebuilt."""
         for entry in self.bands:
@@ -777,6 +874,7 @@ class ViewWindow(tk.Toplevel):
         # rather than left dangling; a caller that wants the selection back
         # re-selects by value after the redraw.
         self.selected_band = None
+        self._sync_delete_button()
         self._load_marks()
         self._draw_marks()
         self._refresh_legend()
@@ -1520,6 +1618,107 @@ def _main(argv=None):
                        and "cannot cross" in win.span_text.get()))
         checks.append(("and the mark stays selected at its stored extent",
                        win.selection == new))
+
+        # ---- deleting ------------------------------------------------------
+        entry = win.select_band(win.bands[0])
+        set_id, doomed = entry.markset.set_id, (entry.interval.start_utc,
+                                                entry.interval.end_utc)
+        n_before = len(entry.markset.intervals)
+        survivors = [(b.markset.set_id, b.interval.start_utc,
+                      b.interval.end_utc) for b in win.bands[1:]]
+
+        msg = win.deletion_message()
+        checks.append((f"the confirmation names the mark, its local times and "
+                       f"its reason [{msg.splitlines()[2].strip()}]",
+                       entry.markset.name in msg
+                       and ann.local_text(doomed[0]) in msg
+                       and entry.markset.reason in msg
+                       and "cannot be undone" in msg))
+        checks.append((f"and says how many occurrences survive "
+                       f"[{msg.splitlines()[-2]}]",
+                       f"{n_before - 1} are kept" in msg))
+        checks.append(("the Delete button is live only while something is "
+                       "selected",
+                       str(win.delete_btn.cget("state")) == "normal"))
+
+        left = win.delete_selected()
+        checks.append((f"the occurrence is gone from the set "
+                       f"[{n_before} -> {len(left.intervals)}]",
+                       left is not None and len(left.intervals) == n_before - 1
+                       and all((i.start_utc, i.end_utc) != doomed
+                               for i in left.intervals)))
+        checks.append(("round trip after a delete returns what the window shows",
+                       [(i.start_utc, i.end_utc) for i in
+                        ann.Store(tmp).load_file(tmp / f"{set_id}.json").intervals]
+                       == [(i.start_utc, i.end_utc) for i in left.intervals]))
+        checks.append(("its band is off the chart, and the others remain",
+                       all(abs(b.patch.get_x() - win._to_num(doomed[0])) > 1e-9
+                           for b in win.bands)
+                       and all(s in [(b.markset.set_id, b.interval.start_utc,
+                                      b.interval.end_utc) for b in win.bands]
+                               for s in survivors)))
+        checks.append(("nothing is selected afterwards, and the button is off",
+                       win.selected_band is None
+                       and str(win.delete_btn.cget("state")) == "disabled"))
+
+        # Emptying a set needs one whose every occurrence is DRAWN. The set
+        # above has an interval outside the window, which is unreachable by
+        # clicking -- the gap slice 5 exists to close, and a reason this check
+        # gets its own fixture rather than reusing that one.
+        solo = ann.Store(tmp)
+        solo.confirm(study_id=info.study_id, pair=refs, name="short lived",
+                     reason="exists to be deleted",
+                     start_utc=idx[800], end_utc=idx[830])
+        solo.confirm(study_id=info.study_id, pair=refs, name="short lived",
+                     reason="", start_utc=idx[850], end_utc=idx[880])
+        win.redraw_marks()
+        solo_id = next(b.markset.set_id for b in win.bands
+                       if b.markset.name == "short lived")
+
+        warned = False
+        while True:
+            here = [b for b in win.bands if b.markset.set_id == solo_id]
+            if not here:
+                break
+            win.select_band(here[0])
+            if len(here[0].markset.intervals) == 1:
+                note = win.deletion_message()
+                warned = "only occurrence" in note and "reason" in note
+                checks.append((f"deleting the last occurrence warns that the "
+                               f"set and its reason go too "
+                               f"[{note.splitlines()[-2][:52]}...]", warned))
+            if win.delete_selected() is None:
+                break
+        checks.append(("the warning was actually reached, not skipped", warned))
+        checks.append(("deleting the last occurrence removes the file, leaving "
+                       "no named set with nothing in it",
+                       not (tmp / f"{solo_id}.json").exists()))
+        _sets, _bad = ann.Store(tmp).load_all()
+        checks.append((f"the store is still valid afterwards "
+                       f"[{len(_sets)} set(s), {len(_bad)} rejected]",
+                       len(_bad) == 1 and "corrupt.json" in _bad[0]))
+
+        # A window whose axis was refused for marking must still be deletable.
+        # #5 turns the selector off across a DST fall-back; only creating and
+        # adjusting need a monotonic axis, and a window that cannot be marked
+        # must not become one whose marks can never be removed.
+        keep_span, win.span = win.span, None
+        stuck = ann.Store(tmp)
+        stuck.confirm(study_id=info.study_id, pair=refs, name="stranded",
+                      reason="left on an unmarkable window",
+                      start_utc=idx[700], end_utc=idx[740])
+        win.redraw_marks()
+        target = next(b for b in win.bands if b.markset.name == "stranded")
+        picked = win.select_band(target)
+        checks.append(("with the selector refused, a mark can still be "
+                       "selected", picked is target
+                       and win.selected_band is target))
+        win.delete_selected()
+        checks.append(("and deleted, so an unmarkable window is not one whose "
+                       "marks are stuck there forever",
+                       not any(b.markset.name == "stranded"
+                               for b in win.bands)))
+        win.span = keep_span
 
         lo, hi = win.figure.axes[0].get_xlim()
         first, last = win._xnum[0], win._xnum[-1]
