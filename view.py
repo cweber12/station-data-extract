@@ -39,6 +39,7 @@ from __future__ import annotations
 import datetime as dt
 import tkinter as tk
 from dataclasses import dataclass
+from pathlib import Path
 from tkinter import messagebox, ttk
 from zoneinfo import ZoneInfo
 
@@ -47,6 +48,7 @@ import identity
 import sensorkit as sk
 
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+ROOT = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
 # Optional dependency. Import failure is recorded, never raised at import time,
@@ -147,6 +149,101 @@ class Band:
         the person is not currently looking at.
         """
         return self.candidate is not None
+
+
+class GhostError(RuntimeError):
+    """A borrowed set's absent partner could not be fetched.
+
+    Always names the key that failed and the label it was stored under. A key
+    stops resolving when the study it points into is not the one it was drawn
+    against, or when the series it named is no longer there -- and the LABEL is
+    what still communicates when the key does not, which is precisely why a
+    SeriesRef carries both.
+    """
+
+
+@dataclass
+class Ghost:
+    """The absent partner of a borrowed pair, standardised over THIS window."""
+    ref: object            # the SeriesRef it was fetched by
+    label: str             # legend text, carrying depth and reference frame
+    x: object              # naive local time, the axis this chart is drawn on
+    values: object         # z-scores, computed over the window on screen
+    line: object = None    # the artist, once drawn
+    borrowers: tuple = ()  # the sets that asked for it
+
+
+def resolve_series(study, key: str, config_root=None):
+    """(TableInfo, ColumnInfo) for a stable key, inside ONE study.
+
+    The key is `file::table::column` and is study-scoped by construction:
+    `scan_parquet` gives every study the identical key for the same station and
+    variable, so resolving one against a different study would silently answer
+    with another snapshot's data. That is the mechanical reason cross-study
+    overlay is out of scope, and it is enforced here by only ever scanning the
+    study handed in.
+    """
+    if study is None:
+        raise GhostError(
+            f"there is no study to resolve {key!r} against, so the absent "
+            f"partner of that pair cannot be fetched.")
+    catalog = sk.build_catalog_study(study, config_root=config_root)
+    available = []
+    for _f, tables in sorted(catalog.items()):
+        for t in tables:
+            for c in t.data_columns:
+                if c.key == key:
+                    return t, c
+                available.append(c.key)
+    raise GhostError(
+        f"no series with the key {key!r} is in study "
+        f"{getattr(study, 'study_id', '?')}. It held {len(available)} series "
+        f"when this was checked. The key is what re-fetches a series, and a "
+        f"renamed or rebuilt source breaks it.")
+
+
+def load_ghost(study, ref, *, interval: str, aggregation: str, lo, hi,
+               config_root=None) -> Ghost:
+    """Fetch a series by key and standardise it OVER THE CURRENT WINDOW.
+
+    Standardised over this window rather than over its whole extent, and with
+    `sensorkit.zscore` rather than an expression written here, so the ghost is
+    comparable to the lines already plotted instead of to itself. `ddof=0` is
+    the detail that would drift if this reimplemented it; see zscore.
+
+    Built through `build_comparison` at the SAME interval and aggregation as
+    the chart, so a 1 h mean is compared with a 1 h mean.
+    """
+    table, col = resolve_series(study, ref.key, config_root)
+    try:
+        res = sk.build_comparison(
+            [(table, col)], interval=interval, aggregation=aggregation,
+            overlap="union", min_samples=1, start=lo, end=hi,
+            convert_units_flag=True, stratification=False)
+    except Exception as exc:
+        raise GhostError(
+            f"{ref.label} ({ref.key}) could not be loaded: {exc}") from None
+    if res.data.empty or not res.data.columns.size:
+        raise GhostError(
+            f"{ref.label} ({ref.key}) resolved, but has no data inside this "
+            f"window. There is nothing to draw, which is not the same as a "
+            f"flat line and must not look like one.")
+
+    column = res.data.columns[0]
+    z = sk.zscore(res.data)[column]
+    if not bool(z.notna().any()):
+        raise GhostError(
+            f"{ref.label} ({ref.key}) is entirely empty inside this window "
+            f"after standardising, so a ghost line would be a blank claim.")
+
+    # Depth and reference frame on the ghost's legend entry too. It is a series
+    # on a chart, and the rule that every legend entry states where the sensor
+    # sits does not stop applying because the line is faint.
+    label = identity.legend_label(column, res.units.get(column, ""), False,
+                                  res.geometry.get(column, ""))
+    return Ghost(ref=ref, label=f"{label} — ghost: context, not compared",
+                 x=res.data.index.tz_convert(LOCAL_TZ).tz_localize(None),
+                 values=z.to_numpy())
 
 
 class MarkDialog(tk.Toplevel):
@@ -281,6 +378,14 @@ class ViewWindow(tk.Toplevel):
         self.overlay_ids = []
         self.candidates = []
         self.overlays = []
+
+        # The absent partner of each borrowed pair. Cached by key -- including
+        # the FAILURES, so a key that does not resolve is not re-scanned on
+        # every redraw -- because the study is immutable evidence and cannot
+        # answer differently between two redraws of one window.
+        self.ghosts = []
+        self.ghost_problems = []
+        self._ghost_cache = {}
 
         self.study = study
         self.study_id = getattr(study, "study_id", None)
@@ -591,6 +696,7 @@ class ViewWindow(tk.Toplevel):
         self.overlay_omitted = {}
         self._draw_native()
         self._draw_borrowed()
+        self._draw_ghosts()
         self._append_rejection_note()
 
     def _band_patch(self, ax, clamped, color: str, foreign: bool):
@@ -708,6 +814,126 @@ class ViewWindow(tk.Toplevel):
             lines.append(line)
         self.overlay_note = "\n".join(lines)
 
+    def _draw_ghosts(self):
+        """The absent partner of every borrowed pair, as a faint dashed line.
+
+        ONE PER DISTINCT KEY. Two borrowed sets drawn against the same series
+        are two interpretations of one thing, and drawing that series twice
+        would put two identical lines on the chart and two entries in a legend
+        that is already carrying four categories.
+
+        A band says "I judged this window interesting". The ghost is what the
+        series was actually doing inside it, which is the difference between
+        being told and being shown.
+        """
+        self.ghosts = []
+        self.ghost_problems = []
+        wanted = {}
+        for cand in self.overlays:
+            ref, names = wanted.setdefault(cand.foreign.key,
+                                           (cand.foreign, []))
+            names.append(cand.markset.name)
+
+        ax = self.figure.axes[0]
+        lo, hi = self._utc[0], self._utc[-1]
+        for _key, (ref, names) in wanted.items():
+            try:
+                ghost = self._ghost_for(ref, lo, hi)
+            except GhostError as exc:
+                # Loud, and on the same line as the omitted counts. The bands
+                # stay: they are still an attributed claim about windows. What
+                # must never happen is a chart that simply has no ghost on it
+                # and says nothing about why.
+                self.ghost_problems.append(
+                    f"The ghost line for “{'”, “'.join(names)}” is MISSING: "
+                    f"{exc}")
+                continue
+            # Grey, thin, dashed, and under the series lines. It is context: a
+            # reader must not be able to mistake it for one of the two series
+            # being compared, and colour is the only thing identifying a line
+            # on a chart whose y axis has no units.
+            ghost.line, = ax.plot(ghost.x, ghost.values, color="#8A8A8A",
+                                  linewidth=1.1, linestyle=(0, (6, 3)),
+                                  alpha=0.75, zorder=1.5, label=ghost.label)
+            ghost.borrowers = tuple(names)
+            self.ghosts.append(ghost)
+            self.mark_legend.append((ghost.line, ghost.label))
+
+        if self.ghost_problems:
+            self.overlay_note = "\n".join(
+                [self.overlay_note] + self.ghost_problems).strip()
+        self._apply_ylim()
+
+    def _ghost_for(self, ref, lo, hi) -> Ghost:
+        """One fetch per key per window, failures included. Raises GhostError."""
+        got = self._ghost_cache.get(ref.key)
+        if got is None:
+            try:
+                got = load_ghost(self.study, ref,
+                                 interval=self.result.interval,
+                                 aggregation=self.result.aggregation,
+                                 lo=lo, hi=hi, config_root=ROOT)
+            except GhostError as exc:
+                got = exc
+            except Exception as exc:            # anything else, still visibly
+                got = GhostError(f"{ref.label} ({ref.key}): {exc}")
+            self._ghost_cache[ref.key] = got
+        if isinstance(got, GhostError):
+            raise got
+        return got
+
+    def _apply_ylim(self):
+        """Widen y to fit the ghosts; keep the x pin exactly as it was.
+
+        Only the X axis was ever the bug that pinning fixed: the span
+        selector's rubber band is a Rectangle initialised at x = 0, the
+        matplotlib epoch, and left autoscaling it dragged the chart back to
+        1970. A band contributes nothing to the y limits at all -- axvspan
+        spans y in AXES coordinates -- so y can be recomputed safely.
+
+        And it has to be. A ghost standardised over a window it does not
+        dominate exceeds the range of the two plotted series easily, and a line
+        whose entire job is to show what a series was doing must not be cropped
+        by a frame that says nothing about having cropped it.
+        """
+        ax = self.figure.axes[0]
+        base = getattr(self, "_series_ylim", None)
+        if base is None:
+            return
+        if not self.ghosts:
+            ax.set_ylim(base)                 # exactly what it was before
+            return
+        lows = [base[0]]
+        highs = [base[1]]
+        for g in self.ghosts:
+            finite = g.values[np.isfinite(g.values)]
+            if finite.size:
+                lows.append(float(finite.min()))
+                highs.append(float(finite.max()))
+        span = max(highs) - min(lows)
+        pad = 0.05 * span if span > 0 else 0.5
+        ax.set_ylim(min(lows) - pad, max(highs) + pad)
+
+    def ghost_message(self) -> str:
+        """What to tell someone about a ghost that could not be drawn, or ''.
+
+        Split from showing it for the reason every other message here is: a
+        modal dialog raised from inside the drawing path blocks whoever is
+        driving the window, including a gate, with no error.
+        """
+        if not self.ghost_problems:
+            return ""
+        return ("The bands of the borrowed set ARE drawn, but the series they "
+                "were drawn against could not be fetched, so there is no "
+                "ghost line showing what it was doing:\n\n"
+                + "\n\n".join(self.ghost_problems[:5]))
+
+    def report_ghost_problems(self):
+        """Raise the dialog, if there is anything to say. Caller's job."""
+        msg = self.ghost_message()
+        if msg:
+            messagebox.showwarning("Ghost line not drawn", msg, parent=self)
+
     def _to_axis(self, when):
         """A UTC instant -> the naive local value the axis is drawn on.
 
@@ -727,7 +953,8 @@ class ViewWindow(tk.Toplevel):
         return bool(self.mark_problems or self.omitted)
 
     def _overlay_needs_attention(self) -> bool:
-        return bool(self.overlay_lost or any(self.overlay_omitted.values()))
+        return bool(self.overlay_lost or self.ghost_problems
+                    or any(self.overlay_omitted.values()))
 
     def rejection_message(self) -> str:
         """What to tell someone about files that would not load, or ''.
@@ -1193,15 +1420,28 @@ class ViewWindow(tk.Toplevel):
         set_id = self.overlay_choice()
         if set_id is None:
             return
+        # The ghost is fetched from the study's parquet on this thread. It is
+        # one series over one window and the frame is cached after the first
+        # read, but the first one is not instant, and a window that stops
+        # repainting with no explanation reads as a hang.
+        self.configure(cursor="watch")
+        self.update_idletasks()
         try:
             cand = self.overlay(set_id)
         except Exception as exc:
             messagebox.showerror("Could not borrow that set", str(exc),
                                  parent=self)
             return
+        finally:
+            self.configure(cursor="")
         self.span_text.set(
             f"Borrowed “{cand.markset.name}” from {cand.markset.pair_text}. "
             f"Its bands are outlined, not filled.")
+        # A key that no longer resolves gets a dialog, not only the note under
+        # the chart. The bands are drawn and attributed; what is missing is the
+        # line showing what the borrowed pair's other series was doing, and
+        # that absence is exactly what nobody would notice.
+        self.report_ghost_problems()
 
     def prompt_remove_overlay(self):
         """Stop borrowing the selected band's set. UI only.
@@ -1358,6 +1598,10 @@ class ViewWindow(tk.Toplevel):
         """Reload from disk and repaint. The file is the source of truth."""
         for patch in self.mark_patches:
             patch.remove()
+        for ghost in self.ghosts:
+            if ghost.line is not None:
+                ghost.line.remove()
+        self.ghosts = []
         # Every Band held a patch that has just been removed, so any selection
         # now points at an artist that is no longer on the axes. Cleared here
         # rather than left dangling; a caller that wants the selection back
@@ -1526,6 +1770,10 @@ class ViewWindow(tk.Toplevel):
         ax.autoscale_view()
         ax.set_xlim(ax.get_xlim())
         ax.set_ylim(ax.get_ylim())
+        # Kept so the frame can be restored EXACTLY when a ghost that widened
+        # it is handed back. Recomputing it later from the lines would include
+        # whatever else has since been drawn.
+        self._series_ylim = ax.get_ylim()
 
         # The legend is built by _refresh_legend once the mark bands exist, so
         # that sets are named alongside the series rather than in a second
@@ -2357,6 +2605,7 @@ def _main(argv=None):
                        pair=(foreign_ref, ann.SeriesRef("p::q::r", "p.q.r")),
                        start_utc=idx[200], end_utc=idx[260])
         win.redraw_marks()
+        pinned_x = win.figure.axes[0].get_xlim()   # must survive every overlay
 
         offered = {c.markset.name for c in win.candidates}
         native_names = {m.name for m in win.marks}
@@ -2532,6 +2781,125 @@ def _main(argv=None):
                        and "exactly one series" in hint))
         bare.destroy()
 
+        # ---- the ghost line --------------------------------------------------
+        ghosts = win.ghosts
+        ghost_lines = [g.line for g in ghosts]
+        checks.append((f"the absent partner is fetched by its stable key and "
+                       f"drawn [{[g.ref.label for g in ghosts]}]",
+                       len(ghosts) == 1 and ghosts[0].ref.key == third_key
+                       and all(ln in win.figure.axes[0].get_lines()
+                               for ln in ghost_lines)))
+
+        gt, gc = resolve_series(info, third_key, ROOT)
+        checks.append((f"resolve_series finds it in THIS study, without a "
+                       f"window [{gc.key}]", gc.key == third_key))
+
+        ghost_res = sk.build_comparison(
+            [(gt, gc)], interval=args.interval, aggregation=args.aggregation,
+            overlap="union", min_samples=1, start=idx[0], end=idx[-1],
+            convert_units_flag=True, stratification=False)
+        want_z = sk.zscore(ghost_res.data)[ghost_res.data.columns[0]].to_numpy()
+        got_z = ghosts[0].values
+        checks.append((f"its y data is sk.zscore of that series, exactly — the "
+                       f"same function the workbook standardises with "
+                       f"[{len(got_z)} points]",
+                       len(got_z) == len(want_z)
+                       and np.allclose(got_z, want_z, equal_nan=True,
+                                       rtol=0, atol=0)))
+        drawn_y = ghost_lines[0].get_ydata()
+        checks.append(("and that is what was handed to matplotlib, not merely "
+                       "what was computed",
+                       len(drawn_y) == len(want_z)
+                       and np.allclose(drawn_y, want_z, equal_nan=True,
+                                       rtol=0, atol=0)))
+        checks.append((f"standardised over THIS window: mean {np.nanmean(got_z):+.1e}, "
+                       f"sd {np.nanstd(got_z):.6f} — a series standardised over "
+                       f"its own wider extent would not centre here",
+                       abs(float(np.nanmean(got_z))) < 1e-9
+                       and abs(float(np.nanstd(got_z)) - 1.0) < 1e-9))
+
+        legend = [t.get_text()
+                  for t in win.figure.axes[0].get_legend().get_texts()]
+        context = [t for t in legend if "ghost" in t]
+        checks.append((f"the legend labels it as CONTEXT, not as a compared "
+                       f"series {context}",
+                       len(context) == 1 and "not compared" in context[0]
+                       and gc.geometry_label in context[0]))
+        checks.append(("it is not one of the compared series: two lines are "
+                       "still the pair, and the ghost is neither",
+                       len(win.plotted()) == 2
+                       and ghost_lines[0] not in win.series_lines.values()))
+        checks.append((f"it is drawn faint and dashed, under the series lines "
+                       f"[lw {ghost_lines[0].get_linewidth()}, "
+                       f"alpha {ghost_lines[0].get_alpha()}]",
+                       ghost_lines[0].get_linestyle() not in ("-", "solid")
+                       and ghost_lines[0].get_alpha() < 1.0
+                       and ghost_lines[0].get_zorder()
+                       < min(ln.get_zorder()
+                             for ln in win.series_lines.values())))
+        ghost_rgb = ghost_lines[0].get_color().lstrip("#").upper()
+        checks.append((f"and in no series colour [{ghost_rgb}]",
+                       ghost_rgb not in
+                       {c.upper() for c in identity.SERIES_COLORS}))
+
+        # The frame. Only the X pin was ever load-bearing; y is recomputed so
+        # that a line whose whole job is to show what a series did is never
+        # silently cropped. Forced with a synthetic ghost, because real data
+        # may happen to fit inside the pinned range and a check that passes
+        # only when the situation does not arise asserts nothing.
+        axis = win.figure.axes[0]
+        with_ghost = axis.get_ylim()
+        checks.append((f"the real ghost is inside the frame "
+                       f"[{with_ghost[0]:.2f}..{with_ghost[1]:.2f}]",
+                       float(np.nanmin(got_z)) >= with_ghost[0]
+                       and float(np.nanmax(got_z)) <= with_ghost[1]))
+        win.ghosts.append(Ghost(ref=wl.foreign, label="synthetic", x=None,
+                                values=np.array([-9.0, 11.0])))
+        win._apply_ylim()
+        widened = axis.get_ylim()
+        win.ghosts.pop()
+        win._apply_ylim()
+        checks.append((f"a ghost exceeding the pinned range WIDENS it rather "
+                       f"than being cropped [{with_ghost[0]:.2f}.."
+                       f"{with_ghost[1]:.2f} -> {widened[0]:.2f}.."
+                       f"{widened[1]:.2f}]",
+                       widened[0] <= -9.0 and widened[1] >= 11.0))
+        checks.append(("and dropping it restores the frame exactly",
+                       axis.get_ylim() == with_ghost))
+        checks.append((f"the X pin is untouched throughout "
+                       f"[{axis.get_xlim()[0]:.0f}..{axis.get_xlim()[1]:.0f}]",
+                       axis.get_xlim() == pinned_x))
+
+        # Two sets drawn against the SAME absent series are two readings of one
+        # thing. One ghost, named for both.
+        twin = ann.Store(tmp)
+        twin.confirm(study_id=info.study_id, name="same partner", reason="",
+                     pair=(refs[1], foreign_ref),
+                     start_utc=idx[600], end_utc=idx[650])
+        win.redraw_marks()
+        twin_id = next(c.markset.set_id for c in win.candidates
+                       if c.markset.name == "same partner")
+        win.overlay(twin_id)
+        checks.append((f"two borrowed sets sharing one absent series get ONE "
+                       f"ghost line, named for both "
+                       f"[{sorted(win.ghosts[0].borrowers) if win.ghosts else []}]",
+                       len(win.ghosts) == 1
+                       and sorted(win.ghosts[0].borrowers)
+                       == ["same partner", "third series"]))
+        win.remove_overlay(twin_id)
+        checks.append(("removing one of them keeps the ghost the other still "
+                       "needs", len(win.ghosts) == 1))
+        n_lines_with = len(win.figure.axes[0].get_lines())
+        win.remove_overlay(wl.markset.set_id)
+        checks.append((f"removing the last borrower takes the ghost off the "
+                       f"axes [{n_lines_with} -> "
+                       f"{len(win.figure.axes[0].get_lines())} lines]",
+                       not win.ghosts
+                       and len(win.figure.axes[0].get_lines())
+                       == n_lines_with - 1
+                       and win.figure.axes[0].get_ylim() == win._series_ylim))
+        win.overlay(wl.markset.set_id)
+
         # ---- native wins a tie ----------------------------------------------
         overlap = ann.Store(tmp)
         overlap.confirm(study_id=info.study_id, pair=refs, name="coincides",
@@ -2563,6 +2931,42 @@ def _main(argv=None):
                        f"[{len([t for t in legend if 'borrowed from' in t])} "
                        f"attributed]",
                        len([t for t in legend if "borrowed from" in t]) == 2))
+
+        # ---- a key that no longer resolves ----------------------------------
+        # "other pair" was drawn against x::y::z, which is in no study. Its
+        # bands are still an attributed claim about windows and stay on the
+        # chart; what must not happen is a chart with no ghost on it saying
+        # nothing about why.
+        checks.append((f"the unresolvable partner is REPORTED, not left as a "
+                       f"silently absent line "
+                       f"[{len(win.ghost_problems)} problem(s)]",
+                       len(win.ghost_problems) == 1
+                       and len(win.ghosts) == 1))
+        checks.append((f"the report names the set, the key and the label "
+                       f"[{win.ghost_problems[0][:96]}...]",
+                       "other pair" in win.ghost_problems[0]
+                       and "x::y::z" in win.ghost_problems[0]
+                       and "MISSING" in win.ghost_problems[0]))
+        gmsg = win.ghost_message()
+        checks.append(("the dialog wording says the bands are drawn and the "
+                       "ghost is not, and is readable without a modal box "
+                       "standing in the way",
+                       "bands" in gmsg and "x::y::z" in gmsg
+                       and "no ghost line" in gmsg))
+        checks.append((f"and the note under the chart says so too, in orange "
+                       f"[{win._overlay_needs_attention()}]",
+                       "MISSING" in win.overlay_note
+                       and win._overlay_needs_attention()))
+
+        try:
+            resolve_series(info, "nowhere::in::this-study", ROOT)
+            resolved, why = True, ""
+        except GhostError as exc:
+            resolved, why = False, str(exc)
+        checks.append((f"resolve_series refuses an unknown key by name, "
+                       f"without a window [{why[:70]}...]",
+                       not resolved and "nowhere::in::this-study" in why
+                       and info.study_id in why))
 
         win.remove_overlay(second.markset.set_id)
         checks.append(("removing one leaves the other drawn",
