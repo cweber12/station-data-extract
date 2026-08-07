@@ -82,12 +82,13 @@ try:
     from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                    NavigationToolbar2Tk)
     from matplotlib.figure import Figure
+    from matplotlib.patches import Patch
     from matplotlib.widgets import SpanSelector
     IMPORT_ERROR: Exception | None = None
 except Exception as exc:                       # pragma: no cover - environment
     matplotlib = mdates = np = None
     FigureCanvasTkAgg = NavigationToolbar2Tk = Figure = None
-    SpanSelector = None
+    SpanSelector = Patch = None
     IMPORT_ERROR = exc
 
 SPAN_HINT = ("Drag across the chart to define a region.  "
@@ -155,10 +156,21 @@ class Band:
     interval: object       # the ORIGINAL stored occurrence -- its identity
     drawn: object = None   # the same occurrence clamped to this window
     candidate: object = None   # set when the band was borrowed from another pair
+    # The colour bar, and the edge rules on a region from another pair. Kept
+    # beside the patch rather than looked up later: `patch` stays the ONE
+    # artist carrying the geometry, so hit testing, selection and removal each
+    # have a single thing to ask, and these ride along with it.
+    decorations: tuple = ()
 
     @property
     def is_drawn(self) -> bool:
         return self.patch is not None
+
+    @property
+    def artists(self) -> list:
+        """Everything this occurrence put on the axes."""
+        return ([] if self.patch is None else [self.patch]) \
+            + list(self.decorations)
 
     @property
     def is_foreign(self) -> bool:
@@ -747,25 +759,41 @@ class ViewWindow(tk.Toplevel):
         self._append_rejection_note()
 
     def _band_patch(self, ax, clamped, color: str, foreign: bool):
-        """One band on the axes. Borrowed ones are UNFILLED, hatched, dashed.
+        """(patch, decorations) for one region. A BLOCK, or a BRACKET.
 
-        Unfilled is the whole distinction: a solid block is a claim about the
-        pair on screen, and a borrowed band is not a claim about it at all.
+        This pair's own regions are a shaded block with the set's colour along
+        the TOP. A region marked on another pair is not shaded at all: two
+        edge rules and the set's colour along the BOTTOM -- an open bracket
+        rather than a block.
 
-        Borrowed bands also sit ABOVE native ones. The question being asked is
-        whether a borrowed window coincides with a native one, so the case
-        where they overlap is precisely the interesting case -- a hatch drawn
-        over a fill still reads as both, while a fill drawn over a hatch hides
-        the answer exactly where it matters.
+        Shape carries the distinction, and position of the colour bar
+        reinforces it, because both survive a glance. The first version used a
+        diagonal hatch, and hatching is the loudest thing that can be put on a
+        chart: it competed with the data it was supposed to be pointing at.
+
+        Nothing is obscured either way. Shading is deliberately light -- what
+        the series were doing INSIDE a marked window is the entire question,
+        and a dark block answers it by hiding the evidence. The set's colour
+        survives in the bar, which is what the legend swatch matches.
+
+        `patch` always spans the region even when it draws nothing visible, so
+        hit testing has one artist to ask whatever the treatment.
         """
         x0, x1 = (self._to_axis(clamped.start_utc),
                   self._to_axis(clamped.end_utc))
         if foreign:
-            return ax.axvspan(x0, x1, facecolor="none", edgecolor="#" + color,
-                              hatch="//", linewidth=1.4, linestyle=(0, (5, 3)),
-                              alpha=0.9, zorder=0.5)
-        return ax.axvspan(x0, x1, facecolor="#" + color, alpha=0.22,
-                          edgecolor="#" + color, linewidth=1.0, zorder=0)
+            patch = ax.axvspan(x0, x1, facecolor="none", edgecolor="none",
+                               linewidth=0, zorder=0.5)
+            bar = ax.axvspan(x0, x1, ymin=0.0, ymax=0.025,
+                             facecolor="#" + color, linewidth=0, zorder=0.6)
+            rules = [ax.axvline(x, color="#" + color, linewidth=1.3,
+                                zorder=0.6) for x in (x0, x1)]
+            return patch, (bar, *rules)
+        patch = ax.axvspan(x0, x1, facecolor="#1A1A1A", alpha=0.15,
+                           edgecolor="none", linewidth=0, zorder=0.4)
+        bar = ax.axvspan(x0, x1, ymin=0.975, ymax=1.0, facecolor="#" + color,
+                         linewidth=0, zorder=0.6)
+        return patch, (bar,)
 
     def _draw_native(self):
         """One band per interval, per set drawn on THIS pair."""
@@ -797,13 +825,23 @@ class ViewWindow(tk.Toplevel):
                 if clamped is None:
                     self.occurrences.append(Band(None, ms, original, None))
                     continue
-                patch = self._band_patch(ax, clamped, ms.color, foreign=False)
-                self.occurrences.append(Band(patch, ms, original, clamped))
+                patch, extra = self._band_patch(ax, clamped, ms.color,
+                                                foreign=False)
+                self.occurrences.append(
+                    Band(patch, ms, original, clamped, decorations=extra))
                 drawn += 1
             # One legend entry per SET, not per band -- the whole point of a
             # set is that many occurrences are one phenomenon.
+            #
+            # The swatch is a PROXY, not a band off the axes: the band's own
+            # fill is a neutral shade so that the data underneath survives, and
+            # a swatch of that would identify nothing. The proxy carries the
+            # set's colour, filled, matching the bar along the top of its
+            # bands. See _draw_borrowed for the open swatch that answers it.
             if pairs:
-                self.mark_legend.append((patch, f"{ms.name}  ({len(pairs)}×)"))
+                self.mark_legend.append(
+                    (Patch(facecolor="#" + ms.color, alpha=0.85,
+                           edgecolor="none"), f"{ms.name}  ({len(pairs)}×)"))
 
         n_sets = len({id(m) for m in self.marks})
         parts = [f"{drawn} mark(s) in {n_sets} set(s) on this pair."]
@@ -839,20 +877,28 @@ class ViewWindow(tk.Toplevel):
             pairs, omitted = ann.clip_to_window(ms.intervals, lo, hi)
             self.overlay_omitted[ms.set_id] = omitted
             clamped_for = {id(original): clamped for original, clamped in pairs}
-            patch = None
+            any_drawn = False
             for original in ms.intervals:
                 clamped = clamped_for.get(id(original))
                 if clamped is None:
                     self.occurrences.append(
                         Band(None, ms, original, None, candidate=cand))
                     continue
-                patch = self._band_patch(ax, clamped, ms.color, foreign=True)
+                patch, extra = self._band_patch(ax, clamped, ms.color,
+                                                foreign=True)
                 self.occurrences.append(
-                    Band(patch, ms, original, clamped, candidate=cand))
-            if patch is not None:
+                    Band(patch, ms, original, clamped, candidate=cand,
+                         decorations=extra))
+                any_drawn = True
+            # An OPEN swatch, answering the filled one this pair's own sets
+            # get: the same distinction the bands make, made again where the
+            # names are read.
+            if any_drawn:
                 self.mark_legend.append(
-                    (patch, f"{ms.name}  ({len(pairs)}×)  ·  borrowed from "
-                            f"{ms.pair_text}"))
+                    (Patch(facecolor="none", edgecolor="#" + ms.color,
+                           linewidth=1.4),
+                     f"{ms.name}  ({len(pairs)}×)  ·  borrowed from "
+                     f"{ms.pair_text}"))
 
             line = (f"Borrowed “{ms.name}” from {ms.pair_text} — "
                     f"{len(pairs)} band(s) drawn")
@@ -899,9 +945,14 @@ class ViewWindow(tk.Toplevel):
             # reader must not be able to mistake it for one of the two series
             # being compared, and colour is the only thing identifying a line
             # on a chart whose y axis has no units.
-            ghost.line, = ax.plot(ghost.x, ghost.values, color="#8A8A8A",
-                                  linewidth=1.1, linestyle=(0, (6, 3)),
-                                  alpha=0.75, zorder=1.5, label=ghost.label)
+            # Solid, mid grey, under the series lines. It was dashed once, and
+            # a dashed line plus hatched bands put two competing textures on a
+            # chart whose whole job is showing the shape of two lines. Mid grey
+            # rather than light: a light line reads beautifully inside a shaded
+            # region and vanishes outside it, so the one line you are meant to
+            # follow end to end would fade in and out along its length.
+            ghost.line, = ax.plot(ghost.x, ghost.values, color="#6E6E6E",
+                                  linewidth=1.3, zorder=1.5, label=ghost.label)
             ghost.borrowers = tuple(names)
             self.ghosts.append(ghost)
             self.mark_legend.append((ghost.line, ghost.label))
@@ -1230,19 +1281,25 @@ class ViewWindow(tk.Toplevel):
         return text
 
     def _restyle_bands(self):
-        """The selected band reads as selected. Colour still identifies the set."""
+        """The selected region reads as selected, without changing what it is.
+
+        A selected region from another pair stays an open bracket, and a
+        selected one of this pair's own stays a block. Selection is not allowed
+        to be the one moment the two look alike.
+        """
         for entry in self.bands:
             chosen = entry is self.selected_band
             if entry.is_foreign:
-                # Heavier outline, still unfilled and still hatched. Selecting
-                # a borrowed band must not be the one moment it starts looking
-                # like a native one.
-                entry.patch.set_linewidth(2.8 if chosen else 1.4)
-                entry.patch.set_alpha(1.0 if chosen else 0.9)
+                for art in entry.decorations:
+                    if hasattr(art, "set_linewidth"):
+                        art.set_linewidth(2.6 if chosen else 1.3)
+                # A faint wash only while selected, so the bracket still reads
+                # as a bracket the rest of the time.
+                entry.patch.set_facecolor(
+                    "#" + entry.markset.color if chosen else "none")
+                entry.patch.set_alpha(0.12 if chosen else None)
                 continue
-            entry.patch.set_alpha(0.34 if chosen else 0.22)
-            entry.patch.set_linewidth(2.2 if chosen else 1.0)
-            entry.patch.set_linestyle("solid" if chosen else "dotted")
+            entry.patch.set_alpha(0.30 if chosen else 0.15)
 
     def _to_num(self, when) -> float:
         return float(mdates.date2num(self._to_axis(when)))
@@ -1663,8 +1720,9 @@ class ViewWindow(tk.Toplevel):
 
     def redraw_marks(self):
         """Reload from disk and repaint. The file is the source of truth."""
-        for patch in self.mark_patches:
-            patch.remove()
+        for entry in self.bands:
+            for art in entry.artists:
+                art.remove()
         for ghost in self.ghosts:
             if ghost.line is not None:
                 ghost.line.remove()
@@ -2199,12 +2257,31 @@ def _main(argv=None):
         # rubber-band Rectangle on the same axes, so it is excluded by
         # IDENTITY rather than by type or colour, either of which would start
         # silently swallowing real bands the day one of them matched.
+        # The colour bar along a region's edge is a patch too, and it is
+        # excluded the same way and for the same reason: by identity, from the
+        # window's own record of what it drew as decoration, never by type or
+        # position -- either of which would start swallowing real regions the
+        # day one matched.
+        def geometry_spans():
+            rubber = getattr(win.span, "_selection_artist", None)
+            decor = {id(a) for b in win.occurrences for a in b.decorations}
+            return [p for p in win.figure.axes[0].patches
+                    if p is not rubber and id(p) not in decor]
+
         rubber_band = getattr(win.span, "_selection_artist", None)
-        spans = [p for p in win.figure.axes[0].patches if p is not rubber_band]
+        spans = geometry_spans()
         checks.append(("the drag rubber-band is on the axes and was excluded",
                        rubber_band is not None
                        and any(p is rubber_band
                                for p in win.figure.axes[0].patches)))
+        checks.append((f"each region's colour bar is on the axes beside its "
+                       f"band, and was excluded too "
+                       f"[{sum(len(b.decorations) for b in win.bands)} "
+                       f"decoration(s)]",
+                       all(all(a in win.figure.axes[0].patches
+                               or a in win.figure.axes[0].get_lines()
+                               for a in b.decorations) for b in win.bands)
+                       and bool(win.bands)))
         checks.append((f"one band is drawn per interval inside the window "
                        f"[{len(spans)} bands]", len(spans) == len(inside)))
         checks.append(("the derived band views agree with the axes exactly",
@@ -2269,8 +2346,7 @@ def _main(argv=None):
                            and i.end_utc == idx[560].to_pydatetime()
                            for i in on_disk.intervals)))
 
-        spans_now = [p for p in win.figure.axes[0].patches
-                     if p is not getattr(win.span, "_selection_artist", None)]
+        spans_now = geometry_spans()
         checks.append((f"the new band is on the chart without reopening "
                        f"[{len(spans_now)} bands]", len(spans_now) == 3))
 
@@ -2359,9 +2435,13 @@ def _main(argv=None):
                        target.markset.name in win.span_text.get()
                        and ann.local_text(target.interval.start_utc)
                        in win.span_text.get()))
-        checks.append(("the selected band is styled apart from the others",
-                       all(target.patch.get_linewidth() > b.patch.get_linewidth()
-                           for b in win.bands if b is not target)))
+        others = [b for b in win.bands if b is not target]
+        checks.append((f"the selected region reads apart from the others "
+                       f"[{target.patch.get_alpha():.2f} vs "
+                       f"{[round(b.patch.get_alpha(), 2) for b in others]}]",
+                       bool(others)
+                       and all(target.patch.get_alpha() > b.patch.get_alpha()
+                               for b in others)))
         checks.append(("selecting resolves to the interval's samples, so a "
                        "later edit can recompute coverage",
                        win._selected_indices
@@ -2743,20 +2823,47 @@ def _main(argv=None):
 
         # Read off the AXES. What is on the chart is the claim being made, and
         # the distinction this issue is HITL for is a property of the artists.
+        # A BLOCK against a BRACKET: shape carries it, so the assertions are
+        # about fill and about where the colour bar sits, not about texture.
         fill_alpha = [b.patch.get_facecolor()[3] for b in foreign_bands]
-        hatches = [b.patch.get_hatch() for b in foreign_bands]
-        native_hatch = [b.patch.get_hatch() for b in native_bands]
         native_fill = [b.patch.get_facecolor()[3] for b in native_bands]
-        checks.append((f"a borrowed band is UNFILLED and hatched where a "
-                       f"native one is filled and plain [fill {fill_alpha} vs "
-                       f"{native_fill}, hatch {hatches} vs {native_hatch}]",
+        checks.append((f"a region from another pair is UNFILLED where this "
+                       f"pair's own are shaded [fill {fill_alpha} vs "
+                       f"{native_fill}]",
                        bool(foreign_bands) and bool(native_bands)
                        and all(a == 0 for a in fill_alpha)
-                       and all(h for h in hatches)
-                       and all(a > 0 for a in native_fill)
-                       and not any(native_hatch)))
-        checks.append(("a borrowed band is drawn ABOVE the native ones, so a "
-                       "coincidence between them still reads as both",
+                       and all(0 < a < 0.4 for a in native_fill)))
+        checks.append((f"the shading is light enough that the data underneath "
+                       f"survives it -- a dark block would hide the very thing "
+                       f"a marked window is asking about [{native_fill}]",
+                       all(a <= 0.2 for a in native_fill)))
+        checks.append(("nothing is hatched any more, on either kind",
+                       not any(b.patch.get_hatch()
+                               for b in foreign_bands + native_bands)))
+
+        def bar_of(band):
+            """The colour bar: the one decoration that is a patch."""
+            return next(a for a in band.decorations if hasattr(a, "get_xy"))
+
+        native_bar_y = [bar_of(b).get_y() for b in native_bands]
+        foreign_bar_y = [bar_of(b).get_y() for b in foreign_bands]
+        checks.append((f"the set's colour is a bar along the TOP of this "
+                       f"pair's regions and the BOTTOM of another pair's, so "
+                       f"position says which before colour does "
+                       f"[{[round(v, 2) for v in native_bar_y]} vs "
+                       f"{[round(v, 2) for v in foreign_bar_y]}]",
+                       bool(native_bar_y) and bool(foreign_bar_y)
+                       and all(v > 0.9 for v in native_bar_y)
+                       and all(v < 0.1 for v in foreign_bar_y)))
+        set_rgb = {tuple(round(int(wl.markset.color[i:i + 2], 16) / 255, 4)
+                         for i in (0, 2, 4))}
+        checks.append(("and the bar carries the SET's colour, which is what "
+                       "the legend swatch matches",
+                       all(tuple(round(v, 4)
+                                 for v in bar_of(b).get_facecolor()[:3])
+                           in set_rgb for b in foreign_bands)))
+        checks.append(("a region from another pair is drawn ABOVE this pair's, "
+                       "so a coincidence between them still reads as both",
                        min(b.patch.get_zorder() for b in foreign_bands)
                        > max(b.patch.get_zorder() for b in native_bands)))
 
@@ -2927,17 +3034,24 @@ def _main(argv=None):
                        "still the pair, and the ghost is neither",
                        len(win.plotted()) == 2
                        and ghost_lines[0] not in win.series_lines.values()))
-        checks.append((f"it is drawn faint and dashed, under the series lines "
-                       f"[lw {ghost_lines[0].get_linewidth()}, "
-                       f"alpha {ghost_lines[0].get_alpha()}]",
-                       ghost_lines[0].get_linestyle() not in ("-", "solid")
-                       and ghost_lines[0].get_alpha() < 1.0
+        checks.append((f"it is SOLID and thinner than a compared series, and "
+                       f"sits under them [lw {ghost_lines[0].get_linewidth()} "
+                       f"vs {[ln.get_linewidth() for ln in win.series_lines.values()]}]",
+                       ghost_lines[0].get_linestyle() in ("-", "solid")
+                       and ghost_lines[0].get_linewidth()
+                       < min(ln.get_linewidth()
+                             for ln in win.series_lines.values())
                        and ghost_lines[0].get_zorder()
                        < min(ln.get_zorder()
                              for ln in win.series_lines.values())))
         ghost_rgb = ghost_lines[0].get_color().lstrip("#").upper()
-        checks.append((f"and in no series colour [{ghost_rgb}]",
-                       ghost_rgb not in
+        r, g, b = (int(ghost_rgb[i:i + 2], 16) for i in (0, 2, 4))
+        grey = abs(r - g) < 8 and abs(g - b) < 8
+        checks.append((f"and grey, at no series colour, and mid rather than "
+                       f"light -- a light line reads inside a shaded region "
+                       f"and vanishes outside it [{ghost_rgb}]",
+                       grey and 0x50 <= r <= 0x90
+                       and ghost_rgb not in
                        {c.upper() for c in identity.SERIES_COLORS}))
 
         # The frame. Only the X pin was ever load-bearing; y is recomputed so
@@ -2987,15 +3101,26 @@ def _main(argv=None):
         win.remove_overlay(twin_id)
         checks.append(("removing one of them keeps the ghost the other still "
                        "needs", len(win.ghosts) == 1))
-        n_lines_with = len(win.figure.axes[0].get_lines())
+        # By IDENTITY, not by counting lines: a region from another pair draws
+        # edge rules, which are Line2D too, so a count would be measuring the
+        # bands going away rather than the ghost.
+        doomed_line = win.ghosts[0].line
+        doomed_artists = [a for b in win.bands if b.is_foreign
+                          for a in b.artists]
         win.remove_overlay(wl.markset.set_id)
         checks.append((f"removing the last borrower takes the ghost off the "
-                       f"axes [{n_lines_with} -> "
-                       f"{len(win.figure.axes[0].get_lines())} lines]",
+                       f"axes [{len(win.figure.axes[0].get_lines())} lines "
+                       f"left]",
                        not win.ghosts
-                       and len(win.figure.axes[0].get_lines())
-                       == n_lines_with - 1
+                       and doomed_line not in win.figure.axes[0].get_lines()
                        and win.figure.axes[0].get_ylim() == win._series_ylim))
+        checks.append((f"and takes EVERY artist of its regions with it, "
+                       f"leaving no colour bar or edge rule behind "
+                       f"[{len(doomed_artists)} checked]",
+                       bool(doomed_artists)
+                       and not any(a in win.figure.axes[0].patches
+                                   or a in win.figure.axes[0].get_lines()
+                                   for a in doomed_artists)))
         win.overlay(wl.markset.set_id)
 
         # ---- the view belongs to whoever is looking at it --------------------
