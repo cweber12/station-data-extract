@@ -525,6 +525,90 @@ def _add_tooltip(widget, text):
     widget.bind("<ButtonPress>", hide)
 
 
+class NameCheckList(ttk.Frame):
+    """A scrolling column of checkboxes, one per name.
+
+    Its own class because the scrolling is machinery and none of it is the
+    window's business: Tk has no scrollable frame, so it is a Canvas with a
+    Frame drawn onto it and the two kept in step by hand. Behind `set_items`
+    the window never touches a scrollregion.
+
+    The list is REBUILT wholesale on every refresh rather than diffed. The
+    number of rows is the number of named sets in a study that share one
+    series with this pair -- a handful -- and a diff would be more code than
+    the thing it optimises, with a stale-row failure mode that a rebuild
+    cannot have.
+    """
+
+    ROW_HEIGHT = 34
+
+    def __init__(self, parent, on_toggle, visible_rows=4):
+        super().__init__(parent)
+        self._on_toggle = on_toggle
+        self._vars = {}
+        self._boxes = {}
+        self._canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0,
+                                 height=self.ROW_HEIGHT * visible_rows)
+        self._bar = ttk.Scrollbar(self, orient="vertical",
+                                  command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._bar.set)
+        self._inner = ttk.Frame(self._canvas)
+        self._window = self._canvas.create_window(
+            (0, 0), window=self._inner, anchor="nw")
+        self._inner.bind("<Configure>", self._resize_scrollregion)
+        self._canvas.bind("<Configure>", self._match_inner_width)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._bar.pack(side="right", fill="y")
+
+    def _resize_scrollregion(self, _event=None):
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _match_inner_width(self, event):
+        # Without this the inner frame keeps its REQUESTED width, so a row
+        # narrower than the column would not fill it and a row wider would be
+        # clipped rather than scrolled to.
+        self._canvas.itemconfigure(self._window, width=event.width)
+
+    def set_items(self, items):
+        """Rebuild the rows. `items` is [(key, label, checked, detail)]."""
+        for child in self._inner.winfo_children():
+            child.destroy()
+        self._vars, self._boxes = {}, {}
+        for key, label, checked, detail in items:
+            var = tk.BooleanVar(value=checked)
+            self._vars[key] = var
+            box = ttk.Checkbutton(self._inner, text=label, variable=var,
+                                  command=lambda k=key: self._toggled(k))
+            box.pack(anchor="w", fill="x")
+            self._boxes[key] = box
+            if detail:
+                ttk.Label(self._inner, text=detail, foreground="#777",
+                          font=("Segoe UI", 8), justify="left").pack(
+                              anchor="w", padx=(20, 0))
+        self._resize_scrollregion()
+
+    def _toggled(self, key):
+        self._on_toggle(key, bool(self._vars[key].get()))
+
+    def keys(self) -> list:
+        """The rows on offer, in order."""
+        return list(self._vars)
+
+    def checked(self) -> set:
+        """Which rows are ticked. The seam a gate reads instead of pixels."""
+        return {k for k, v in self._vars.items() if v.get()}
+
+    def invoke(self, key):
+        """Tick or untick a row the way a click does, callback and all.
+
+        The gate drives THIS rather than calling the window's methods, for
+        the reason #19 was opened: a check that bypasses the widget cannot
+        see a widget that is wired up wrongly.
+        """
+        self._boxes[key].invoke()
+        return bool(self._vars[key].get())
+
+
 _MODE_TOOLBAR = None
 
 
@@ -737,7 +821,7 @@ class ViewWindow(tk.Toplevel):
         # for 1150 px and expands, so packed first it took the lot and the list
         # was allocated 10 px and never mapped. A window had to be dragged
         # wider than this screen before the list appeared at all.
-        self._build_mark_list(body)
+        self._build_side_panel(body)
         left.pack(side="left", fill="both", expand=True)
 
         # The readout sits directly under the chart because it is read WHILE
@@ -769,25 +853,6 @@ class ViewWindow(tk.Toplevel):
             foreground="#B4531A" if self._marks_need_attention() else "#777")
         self.marks_label.pack(side="left")
 
-        # Borrowing. The dropdown offers only sets sharing EXACTLY ONE series
-        # with this pair -- see annotations.eligible_overlays for why that is
-        # the rule rather than "everything in the study".
-        controls = ttk.Frame(frame)
-        ttk.Label(controls, text="Show regions from another pair:").pack(side="left")
-        self.overlay_var = tk.StringVar()
-        self.overlay_box = ttk.Combobox(controls, textvariable=self.overlay_var,
-                                        state="readonly", width=62)
-        self.overlay_box.pack(side="left", padx=(6, 6))
-        self.overlay_btn = ttk.Button(controls, text="Show on chart",
-                                      command=self.prompt_overlay)
-        self.overlay_btn.pack(side="left")
-        self.remove_btn = ttk.Button(controls, text="Stop showing",
-                                     command=self.prompt_remove_overlay,
-                                     state="disabled")
-        self.remove_btn.pack(side="left", padx=(6, 0))
-        self.overlay_hint = ttk.Label(controls, foreground="#777", text="")
-        self.overlay_hint.pack(side="left", padx=(10, 0))
-
         # What is borrowed, and what of it is NOT drawn. Its own line rather
         # than appended to the marks note: the counts belong to different
         # pairs, and one sentence carrying both would attribute neither.
@@ -797,23 +862,20 @@ class ViewWindow(tk.Toplevel):
             foreground="#B4531A" if self._overlay_needs_attention() else "#777")
         self.overlay_label.pack(side="left")
 
-        # THE CONTROL GOES ABOVE THE CHART, not below it. It was at the very
-        # bottom, under three status lines, and it fitted the window by ten
-        # pixels -- which is not a layout, it is a coin toss, and it came up
-        # tails on a screen with a taskbar. Above the chart it cannot be
-        # pushed anywhere by anything, and it is the first thing seen rather
-        # than the last, which is the right order for the only control that
-        # brings another pair's regions onto this chart.
-        controls.pack(side="top", fill="x", pady=(0, 8))
-
         # The rest bottom-up, then the chart. See the note above `body`.
+        #
+        # The borrowing control USED TO BE A ROW HERE, packed above the chart
+        # to keep it off the bottom edge. It now lives in the side panel with
+        # the regions list, because both answer "what is on this chart" and
+        # because a checklist needs height that a single row cannot give it.
+        # The rule that put it above the chart still holds where it applies:
+        # the panel is packed before the chart for the same reason.
         borrowed.pack(side="bottom", fill="x", pady=(2, 0))
         marks.pack(side="bottom", fill="x", pady=(2, 0))
         note.pack(side="bottom", fill="x", pady=(8, 0))
         readout.pack(side="bottom", fill="x", pady=(6, 0))
         body.pack(side="top", fill="both", expand=True)
 
-        self._offer_ids = []
         self._refresh_overlay_controls()
 
         # NOTE the dialog is NOT raised here. A modal box opened during
@@ -839,10 +901,76 @@ class ViewWindow(tk.Toplevel):
 
     # ------------------------------------------------------------ mark list
 
-    def _build_mark_list(self, parent):
-        """Every occurrence on this pair, including the ones not drawn."""
+    def _build_side_panel(self, parent):
+        """The right-hand column: what CAN be shown, then what IS here.
+
+        One column, because both halves answer the same question -- what is
+        on this chart -- and in that order, because the control that brings
+        regions in belongs above the list of the regions it brings.
+
+        Packed before the chart by the caller. That is load-bearing; see the
+        note at the call site.
+        """
         right = ttk.Frame(parent, padding=(10, 0, 0, 0))
         right.pack(side="right", fill="y")
+        self._build_overlay_controls(right)
+        self._build_mark_list(right)
+
+    def _build_overlay_controls(self, parent):
+        """Tick a name to show every region saved under it on another pair.
+
+        A CHECKLIST, not a dropdown and two buttons. The old control offered
+        one set per line and acted on the CHART SELECTION rather than on the
+        line, so "Stop showing" was dead until you had clicked a borrowed
+        region -- and after zoom became a mode, dead until you had left the
+        mode too. A checkbox has no such gap: the thing you tick is the thing
+        that changes, and unticking it is how it comes off.
+        """
+        ttk.Label(parent, text="Regions from other pairs",
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        self.overlay_list = NameCheckList(parent, self._on_overlay_toggled)
+        self.overlay_list.pack(fill="x")
+        self.overlay_hint = ttk.Label(parent, foreground="#777", text="",
+                                      wraplength=330, justify="left")
+        self.overlay_hint.pack(anchor="w", pady=(2, 10))
+
+    def _on_overlay_toggled(self, name: str, checked: bool):
+        """A name was ticked or unticked. UI only; the rules are show/hide."""
+        # The ghost is fetched from the study's parquet on this thread. It is
+        # one series over one window and the frame is cached after the first
+        # read, but the first one is not instant, and a window that stops
+        # repainting with no explanation reads as a hang.
+        self.configure(cursor="watch")
+        self.update_idletasks()
+        try:
+            if checked:
+                group = self.show_name(name)
+                self.span_text.set(
+                    f"Showing “{group.name}”, marked on "
+                    f"{' and '.join(group.pair_texts)}. Its colour bar is "
+                    f"along the BOTTOM of each region, not the top.")
+            else:
+                self.hide_name(name)
+                self.span_text.set(
+                    f"Stopped showing “{name}”. Nothing was deleted — the "
+                    f"regions are still saved on their own pair.")
+        except Exception as exc:
+            messagebox.showerror("Could not show that set", str(exc),
+                                 parent=self)
+            self._refresh_overlay_controls()   # put the tick back
+            return
+        finally:
+            self.configure(cursor="")
+        # A key that no longer resolves gets a dialog, not only the note under
+        # the chart. The regions are drawn and attributed; what is missing is
+        # the line showing what the borrowed pair's other series was doing,
+        # and that absence is exactly what nobody would notice.
+        if checked:
+            self.report_ghost_problems()
+
+    def _build_mark_list(self, parent):
+        """Every occurrence on this pair, including the ones not drawn."""
+        right = parent
 
         # "in this view", not "on this pair": once a set can be borrowed from
         # another pair, the older heading would be a small lie about half the
@@ -1647,9 +1775,13 @@ class ViewWindow(tk.Toplevel):
             # Where it came from, on selection rather than only in the legend.
             # It is read-only here and the readout has to say so, or the first
             # thing anyone learns about the rule is that Delete did nothing.
+            # Says where it came from AND how to get rid of it. The removal
+            # used to be a button right here; now it is a tick in the panel,
+            # so the readout has to point at it or the gesture is invisible.
             text += (f"   ·   marked on {entry.markset.pair_text}, not on this "
                      f"pair, so it is read-only here — open that pair to "
-                     f"change it.")
+                     f"change it, or untick “{entry.markset.name}” under "
+                     f"“Regions from other pairs” to stop showing it.")
             return text
         if entry.patch is None:
             # Say why there is nothing to drag, rather than leaving someone
@@ -1871,100 +2003,54 @@ class ViewWindow(tk.Toplevel):
                 f"them. Open that pair to change it.")
 
     def _no_candidates_reason(self) -> str:
-        """Why the dropdown is empty. Never merely disabled and silent."""
+        """Why the checklist is empty. Never merely blank and silent."""
         if self.store is None:
             return "There is no study here to show regions from."
         return ("Nothing to show: no saved set in this study shares exactly one "
                 "series with this pair.")
 
+    def overlay_rows(self) -> list:
+        """[(name, label, ticked, detail)] for the checklist. The seam.
+
+        Built here rather than inside the widget so that what the list SAYS
+        can be asserted without reading a pixel, and so the widget stays a
+        widget: it is handed rows, and knows nothing about sets or pairs.
+        """
+        rows = []
+        for group in self.overlay_groups():
+            state = group.state(self.overlay_ids)
+            detail = " · ".join(group.pair_texts)
+            if state == "some":
+                # Never let a tick claim the whole name is on the chart when
+                # it is not. Reachable through the per-set seam, and silence
+                # here would be a chart disagreeing with its own controls.
+                on = sum(1 for i in group.set_ids if i in self.overlay_ids)
+                detail = f"{on} of {len(group.set_ids)} shown  ·  {detail}"
+            rows.append((group.name, group.offer_text, state != "none",
+                         detail))
+        return rows
+
     def _refresh_overlay_controls(self):
-        """Rebuild the dropdown from the candidates. Selection survives it.
+        """Rebuild the checklist from the candidates.
 
-        Kept by SET ID rather than by the displayed string, because the string
-        changes the moment a set goes on the chart -- and a selection that
-        silently moved to a different set would borrow one thing while the box
-        showed another.
+        Wholesale, and the ticks are recomputed from `overlay_ids` rather
+        than preserved from the widget: what is on the chart is the truth,
+        and a tick carried across a refresh could outlive the set it stood
+        for -- a set deleted from another window leaves the offer entirely.
         """
-        box = getattr(self, "overlay_box", None)
-        if box is None:
+        widget = getattr(self, "overlay_list", None)
+        if widget is None:
             return
-        was = self.overlay_choice()
-        self._offer_ids = [c.markset.set_id for c in self.candidates]
-        values = [c.offer_text + ("   ·   on chart"
-                                  if c.markset.set_id in self.overlay_ids
-                                  else "")
-                  for c in self.candidates]
-        box.configure(values=values)
-        if was in self._offer_ids:
-            box.current(self._offer_ids.index(was))
-        elif values:
-            box.current(0)
-        else:
-            self.overlay_var.set("")
-
-        live = "readonly" if values else "disabled"
-        box.configure(state=live)
-        self.overlay_btn.configure(state="normal" if values else "disabled")
+        rows = self.overlay_rows()
+        widget.set_items(rows)
         self.overlay_hint.configure(
-            text="" if values else self._no_candidates_reason())
-
-    def overlay_choice(self):
-        """The set id the dropdown is showing, or None. The seam under the UI."""
-        box = getattr(self, "overlay_box", None)
-        if box is None:
-            return None
-        i = box.current()
-        return self._offer_ids[i] if 0 <= i < len(self._offer_ids) else None
-
-    def prompt_overlay(self):
-        """Borrow whatever is chosen. UI only; the rule is in overlay()."""
-        set_id = self.overlay_choice()
-        if set_id is None:
-            return
-        # The ghost is fetched from the study's parquet on this thread. It is
-        # one series over one window and the frame is cached after the first
-        # read, but the first one is not instant, and a window that stops
-        # repainting with no explanation reads as a hang.
-        self.configure(cursor="watch")
-        self.update_idletasks()
-        try:
-            cand = self.overlay(set_id)
-        except Exception as exc:
-            messagebox.showerror("Could not show that set", str(exc),
-                                 parent=self)
-            return
-        finally:
-            self.configure(cursor="")
-        self.span_text.set(
-            f"Showing “{cand.markset.name}”, marked on {cand.markset.pair_text}. "
-            f"Its regions are bracketed, not shaded.")
-        # A key that no longer resolves gets a dialog, not only the note under
-        # the chart. The bands are drawn and attributed; what is missing is the
-        # line showing what the borrowed pair's other series was doing, and
-        # that absence is exactly what nobody would notice.
-        self.report_ghost_problems()
-
-    def prompt_remove_overlay(self):
-        """Stop borrowing the selected band's set. UI only.
-
-        Deliberately says that nothing was deleted. This button sits beside
-        Delete mark, acts on a band, and removes bands from the chart -- three
-        good reasons for someone to wonder whether their marks are gone.
-        """
-        entry = self.selected_band
-        if entry is None or not entry.is_foreign:
-            return
-        name, pair_text = entry.markset.name, entry.markset.pair_text
-        self.remove_overlay(entry.markset.set_id)
-        self.span_text.set(
-            f"Stopped showing “{name}” from {pair_text}. Nothing was "
-            f"deleted — the set is still saved on its own pair.")
+            text="" if rows else self._no_candidates_reason())
 
     def overlay(self, set_id: str):
         """Borrow a saved set onto this chart, and redraw. Returns its offer.
 
         The seam, matching commit_mark and delete_selected: the rule lives
-        here, and the dropdown above it only calls this. Eligibility is
+        here, and the checklist above it only calls this. Eligibility is
         re-checked rather than trusted from whatever the widget was showing --
         the offer may have been built before another window deleted the set.
         """
@@ -2143,18 +2229,20 @@ class ViewWindow(tk.Toplevel):
         self.span_text.set(f"Deleted an occurrence of “{name}”.")
 
     def _sync_delete_button(self):
-        """The buttons that act on a selection follow it. Exactly one applies:
-        a native mark can be deleted, a borrowed one can only be handed back."""
+        """Delete follows the selection: live only for a region of THIS pair.
+
+        There is no longer a second button beside it. "Stop showing" acted on
+        the selection too, which meant it was dead until a borrowed region
+        had been clicked -- the thing that made handing a set back feel
+        broken. Unticking its name in the panel does that now, and needs no
+        selection at all.
+        """
         entry = self.selected_band
         button = getattr(self, "delete_btn", None)
         if button is not None:
             live = (entry is not None and self.store is not None
                     and not entry.is_foreign)
             button.configure(state="normal" if live else "disabled")
-        remove = getattr(self, "remove_btn", None)
-        if remove is not None:
-            remove.configure(state="normal" if entry is not None
-                             and entry.is_foreign else "disabled")
 
     def select_interval(self, set_id: str, start_utc, end_utc):
         """Re-select an occurrence by VALUE after the bands were rebuilt."""
@@ -2538,9 +2626,8 @@ def _main(argv=None):
     # packed first, so an expanding chart packed first left every fixed-height
     # row below it unmapped, including the two lines that carry the counts
     # this feature promises to report.
-    furniture = {"overlay dropdown": win.overlay_box,
-                 "Overlay button": win.overlay_btn,
-                 "Remove button": win.remove_btn,
+    furniture = {"other-pairs checklist": win.overlay_list,
+                 "checklist hint": win.overlay_hint,
                  "Delete button": win.delete_btn,
                  "regions note": win.overlay_label,
                  "marks note": win.marks_label,
@@ -2657,16 +2744,23 @@ def _main(argv=None):
                    f"[{win.region_btn.winfo_width()} px]",
                    win.region_btn.winfo_width() >= icon.width()))
 
-    # The control that brings another pair's regions onto the chart sits ABOVE
-    # the chart. Below it, it was the last thing on a window it fitted by ten
-    # pixels, and the first thing to disappear on a shorter screen.
-    canvas_top = (win.canvas.get_tk_widget().winfo_rooty()
-                  - win.winfo_rooty())
-    control_top = win.overlay_box.winfo_rooty() - win.winfo_rooty()
-    checks.append((f"the 'regions from another pair' control is above the "
-                   f"chart, where nothing can push it off "
-                   f"[control at y={control_top}, chart at y={canvas_top}]",
-                   control_top < canvas_top))
+    # The control that brings another pair's regions in sits in the SIDE
+    # PANEL, above the list of regions it adds to. It used to be a row above
+    # the chart, which is where it went after being the last thing on a window
+    # it fitted by ten pixels; the panel is packed before the chart for that
+    # same reason, so it still cannot be pushed anywhere.
+    list_top = win.overlay_list.winfo_rooty() - win.winfo_rooty()
+    tree_top = win.mark_tree.winfo_rooty() - win.winfo_rooty()
+    checks.append((f"the other-pairs checklist is in the panel ABOVE the "
+                   f"regions list, so the control comes before what it "
+                   f"controls [checklist y={list_top}, list y={tree_top}]",
+                   0 < list_top < tree_top))
+    chart_right = (win.canvas.get_tk_widget().winfo_rootx()
+                   + win.canvas.get_tk_widget().winfo_width())
+    checks.append((f"and beside the chart rather than under it, so a shorter "
+                   f"window cannot cut it off [checklist x="
+                   f"{win.overlay_list.winfo_rootx() - win.winfo_rootx()}]",
+                   win.overlay_list.winfo_rootx() >= chart_right))
 
     expected = sk.zscore(res.data)
     drawn = win.plotted()
@@ -3707,54 +3801,112 @@ def _main(argv=None):
                        (tmp / f"{wl.markset.set_id}.json").read_bytes()
                        == borrowed_bytes))
 
-        # ---- the dropdown ----------------------------------------------------
-        offers = list(win.overlay_box.cget("values"))
-        checks.append((f"the dropdown offers exactly the eligible sets, each "
-                       f"naming its source pair {offers}",
-                       len(offers) == len(win.candidates) == 2
-                       and all(c.markset.name in o and c.markset.pair_text in o
-                               for c, o in zip(win.candidates, offers))))
-        checks.append((f"and marks the one already on the chart "
-                       f"[{[o[-9:] for o in offers if 'on chart' in o]}]",
-                       sum("on chart" in o for o in offers) == 1))
+        # ---- the checklist ---------------------------------------------------
+        # Driven through the WIDGET, not through show_name/hide_name. The
+        # seams are checked headless in annotations.py; what is left to
+        # establish here is that the boxes are wired to them, which is
+        # precisely what calling the seam by hand cannot see -- the lesson
+        # #19 was opened for.
+        rows = {name: (label, ticked, detail)
+                for name, label, ticked, detail in win.overlay_rows()}
+        checks.append((f"the checklist offers one row per NAME, not one per "
+                       f"set [{sorted(rows)}]",
+                       sorted(rows) == sorted({c.markset.name
+                                               for c in win.candidates})))
+        checks.append((f"each row counts its REGIONS and names its source "
+                       f"pair [{rows[wl.markset.name][0]}]",
+                       "region" in rows[wl.markset.name][0]
+                       and wl.markset.pair_text in rows[wl.markset.name][2]))
+        checks.append((f"and the one already on the chart is TICKED "
+                       f"[{sorted(win.overlay_list.checked())}]",
+                       win.overlay_list.checked() == {wl.markset.name}))
 
-        # Hand it back through the button, then borrow it again through the
-        # button, so the control is exercised and not only the seam under it.
-        win.select_band(next(b for b in win.bands if b.is_foreign))
-        checks.append(("Remove overlay is live only while a BORROWED band is "
-                       "selected",
-                       str(win.remove_btn.cget("state")) == "normal"))
-        win.prompt_remove_overlay()
-        checks.append((f"pressing it stops the borrowing and says nothing was "
-                       f"deleted [...{win.span_text.get()[-46:]}]",
+        # Untick it. No selection first, which is the entire point: the old
+        # control was dead until a borrowed region had been clicked.
+        win.select_band(None)
+        win.overlay_list.invoke(wl.markset.name)
+        checks.append((f"unticking a name with NOTHING selected stops showing "
+                       f"it, and says nothing was deleted "
+                       f"[...{win.span_text.get()[-46:]}]",
                        not [b for b in win.bands if b.is_foreign]
                        and "Nothing was deleted" in win.span_text.get()
                        and (tmp / f"{wl.markset.set_id}.json").exists()))
-        win.select_band(next(b for b in win.bands if not b.is_foreign))
-        checks.append(("and it is off again for a native mark, which is "
-                       "deleted rather than handed back",
-                       str(win.remove_btn.cget("state")) == "disabled"
-                       and str(win.delete_btn.cget("state")) == "normal"))
+        checks.append(("and the box is left unticked, so the panel agrees "
+                       "with the chart",
+                       wl.markset.name not in win.overlay_list.checked()))
 
-        win.overlay_box.current(win._offer_ids.index(wl.markset.set_id))
-        checks.append(("the choice resolves to a SET ID, not to the label the "
-                       "box happens to be showing",
-                       win.overlay_choice() == wl.markset.set_id))
-        win.prompt_overlay()
-        checks.append((f"pressing Overlay draws its bands "
+        win.overlay_list.invoke(wl.markset.name)
+        checks.append((f"ticking it again draws every region under that name "
                        f"[{len([b for b in win.bands if b.is_foreign])} "
                        f"borrowed]",
                        [b.markset.set_id for b in win.bands if b.is_foreign]
                        == [wl.markset.set_id] * 2))
+        checks.append(("Delete stays off for a borrowed region, which is "
+                       "handed back rather than deleted",
+                       win.select_band(next(b for b in win.bands
+                                            if b.is_foreign)) is not None
+                       and str(win.delete_btn.cget("state")) == "disabled"))
+        checks.append((f"and the readout says how to stop showing it, now "
+                       f"that no button does [...{win.span_text.get()[-38:]}]",
+                       "untick" in win.span_text.get()))
+        win.select_band(next(b for b in win.bands if not b.is_foreign))
+        checks.append(("while Delete is live for one of this pair's own",
+                       str(win.delete_btn.cget("state")) == "normal"))
+
+        # ---- one NAME, several sets ------------------------------------------
+        # The case the checklist exists for. "Internal tide" marked on two
+        # comparisons is two sets and one phenomenon, and the old dropdown
+        # offered them as two lines differing only in a trailing pair.
+        twins = ann.Store(tmp)
+        for partner, when in [(refs[0], idx[520]), (refs[1], idx[600])]:
+            twins.confirm(study_id=info.study_id,
+                          pair=(partner, foreign_ref), name="same phenomenon",
+                          reason="seen on two comparisons",
+                          start_utc=when, end_utc=when + dt.timedelta(hours=8))
+        win.redraw_marks()
+
+        twin_ids = {c.markset.set_id for c in win.candidates
+                    if c.markset.name == "same phenomenon"}
+        checks.append((f"two sets under one name are TWO sets in the store "
+                       f"[{len(twin_ids)}]", len(twin_ids) == 2))
+        twin_rows = [r for r in win.overlay_rows() if r[0] == "same phenomenon"]
+        checks.append((f"but ONE row in the checklist [{len(twin_rows)} row(s), "
+                       f"'{twin_rows[0][1] if twin_rows else ''}']",
+                       len(twin_rows) == 1))
+
+        win.overlay_list.invoke("same phenomenon")
+        drawn_ids = {b.markset.set_id for b in win.bands if b.is_foreign}
+        checks.append((f"and ticking it draws EVERY set under that name, not "
+                       f"whichever sorted first [{len(twin_ids & drawn_ids)} "
+                       f"of {len(twin_ids)}]",
+                       twin_ids <= drawn_ids))
+
+        win.overlay_list.invoke("same phenomenon")
+        left_over = {b.markset.set_id for b in win.bands if b.is_foreign}
+        checks.append((f"unticking takes all of them off, leaving no remnant "
+                       f"behind an unticked box [{len(twin_ids & left_over)} "
+                       f"left]", not (twin_ids & left_over)))
+
+        # The half-shown case. Reachable because the per-set seam is still
+        # there, and a tick that claimed the whole name was on the chart
+        # would be a control disagreeing with the chart it drives.
+        win.overlay(sorted(twin_ids)[0])
+        half = next(r for r in win.overlay_rows() if r[0] == "same phenomenon")
+        checks.append((f"with only one of the two borrowed, the row SAYS SO "
+                       f"rather than claiming the name is shown [{half[3]}]",
+                       half[2] and "1 of 2 shown" in half[3]))
+        win.hide_name("same phenomenon")
+        checks.append(("and unticking a half-shown name clears the remnant",
+                       not [b for b in win.bands
+                            if b.markset.set_id in twin_ids]))
 
         bare = ViewWindow(root_tk, res, study=info,
                           annotations_dir=tmp / "no-sets-here")
         bare.update_idletasks()
         hint = str(bare.overlay_hint.cget("text"))
-        checks.append((f"with nothing eligible the control is disabled and "
-                       f"SAYS WHY [{hint}]",
-                       str(bare.overlay_box.cget("state")) == "disabled"
-                       and str(bare.overlay_btn.cget("state")) == "disabled"
+        checks.append((f"with nothing eligible the list is empty and SAYS WHY "
+                       f"[{hint}]",
+                       not bare.overlay_list.keys()
                        and "exactly one series" in hint))
         bare.destroy()
 

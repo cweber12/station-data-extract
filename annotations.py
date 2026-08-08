@@ -445,17 +445,6 @@ class Candidate:
     shared: SeriesRef
     foreign: SeriesRef
 
-    @property
-    def offer_text(self) -> str:
-        """What the dropdown shows. The source pair is part of the offer.
-
-        Naming the pair here rather than only in the legend means the choice is
-        made knowing what is being borrowed, not just its name -- two sets can
-        share a name across different pairs, and "internal tide" alone would
-        not say which comparison it was drawn from.
-        """
-        return f"{self.markset.name}  —  {self.markset.pair_text}"
-
 
 @dataclass(frozen=True)
 class NameGroup:
@@ -1297,11 +1286,10 @@ def _main(argv=None):
         ok("a set from another study is not offered, however well its keys "
            "match",
            not any(c.markset.name == "other study" for c in offered))
-        ok(f"the offer names the source pair, not just the set "
-           f"[{offered[0].offer_text if offered else ''}]",
-           bool(offered) and water.label in offered[0].offer_text
-           and temp_ljac1.label in offered[0].offer_text
-           and "water level" in offered[0].offer_text)
+        ok(f"an offer carries the source pair, which is what names it to a "
+           f"reader [{offered[0].markset.pair_text if offered else ''}]",
+           bool(offered) and water.label in offered[0].markset.pair_text
+           and temp_ljac1.label in offered[0].markset.pair_text)
 
         # ---- grouping the offers by NAME ------------------------------------
         # Headless on purpose. This is the rule behind the control that shows
