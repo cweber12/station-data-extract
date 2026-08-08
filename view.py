@@ -125,6 +125,11 @@ Z_REGION_BAR = 0.7
 Z_GHOST = 1.5
 Z_SERIES = 2.0
 
+# How far one notch of the wheel changes the span, and how long the wheel has
+# to be still before where it came to rest is recorded for Back.
+WHEEL_STEP = 1.2
+VIEW_PUSH_DELAY_MS = 350
+
 # The ghost's grey answers to REGION_ALPHA and must be re-chosen with it. At a
 # 40% fill the region rendered about #999999 and NO grey worked: light vanished
 # inside the region, dark vanished against the white outside it. An opaque
@@ -525,6 +530,57 @@ def _add_tooltip(widget, text):
     widget.bind("<ButtonPress>", hide)
 
 
+def zoom_x(xlim, at_x, factor, window, min_span=None):
+    """A new x range, zoomed about `at_x` by `factor`, clamped to `window`.
+
+    Pure, and here rather than in the store because it describes an AXIS,
+    not an annotation -- and `annotations.py` imports nothing outside the
+    standard library and has no reason to learn what a view is. Pure so that
+    the arithmetic can be checked without a window: the parts of this that
+    are easy to get wrong are all arithmetic.
+
+    `factor` multiplies the SPAN. Below 1 zooms in, above 1 zooms out.
+
+    THE INSTANT UNDER THE CURSOR STAYS UNDER THE CURSOR. That is what makes
+    a wheel feel like a wheel: the span shrinks about the thing being
+    pointed at rather than about the middle of the frame, so the feature
+    being examined does not slide away while it is examined.
+
+    Clamped so it can never show more than the window that was built. There
+    is nothing out there -- the series stop -- and a frame wider than the
+    data reads as measurements that are missing rather than absent.
+
+    `min_span` is the floor, supplied by the caller because how far in is
+    far enough is a fact about the SAMPLES, and an axis has no idea how
+    often the instrument reported.
+
+    Returns the range unchanged when there is nothing to do, so a caller can
+    compare and skip a repaint.
+    """
+    lo, hi = float(xlim[0]), float(xlim[1])
+    wlo, whi = float(window[0]), float(window[1])
+    if not hi > lo or not whi > wlo:
+        return (lo, hi)                 # degenerate; nothing sane to return
+
+    full = whi - wlo
+    span = (hi - lo) * float(factor)
+    span = min(span, full)
+    if min_span is not None:
+        span = max(span, min(float(min_span), full))
+
+    # The fraction of the frame the cursor sits at, preserved exactly. Held
+    # against the CURRENT range, and the cursor clamped into it, so a stray
+    # coordinate from outside the axes cannot fling the view somewhere.
+    at_x = min(max(float(at_x), lo), hi)
+    frac = (at_x - lo) / (hi - lo)
+    new_lo = at_x - frac * span
+
+    # SLIDE back inside the window, never squeeze: hitting an edge should
+    # cost you the position, not the magnification you just chose.
+    new_lo = min(max(new_lo, wlo), whi - span)
+    return (new_lo, new_lo + span)
+
+
 class NameCheckList(ttk.Frame):
     """A scrolling column of checkboxes, one per name.
 
@@ -815,6 +871,7 @@ class ViewWindow(tk.Toplevel):
         self.region_btn.pack(side="left", padx=(8, 0), pady=2, **where)
 
         canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._install_wheel_zoom()
 
         # The list claims its width, then the chart takes the rest. The same
         # rule as the rows below, and the same bug it prevents: the figure asks
@@ -1525,6 +1582,94 @@ class ViewWindow(tk.Toplevel):
         # outgrows its margin walks off the bottom of the figure unremarked.
         self.figure.subplots_adjust(
             bottom=min(0.50, max(0.28, 0.14 + 0.07 * rows)))
+
+    # ------------------------------------------------------------ the view
+    # Zoom is how you LOOK at the chart. Nothing here changes what is on it,
+    # which is why none of it consults Region mode or the store.
+
+    def _install_wheel_zoom(self):
+        """The wheel zooms the time axis. Connected once, at build."""
+        self._view_push_id = None
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+
+    def _min_span(self) -> float:
+        """How far in is far enough: about five samples.
+
+        A fact about the DATA, which is why `zoom_x` is told rather than
+        deciding. Without a floor the span converges on zero, and a frame
+        narrower than the gap between two readings shows a single sample
+        and a lot of white.
+        """
+        if len(self._xnum) < 2:
+            return 0.0
+        return float(np.median(np.diff(self._xnum))) * 5
+
+    def _on_scroll(self, event):
+        """Zoom the TIME axis about the cursor.
+
+        Not gated on Region mode. Zooming is how the chart is read, not a
+        way of changing it, and a wheel that stopped working while Zoom or
+        Pan happened to be engaged would be dead for no reason anyone could
+        see -- which is the fault this window has already been fixed for
+        once.
+
+        The Y SCALE IS LEFT ALONE, deliberately. It is set by the data plus
+        any ghost line, and a stray scroll moving it would look exactly like
+        the frame-wandering bug that #18 exists to remove.
+        """
+        ax = self.figure.axes[0]
+        if event.inaxes is not ax or event.xdata is None or not event.step:
+            return
+        # step is positive away from the user, which is zoom IN, which is a
+        # span multiplier below one.
+        factor = WHEEL_STEP ** (-float(event.step))
+        before = ax.get_xlim()
+        after = zoom_x(before, event.xdata, factor, self._window_xlim,
+                       min_span=self._min_span())
+        if after == tuple(before):
+            return
+        ax.set_xlim(after)
+        self.canvas.draw_idle()
+        self._schedule_view_push()
+
+    def _schedule_view_push(self):
+        """Record the view for Back, ONCE per burst of scrolling.
+
+        A wheel gesture is a dozen notches. Pushing each would make Back a
+        dozen presses to undo one motion, so the push waits until the wheel
+        has been still for a moment and then records where it came to rest
+        -- which is what matplotlib's own zoom does on release.
+
+        Tk only: `after` and `after_cancel` are Tk calls and this runs on
+        the main thread, where scroll events are delivered.
+        """
+        if self._view_push_id is not None:
+            self.after_cancel(self._view_push_id)
+        self._view_push_id = self.after(VIEW_PUSH_DELAY_MS, self.push_view)
+
+    def push_view(self):
+        """Put the current view on the toolbar's history, so Back returns.
+
+        Public because it is the end of the debounce, and a gate that had to
+        wait out a timer to find out whether anything was recorded would be
+        a gate that sometimes waited badly.
+
+        CANCELS the pending timer rather than only forgetting it. Clearing
+        the id alone left the `after` still scheduled, so calling this
+        directly recorded the view now AND again when the stale callback
+        fired -- two entries for one gesture, and a Back that went half way.
+        It showed up as a gate that passed and then did not.
+        """
+        pending, self._view_push_id = getattr(self, "_view_push_id", None), None
+        if pending is not None:
+            self.after_cancel(pending)
+        toolbar = getattr(self, "toolbar", None)
+        if toolbar is not None:
+            toolbar.push_current()
+
+    def view_push_pending(self) -> bool:
+        """Is a push still waiting on the wheel going quiet?"""
+        return getattr(self, "_view_push_id", None) is not None
 
     # ----------------------------------------------------------- region mode
 
@@ -2441,6 +2586,12 @@ class ViewWindow(tk.Toplevel):
         # it is handed back. Recomputing it later from the lines would include
         # whatever else has since been drawn.
         self._series_ylim = ax.get_ylim()
+        # And the x range as built, which is the limit the wheel zooms out to.
+        # Taken here rather than from `_xnum` because the axis is framed a
+        # little wider than the data, and zooming out to the data would shave
+        # that margin off on the first scroll -- a view that quietly differs
+        # from the one the window opened at.
+        self._window_xlim = ax.get_xlim()
 
         # The legend is built by _refresh_legend once the mark bands exist, so
         # that sets are named alongside the series rather than in a second
@@ -3568,6 +3719,118 @@ def _main(argv=None):
                        f"redraw [{lo:.0f}..{hi:.0f} vs data {first:.0f}.."
                        f"{last:.0f}]",
                        lo > first - 5 and hi < last + 5))
+
+        # ---- zoom_x, the arithmetic, with no window in the way --------------
+        # Every part of a wheel zoom that is easy to get wrong is arithmetic,
+        # so it is a pure function and it is checked as one. The gesture
+        # itself is driven through real scroll events further down.
+        WIN = (100.0, 200.0)
+        start = (100.0, 200.0)
+
+        halved = zoom_x(start, 150.0, 0.5, WIN)
+        checks.append((f"zooming in halves the span [{halved}]",
+                       abs((halved[1] - halved[0]) - 50.0) < 1e-9))
+        back_out = zoom_x(halved, 150.0, 2.0, WIN)
+        checks.append((f"and zooming out by the reciprocal returns EXACTLY "
+                       f"where it started [{back_out} vs {start}]",
+                       all(abs(a - b) < 1e-9
+                           for a, b in zip(back_out, start))))
+
+        # The property that makes a wheel feel like a wheel.
+        off_centre = 120.0
+        z = zoom_x(start, off_centre, 0.4, WIN)
+        was = (off_centre - start[0]) / (start[1] - start[0])
+        now = (off_centre - z[0]) / (z[1] - z[0])
+        checks.append((f"the instant under the CURSOR stays under the cursor, "
+                       f"not the middle of the frame [{was:.4f} -> {now:.4f}]",
+                       abs(was - now) < 1e-9))
+
+        wide = zoom_x((140.0, 160.0), 150.0, 100.0, WIN)
+        checks.append((f"zooming out is clamped to the window that was built, "
+                       f"never past the data [{wide}]",
+                       wide == (100.0, 200.0)))
+
+        # Sliding, not squeezing, at an edge: the magnification just chosen
+        # survives, and only the position gives way.
+        edge = zoom_x((100.0, 120.0), 101.0, 2.0, WIN)
+        checks.append((f"at the window edge the span asked for is kept and the "
+                       f"view SLIDES inside it [{edge}]",
+                       abs((edge[1] - edge[0]) - 40.0) < 1e-9
+                       and edge[0] >= WIN[0] - 1e-9
+                       and edge[1] <= WIN[1] + 1e-9))
+
+        floored = zoom_x(start, 150.0, 1e-6, WIN, min_span=4.0)
+        checks.append((f"zooming in stops at the floor the caller sets, so the "
+                       f"span cannot converge on zero [{floored}]",
+                       abs((floored[1] - floored[0]) - 4.0) < 1e-9))
+        checks.append(("a degenerate range is returned untouched rather than "
+                       "producing a NaN frame",
+                       zoom_x((5.0, 5.0), 5.0, 0.5, WIN) == (5.0, 5.0)))
+        checks.append((f"and the floor never exceeds the window itself "
+                       f"[{zoom_x(start, 150.0, 0.1, WIN, min_span=1e9)}]",
+                       zoom_x(start, 150.0, 0.1, WIN, min_span=1e9) == WIN))
+
+        # ---- the wheel, through real scroll events --------------------------
+        from matplotlib.backend_bases import MouseEvent as _ME
+        axz = win.figure.axes[0]
+        win.figure.axes[0].set_xlim(win._window_xlim)
+        home_x = axz.get_xlim()
+        home_y = axz.get_ylim()
+
+        def scroll(at_x, step):
+            px, py = axz.transData.transform((at_x, 0.0))
+            win.canvas.callbacks.process(
+                "scroll_event",
+                _ME("scroll_event", win.canvas, int(px), int(py), step=step))
+
+        target = (home_x[0] + home_x[1]) / 2
+        scroll(target, 1)
+        after_one = axz.get_xlim()
+        checks.append((f"a real scroll UP narrows the time axis "
+                       f"[{home_x[1] - home_x[0]:.2f} -> "
+                       f"{after_one[1] - after_one[0]:.2f} days]",
+                       (after_one[1] - after_one[0])
+                       < (home_x[1] - home_x[0]) - 1e-9))
+        checks.append((f"and leaves the Y scale exactly alone -- a stray "
+                       f"scroll must not move the frame [{axz.get_ylim()}]",
+                       axz.get_ylim() == home_y))
+
+        for _ in range(6):
+            scroll(target, -1)
+        checks.append((f"scrolling back out is clamped at the built window, so "
+                       f"it cannot show emptiness beyond the data "
+                       f"[{axz.get_xlim()} vs {home_x}]",
+                       all(abs(a - b) < 1e-9
+                           for a, b in zip(axz.get_xlim(), home_x))))
+
+        # ---- Back undoes a whole gesture, not one notch of it ---------------
+        win.push_view()                       # settle anything outstanding
+        before_burst = axz.get_xlim()
+        for _ in range(5):
+            scroll(target, 1)
+        checks.append(("a burst of scrolling leaves the push PENDING rather "
+                       "than recording each notch", win.view_push_pending()))
+        zoomed_to = axz.get_xlim()
+
+        # Wait out the debounce the way the app does -- by letting Tk run --
+        # but BOUNDED, so a timer that never fires fails the gate instead of
+        # hanging it. A gate that hangs reads as a slow machine.
+        import time as _time
+        deadline = _time.monotonic() + 5.0
+        while win.view_push_pending() and _time.monotonic() < deadline:
+            win.update()
+            _time.sleep(0.02)
+        checks.append((f"and records the resting view once the wheel goes "
+                       f"quiet [pending={win.view_push_pending()}]",
+                       not win.view_push_pending()))
+
+        win.toolbar.back()
+        checks.append((f"so ONE Back undoes the whole gesture, not five "
+                       f"[{axz.get_xlim()} vs {before_burst}]",
+                       all(abs(a - b) < 1e-9
+                           for a, b in zip(axz.get_xlim(), before_burst))
+                       and axz.get_xlim() != zoomed_to))
+        axz.set_xlim(win._window_xlim)
 
         colors = {p.get_facecolor()[:3] for p in spans}
         series_rgb = {tuple(round(int(c[i:i + 2], 16) / 255, 6)
