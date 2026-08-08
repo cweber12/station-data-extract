@@ -581,6 +581,43 @@ def zoom_x(xlim, at_x, factor, window, min_span=None):
     return (new_lo, new_lo + span)
 
 
+def pan_to(interval, xlim, window):
+    """A new x range showing `interval`, AT THE SAME SPAN. Pure.
+
+    Travelling to a region must not silently re-magnify it. Two regions of
+    different lengths viewed at whatever scale each happened to need cannot
+    be compared, which is the same reason the PDF export fixes its scale --
+    so this pans and never zooms, and if the region does not fit you scroll
+    out yourself. That is why the wheel had to come first: without it there
+    is no zoom-out control to scroll with.
+
+    Returns `xlim` unchanged when the region is ALREADY fully in view, so
+    clicking a region on the chart cannot make the chart move under the
+    click. The caller compares and skips the repaint.
+
+    A region wider than the current span is centred rather than fitted --
+    fitting it would be the rescale this refuses to do.
+    """
+    lo, hi = float(xlim[0]), float(xlim[1])
+    wlo, whi = float(window[0]), float(window[1])
+    a, b = sorted((float(interval[0]), float(interval[1])))
+    if not hi > lo:
+        return (lo, hi)
+    if a >= lo and b <= hi:
+        return (lo, hi)                 # already there; do not move
+
+    span = hi - lo
+    new_lo = (a + b) / 2 - span / 2
+
+    # Clamp against the built window, keeping the span exactly. Only when the
+    # window can hold it: a span wider than the window itself means the view
+    # is already showing everything there is, and forcing it inside would
+    # shrink the frame as a side effect of a jump.
+    if whi - wlo >= span:
+        new_lo = min(max(new_lo, wlo), whi - span)
+    return (new_lo, new_lo + span)
+
+
 class NameCheckList(ttk.Frame):
     """A scrolling column of checkboxes, one per name.
 
@@ -1906,11 +1943,46 @@ class ViewWindow(tk.Toplevel):
                                  self._to_num(shown.end_utc))
         self.selection = (entry.interval.start_utc, entry.interval.end_utc)
         self._selected_indices = self._indices_for(shown)
-        self.span_text.set(self._selected_summary(entry))
+        travelled = self._pan_to_selection(entry)
+        self.span_text.set(self._selected_summary(entry, travelled=travelled))
         self.canvas.draw_idle()
         return entry
 
-    def _selected_summary(self, entry) -> str:
+    def _pan_to_selection(self, entry) -> bool:
+        """Bring the selected region into view. True if the view moved.
+
+        Only ever pans -- see `pan_to`. A region already on screen does not
+        move the chart, so clicking one cannot shift it under the click.
+
+        Nothing happens for a region OUTSIDE THE BUILT WINDOW. There is
+        nowhere to travel to: it is not drawn because the data does not
+        reach it, and the readout says to rebuild wider instead. That is the
+        distinction between outside-the-view and outside-the-window, made
+        where it matters rather than in a label.
+        """
+        if entry is None or entry.patch is None:
+            return False
+        ax = self.figure.axes[0]
+        shown = entry.drawn or entry.interval
+        before = tuple(ax.get_xlim())
+        after = pan_to((self._to_num(shown.start_utc),
+                        self._to_num(shown.end_utc)),
+                       before, self._window_xlim)
+        if after == before:
+            return False
+        # Record where the wheel left off BEFORE moving, or a jump made
+        # during a scroll burst would swallow the view it interrupted --
+        # push_view cancels the pending timer, so this is the only chance to
+        # keep it. Only when one is pending: pushing an unchanged view twice
+        # puts two identical entries on the stack, and a Back that appears
+        # to do nothing.
+        if self.view_push_pending():
+            self.push_view()
+        ax.set_xlim(after)
+        self.push_view()          # and where the jump landed, so Back returns
+        return True
+
+    def _selected_summary(self, entry, travelled: bool = False) -> str:
         iv = entry.interval
         text = (f"Selected “{entry.markset.name}”:  "
                 f"{ann.local_text(iv.start_utc)}  →  "
@@ -1930,9 +2002,18 @@ class ViewWindow(tk.Toplevel):
             return text
         if entry.patch is None:
             # Say why there is nothing to drag, rather than leaving someone
-            # hunting for handles that cannot exist.
+            # hunting for handles that cannot exist. This is also the half of
+            # story 16 that a jump cannot answer: outside the WINDOW means
+            # rebuild, where outside the VIEW just means travel, and the
+            # travel already happened.
             text += ("   ·   outside this window, so it is not drawn: it can "
                      "be deleted, but adjusting means rebuilding wider.")
+        elif travelled:
+            # Say the chart moved. A frame that jumps with no explanation is
+            # the thing this window has been repeatedly fixed for; a frame
+            # that jumps and says why is navigation.
+            text += ("   ·   scrolled to bring it into view, at the same "
+                     "scale — press Back to return.")
         return text
 
     def _restyle_bands(self):
@@ -3770,6 +3851,43 @@ def _main(argv=None):
                        f"[{zoom_x(start, 150.0, 0.1, WIN, min_span=1e9)}]",
                        zoom_x(start, 150.0, 0.1, WIN, min_span=1e9) == WIN))
 
+        # ---- pan_to, the arithmetic ------------------------------------------
+        view = (150.0, 170.0)                 # a 20-wide view inside WIN
+        checks.append((f"a region already in view does not move the chart, so "
+                       f"clicking one cannot shift it under the click "
+                       f"[{pan_to((155.0, 160.0), view, WIN)}]",
+                       pan_to((155.0, 160.0), view, WIN) == view))
+        checks.append(("nor does one touching the very edges of the view",
+                       pan_to((150.0, 170.0), view, WIN) == view))
+
+        # Far enough from the window edge that centring is actually possible;
+        # nearer than half a span and the clamp below is what applies, which
+        # is a different check and was briefly conflated with this one.
+        jumped = pan_to((120.0, 124.0), view, WIN)
+        checks.append((f"a region outside it is CENTRED [{jumped}]",
+                       abs(((jumped[0] + jumped[1]) / 2) - 122.0) < 1e-9))
+        checks.append((f"at exactly the same span -- travelling never "
+                       f"re-magnifies [{jumped[1] - jumped[0]:.6f} vs "
+                       f"{view[1] - view[0]:.6f}]",
+                       abs((jumped[1] - jumped[0])
+                           - (view[1] - view[0])) < 1e-9))
+
+        at_edge = pan_to((100.0, 101.0), view, WIN)
+        checks.append((f"and clamped at the window edge, still at that span "
+                       f"[{at_edge}]",
+                       at_edge[0] >= WIN[0] - 1e-9
+                       and abs((at_edge[1] - at_edge[0]) - 20.0) < 1e-9))
+
+        # Wider than the frame: centred, NOT fitted. Fitting would be the
+        # rescale this refuses to do.
+        big = pan_to((110.0, 190.0), view, WIN)
+        checks.append((f"a region wider than the frame is centred rather than "
+                       f"fitted [{big}]",
+                       abs((big[1] - big[0]) - 20.0) < 1e-9
+                       and abs(((big[0] + big[1]) / 2) - 150.0) < 1e-9))
+        checks.append(("a degenerate view is returned untouched",
+                       pan_to((1.0, 2.0), (5.0, 5.0), WIN) == (5.0, 5.0)))
+
         # ---- the wheel, through real scroll events --------------------------
         from matplotlib.backend_bases import MouseEvent as _ME
         axz = win.figure.axes[0]
@@ -3830,6 +3948,101 @@ def _main(argv=None):
                        all(abs(a - b) < 1e-9
                            for a, b in zip(axz.get_xlim(), before_burst))
                        and axz.get_xlim() != zoomed_to))
+        axz.set_xlim(win._window_xlim)
+
+        # ---- travelling to a region, through the real list -------------------
+        # The payoff: a region outside the current view was selectable and
+        # then invisible. Driven by ticking the row through Tk, not by
+        # calling select_band, so the path a person uses is the path checked.
+        win.push_view()
+        drawn_here = [o for o in win.occurrences
+                      if o.patch is not None and not o.is_foreign]
+        far_right = max(drawn_here, key=lambda o: o.patch.get_x())
+        near_left = min(drawn_here, key=lambda o: o.patch.get_x())
+
+        # Zoom into the LEFT end, so the right-hand region is off screen.
+        left_edge = win._window_xlim[0]
+        narrow = (left_edge, left_edge
+                  + (win._window_xlim[1] - win._window_xlim[0]) / 6)
+        axz.set_xlim(narrow)
+        win.push_view()
+        span_before = narrow[1] - narrow[0]
+        target_x = far_right.patch.get_x()
+        checks.append((f"with the view zoomed to one end, a region at the "
+                       f"other is genuinely off screen [{target_x:.0f} not in "
+                       f"{narrow[0]:.0f}..{narrow[1]:.0f}]",
+                       not narrow[0] <= target_x <= narrow[1]))
+
+        row_for_far = next(r for r in win._row_for
+                           if win._row_for[r] is far_right)
+        pick_row(row_for_far)
+        after_jump = axz.get_xlim()
+        checks.append((f"selecting it in the list TRAVELS to it "
+                       f"[{after_jump[0]:.0f}..{after_jump[1]:.0f}]",
+                       after_jump[0] <= target_x <= after_jump[1]))
+        checks.append((f"at the scale that was chosen, not re-magnified "
+                       f"[{after_jump[1] - after_jump[0]:.6f} vs "
+                       f"{span_before:.6f}]",
+                       abs((after_jump[1] - after_jump[0])
+                           - span_before) < 1e-6))
+        checks.append((f"and says the chart moved, rather than jumping in "
+                       f"silence [...{win.span_text.get()[-42:]}]",
+                       "Back to return" in win.span_text.get()))
+
+        win.toolbar.back()
+        checks.append((f"Back returns to where the jump started, so "
+                       f"travelling is safe to try [{axz.get_xlim()} vs "
+                       f"{narrow}]",
+                       all(abs(a - b) < 1e-6
+                           for a, b in zip(axz.get_xlim(), narrow))))
+
+        # A region already on screen must NOT move the chart.
+        #
+        # Asserted from a view that CONTAINS the region OFF-CENTRE, which is
+        # the only arrangement that can see the mistake. At full-window zoom
+        # a recentre clamps straight back to the same frame, so this check
+        # passed with the short-circuit deliberately deleted -- it was
+        # measuring the clamp, not the thing it names.
+        wlo, whi = win._window_xlim
+        r0 = near_left.patch.get_x()
+        r1 = r0 + near_left.patch.get_width()
+        pad = (whi - wlo) / 10
+        contains = (max(r0 - pad * 0.25, wlo), min(r1 + pad * 2.0, whi))
+        axz.set_xlim(contains)
+        win.push_view()
+        steady = tuple(axz.get_xlim())
+        checks.append((f"the region sits INSIDE that view but off centre, so "
+                       f"a needless recentre would show "
+                       f"[{steady[0]:.2f}..{steady[1]:.2f}]",
+                       steady[0] <= r0 and r1 <= steady[1]
+                       and abs(((r0 + r1) / 2)
+                               - ((steady[0] + steady[1]) / 2)) > 1e-6))
+        pick_row(next(r for r in win._row_for
+                      if win._row_for[r] is near_left))
+        checks.append((f"selecting a region already in view leaves the chart "
+                       f"exactly where it was [{axz.get_xlim()} vs {steady}]",
+                       tuple(axz.get_xlim()) == steady))
+        checks.append(("and does not claim to have scrolled",
+                       "Back to return" not in win.span_text.get()))
+
+        # The other half of story 16: outside the WINDOW is not a jump, it is
+        # a rebuild, and nothing to travel to.
+        off_window = next((o for o in win.occurrences if o.patch is None), None)
+        if off_window is None:
+            checks.append(("a region outside the built window exists to "
+                           "check against", False))
+        else:
+            held = tuple(axz.get_xlim())
+            pick_row(next(r for r in win._row_for
+                          if win._row_for[r] is off_window))
+            checks.append((f"a region outside the BUILT WINDOW does not move "
+                           f"the chart -- there is nowhere to travel to "
+                           f"[{axz.get_xlim()} vs {held}]",
+                           tuple(axz.get_xlim()) == held))
+            checks.append((f"and says to rebuild wider instead of offering a "
+                           f"jump [...{win.span_text.get()[-40:]}]",
+                           "rebuilding wider" in win.span_text.get()
+                           and "Back to return" not in win.span_text.get()))
         axz.set_xlim(win._window_xlim)
 
         colors = {p.get_facecolor()[:3] for p in spans}
