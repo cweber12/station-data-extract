@@ -378,6 +378,150 @@ class MarkDialog(tk.Toplevel):
         return self.result_value
 
 
+def _stock_icon_stats(master=None):
+    """Canvas size, palette and ink weight of matplotlib's own toolbar icons.
+
+    Gate support, so "cohesive with the other icons" is a measurement rather
+    than an opinion. Read through `tk.PhotoImage`, which handles PNG in Tk 8.6
+    and is the same reader the button itself uses -- no Pillow, and no second
+    notion of what a pixel is.
+
+    `cbook._get_data_path` is private. Fine HERE: a gate that breaks when
+    matplotlib moves its icons is a gate reporting something true.
+    """
+    from matplotlib import cbook
+    import pathlib
+    folder = pathlib.Path(str(cbook._get_data_path("images")))
+    sizes, colours, weights = set(), set(), []
+    for name in ("home.png", "move.png", "zoom_to_rect.png", "filesave.png"):
+        img = tk.PhotoImage(master=master, file=str(folder / name))
+        sizes.add((img.width(), img.height()))
+        n = 0
+        for x in range(img.width()):
+            for y in range(img.height()):
+                if not img.transparency_get(x, y):
+                    colours.add(img.get(x, y))
+                    n += 1
+        weights.append(n)
+    return {"size": sizes.pop() if len(sizes) == 1 else None,
+            "colours": colours, "low": min(weights), "high": max(weights)}
+
+
+def _region_icon(master):
+    """A 20x20 marquee over a trace: "select a span of this chart".
+
+    DRAWN, not shipped. matplotlib resolves its own toolbar icons through the
+    private `cbook._get_data_path`, and a PNG committed here would be the one
+    file in this repo whose content cannot be read in a diff -- an icon that
+    nobody can review is an icon nobody can correct.
+
+    A fresh PhotoImage is fully transparent, so only the inked pixels are set
+    and the button's own background shows through in any theme. The caller
+    must keep the returned image alive: Tk drops an image the moment its last
+    Python reference goes, and the button then renders empty.
+    """
+    # Matched to its neighbours, which is the whole point of an icon here:
+    # matplotlib's are 24x24 PURE BLACK silhouettes of about 220 inked pixels
+    # -- solid shapes, no outlines, no second colour. A two-tone 20x20 badge
+    # sat in that row looking like something from another program.
+    ink = "#000000"
+    size = 24
+    img = tk.PhotoImage(master=master, width=size, height=size)
+
+    # The icon IS a region: the colour bar, then the block under it. It
+    # previews its own result, which is the most a 24 px glyph can do.
+    #
+    # Vertical because a region is a span of time and nothing else -- a square
+    # would imply the y range is part of the claim, which CONTEXT.md is at
+    # pains to deny.
+    #
+    # Two solid shapes and a gap, and nothing overlapping. A trace crossing
+    # the block was tried twice: with one colour it has to be knocked out of
+    # the block as negative space, and at this size the knockout either
+    # vanishes at 2 px or severs the block at 3 px. Neighbouring glyphs are
+    # single silhouettes for the same reason.
+    # Width chosen to land inside the stock icons' ink weight (228-284 px);
+    # at ten columns this read visibly lighter than everything beside it.
+    x0, x1 = 6, 17
+    for x in range(x0, x1 + 1):
+        for y in range(2, 5):                     # the colour bar, on top
+            img.put(ink, to=(x, y))
+        for y in range(7, 22):                    # the region under it
+            img.put(ink, to=(x, y))
+    return img
+
+
+def _add_tooltip(widget, text):
+    """A hover label, because an unlabelled icon says nothing on its own.
+
+    matplotlib gives every one of its own toolbar buttons a tooltip, so a
+    neighbour without one is the odd button out. Written here rather than
+    imported from `matplotlib.backends._backend_tk`, which is private.
+    """
+    state = {"tip": None}
+
+    def show(_event=None):
+        if state["tip"] is not None:
+            return
+        tip = tk.Toplevel(widget)
+        tip.wm_overrideredirect(True)
+        tk.Label(tip, text=text, justify="left", relief="solid", borderwidth=1,
+                 background="#FFFFE0", font=("Segoe UI", 8)).pack()
+        tip.wm_geometry(f"+{widget.winfo_rootx()}"
+                        f"+{widget.winfo_rooty() + widget.winfo_height() + 2}")
+        state["tip"] = tip
+
+    def hide(_event=None):
+        if state["tip"] is not None:
+            state["tip"].destroy()
+            state["tip"] = None
+
+    widget.bind("<Enter>", show)
+    widget.bind("<Leave>", hide)
+    widget.bind("<ButtonPress>", hide)
+
+
+_MODE_TOOLBAR = None
+
+
+def _mode_toolbar_class():
+    """The stock toolbar, but it SAYS when Zoom or Pan is engaged.
+
+    Subclassed lazily because `NavigationToolbar2Tk` is None when matplotlib
+    failed to import, and this module has to import anyway so compare.py can
+    explain why rather than refuse to start.
+
+    Only the PUBLIC `zoom()` and `pan()` are overridden. They are the entry
+    points every toolbar button goes through, and they are the two the window
+    needs to hear about. Reaching into `mode` or the old `_active` instead
+    would be reaching for internals that matplotlib has already renamed once.
+    """
+    global _MODE_TOOLBAR
+    if _MODE_TOOLBAR is None:
+        class _ModeToolbar(NavigationToolbar2Tk):
+            def __init__(self, canvas, master, on_mode_change=None, **kw):
+                # Set BEFORE super().__init__: it builds the buttons, and a
+                # notification arriving during construction must not find the
+                # attribute missing.
+                self._on_mode_change = on_mode_change
+                super().__init__(canvas, master, **kw)
+
+            def zoom(self, *args):
+                super().zoom(*args)
+                self._notify_mode()
+
+            def pan(self, *args):
+                super().pan(*args)
+                self._notify_mode()
+
+            def _notify_mode(self):
+                if self._on_mode_change is not None:
+                    self._on_mode_change()
+
+        _MODE_TOOLBAR = _ModeToolbar
+    return _MODE_TOOLBAR
+
+
 class ViewWindow(tk.Toplevel):
     """The z-score chart of a pair, in a window. Read-only for now."""
 
@@ -494,10 +638,53 @@ class ViewWindow(tk.Toplevel):
 
         toolbar_holder = ttk.Frame(left)
         toolbar_holder.pack(fill="x")
-        self.toolbar = NavigationToolbar2Tk(canvas, toolbar_holder,
-                                            pack_toolbar=False)
+        self.toolbar = _mode_toolbar_class()(
+            canvas, toolbar_holder, on_mode_change=self._on_toolbar_mode,
+            pack_toolbar=False)
         self.toolbar.update()
         self.toolbar.pack(side="left")
+
+        # Region sits FLUSH beside Zoom and Pan because it is a third member of
+        # that set, not a separate control that happens to be nearby.
+        #
+        # Packed INSIDE the toolbar frame, after its stock buttons. Not a
+        # `toolitems` entry: matplotlib resolves toolitem icons through the
+        # private `cbook._get_data_path` and renders only `zoom` and `pan` as
+        # pressed toggles, so adding one that way means copying the whole of
+        # `__init__` and inheriting its churn.
+        #
+        # Inside rather than beside, because beside CANNOT WORK and the gate
+        # said so: `NavigationToolbar2Tk.__init__` sets the frame's width to
+        # the figure's and calls `pack_propagate(False)`, so the toolbar
+        # demands the full 1150 px of the row whatever its buttons need.
+        # Packed after it, this button was allocated 1 px and never mapped --
+        # the regions-list bug again, sideways. The same fixed width is what
+        # makes inside work: the stock buttons use about half of it.
+        #
+        # A Checkbutton styled Toolbutton, so "pressed" is what the widget
+        # already means rather than something painted on. The mode has to be
+        # VISIBLE -- marking being an invisible gesture is the bug.
+        #
+        # An ICON, matching its neighbours: a text button in a row of glyphs
+        # reads as something bolted on rather than as a third mode. The image
+        # is held on the instance because Tk drops an image as soon as its
+        # last Python reference goes, and the button then renders empty.
+        self._region_mode = True
+        self._region_var = tk.BooleanVar(value=True)
+        self.region_icon = _region_icon(self.toolbar)
+        self.region_btn = ttk.Checkbutton(
+            self.toolbar, image=self.region_icon, style="Toolbutton",
+            variable=self._region_var, command=self._on_region_button)
+        _add_tooltip(self.region_btn,
+                     "Region: drag on the chart to mark a span of time")
+        # Immediately after Zoom, so the three MODES are one group and the
+        # actions that follow are another. Appended after Save otherwise --
+        # `_buttons` is matplotlib's, and the worst a rename can do here is
+        # put the button 70 px further along a row it is still in. The gate
+        # asserts the adjacency, so the fallback cannot pass unnoticed.
+        after_zoom = getattr(self.toolbar, "_buttons", {}).get("Subplots")
+        where = {"before": after_zoom} if after_zoom is not None else {}
+        self.region_btn.pack(side="left", padx=(8, 0), pady=2, **where)
 
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
@@ -1157,6 +1344,83 @@ class ViewWindow(tk.Toplevel):
         self.figure.subplots_adjust(
             bottom=min(0.50, max(0.28, 0.14 + 0.07 * rows)))
 
+    # ----------------------------------------------------------- region mode
+
+    def region_mode_active(self) -> bool:
+        """Is Region the active mode? THE predicate, and there is only one.
+
+        Both the span selector and the click-to-select handlers ask this and
+        nothing else. Before this, the selector consulted `canvas.widgetlock`
+        and the click handlers consulted NOTHING, so a click during a zoom
+        gesture still moved the selection: two rules answering one question,
+        and only one of them right.
+        """
+        if not self._region_mode:
+            return False
+        return self._toolbar_mode_name() == "NONE"
+
+    def _toolbar_mode_name(self) -> str:
+        """"ZOOM", "PAN" or "NONE". Tolerates being asked before the toolbar
+        exists, which happens while the window is still being built."""
+        toolbar = getattr(self, "toolbar", None)
+        mode = getattr(toolbar, "mode", None)
+        return getattr(mode, "name", "NONE") or "NONE"
+
+    def set_region_mode(self, on: bool):
+        """Engage Region, releasing Zoom or Pan, or step out of it."""
+        if on:
+            self._release_toolbar_mode()
+        self._region_mode = bool(on)
+        self._sync_region_mode()
+
+    def _release_toolbar_mode(self):
+        """Un-press whichever of Zoom or Pan is engaged, if either is.
+
+        Through the toolbar's OWN toggle, so the widgetlock is released by the
+        code that took it. Dispatched on the mode's enum NAME rather than its
+        text: the text for pan is "pan/zoom", so a substring test for "zoom"
+        matches the wrong one. If matplotlib ever renames these the gate below
+        fails on the widgetlock, which is the point of asserting the release
+        rather than the call.
+        """
+        name = self._toolbar_mode_name()
+        if name == "ZOOM":
+            self.toolbar.zoom()
+        elif name == "PAN":
+            self.toolbar.pan()
+
+    def _on_region_button(self):
+        """The Region toggle was pressed."""
+        self.set_region_mode(bool(self._region_var.get()))
+
+    def _on_toolbar_mode(self):
+        """Zoom or Pan was toggled on the toolbar.
+
+        Engaging either steps OUT of Region. Releasing one does not step back
+        in: leaving Region is a decision, and re-entering it should be one too,
+        by pressing the button that says so.
+        """
+        if self._toolbar_mode_name() != "NONE":
+            self._region_mode = False
+        self._sync_region_mode()
+
+    def _sync_region_mode(self):
+        """Make the button and the selector agree with the predicate."""
+        active = self.region_mode_active()
+        if getattr(self, "_region_var", None) is not None:
+            if bool(self._region_var.get()) != bool(self._region_mode):
+                self._region_var.set(bool(self._region_mode))
+        if not active:
+            # Drop any half-finished press. Leaving Region between a press and
+            # its release must not leave a click waiting to land later.
+            self._press_x = None
+        span = getattr(self, "span", None)
+        if span is not None:
+            # One predicate, one switch. `set_active(False)` makes the
+            # selector ignore presses AND its own edge handles, so a zoom
+            # gesture cannot drag a region's edge by accident either.
+            span.set_active(active)
+
     # ------------------------------------------------------------- selecting
 
     def _install_span_selector(self):
@@ -1169,9 +1433,11 @@ class ViewWindow(tk.Toplevel):
         snapping an already-snapped value is idempotent, and the rule belongs
         in the module a gate can reach without opening a window.
 
-        No conflict with the toolbar: `_SelectorWidget.ignore` consults
-        `canvas.widgetlock`, which zoom and pan hold while active, so a drag
-        means one thing at a time.
+        No conflict with the toolbar, and now only one rule saying so: the
+        selector is switched off whenever `region_mode_active()` is False.
+        `_SelectorWidget.ignore` also consults `canvas.widgetlock`, which zoom
+        and pan hold while active, but that was never the whole answer -- the
+        click handlers below never consulted it at all.
         """
         # Marking is refused outright on an axis that doubles back. Local time
         # runs 01:00, 01:30, 01:00, 01:30 across the November fall-back, so an
@@ -1211,6 +1477,7 @@ class ViewWindow(tk.Toplevel):
             props=dict(facecolor="#808080", alpha=0.20),
         )
         self.span.set_visible(False)
+        self._sync_region_mode()        # opens in Region mode, so: active
 
         # NOTE the press/release handlers are connected above, before this
         # point, because they must exist even when the selector is refused.
@@ -1222,12 +1489,21 @@ class ViewWindow(tk.Toplevel):
     # ------------------------------------------------------- selecting a mark
 
     def _on_press(self, event):
-        """Remember where a press landed, so release can tell click from drag."""
+        """Remember where a press landed, so release can tell click from drag.
+
+        Ignored outside Region mode. A press that begins a zoom rectangle is
+        not the start of a selection, and remembering it is what let a zoom
+        gesture change the selection on release.
+        """
+        if not self.region_mode_active():
+            return
         if event.inaxes is self.figure.axes[0]:
             self._press_x = event.xdata
 
     def _on_release(self, event):
         """A click that did not move is a SELECT, not a failed drag."""
+        if not self.region_mode_active():
+            return
         if event.inaxes is not self.figure.axes[0] or self._press_x is None:
             return
         # With no selector there is no create gesture to be confused with, and
@@ -2141,7 +2417,8 @@ def _main(argv=None):
                  "Delete button": win.delete_btn,
                  "regions note": win.overlay_label,
                  "marks note": win.marks_label,
-                 "the regions list": win.mark_tree}
+                 "the regions list": win.mark_tree,
+                 "the Region button": win.region_btn}
     absent = [n for n, w in furniture.items() if not w.winfo_ismapped()]
     checks.append((f"every control and status line is on screen at the size "
                    f"the window opens at "
@@ -2160,6 +2437,87 @@ def _main(argv=None):
     checks.append((f"and none of them runs past the bottom edge of the window "
                    f"[{'; OVER: ' + ', '.join(over) if over else 'all inside'}]",
                    not over))
+
+    # The SAME assertion sideways, which did not exist until something was
+    # added to a horizontal row. The Region button is packed flush after a
+    # toolbar of nine buttons plus a coordinate readout; if that row overruns,
+    # the button is gone in exactly the way the regions list was gone, and the
+    # bottom-edge check above cannot see it.
+    def past_right(w):
+        return (w.winfo_rootx() - win.winfo_rootx()) + w.winfo_width() \
+            > win.winfo_width()
+
+    wide = [n for n, w in furniture.items() if past_right(w)]
+    checks.append((f"and none past the right edge either "
+                   f"[{'; OVER: ' + ', '.join(wide) if wide else 'all inside'}]",
+                   not wide))
+
+    # "Beside Pan and Zoom" is a claim about geometry, so assert the geometry
+    # rather than trusting the packing order to have meant it. Reaching into
+    # the toolbar's private `_buttons` is fine HERE and not in the window: a
+    # gate that breaks on a matplotlib rename is a gate doing its job, where
+    # app code that breaks on one is a bug in the field.
+    zoom_btn = getattr(win.toolbar, "_buttons", {}).get("Zoom")
+    if zoom_btn is None:
+        checks.append(("the toolbar exposes a Zoom button to sit beside "
+                       "[matplotlib renamed _buttons]", False))
+    else:
+        same_row = abs(zoom_btn.winfo_rooty() - win.region_btn.winfo_rooty()) < 12
+        to_right = win.region_btn.winfo_rootx() > zoom_btn.winfo_rootx()
+        gap = win.region_btn.winfo_rootx() - (zoom_btn.winfo_rootx()
+                                              + zoom_btn.winfo_width())
+        checks.append((f"the Region button is in the toolbar ROW, to the right "
+                       f"of Zoom and close to it [same row {same_row}, "
+                       f"gap {gap} px]",
+                       same_row and to_right and 0 <= gap < 40))
+
+    # An ICON, and one that is still ALIVE. Tk drops an image the moment its
+    # last Python reference goes, and the button then renders empty while
+    # staying mapped, sized and clickable -- `winfo_ismapped()` cannot tell
+    # the difference, which is the withdrawn-dialog lesson wearing a third
+    # costume. So: read the pixels back.
+    shows_image = bool(str(win.region_btn.cget("image")))
+    checks.append((f"the Region button carries an image rather than a text "
+                   f"label [{'image' if shows_image else 'NO IMAGE'}]",
+                   shows_image and not str(win.region_btn.cget("text"))))
+
+    icon = win.region_icon
+    opaque = [(x, y) for x in range(icon.width()) for y in range(icon.height())
+              if not icon.transparency_get(x, y)]
+    inked = {icon.get(x, y) for x, y in opaque}
+    checks.append((f"and the image survived, with pixels actually drawn "
+                   f"[{icon.width()}x{icon.height()}, {len(opaque)} inked]",
+                   (icon.width(), icon.height()) == (24, 24)
+                   and len(opaque) > 150))
+
+    # COHESION, asserted rather than asserted-in-a-comment. matplotlib's own
+    # toolbar icons are 24x24 pure-black silhouettes of roughly 210-250 inked
+    # pixels; a two-tone 20x20 badge sat in that row looking like it came from
+    # another program. Same canvas, same single colour, comparable weight.
+    stock = _stock_icon_stats()
+    checks.append((f"and match the stock toolbar icons: same canvas, ONE "
+                   f"colour, pure black [{sorted(inked)} vs stock "
+                   f"{sorted(stock['colours'])}]",
+                   inked == {(0, 0, 0)}
+                   and (icon.width(), icon.height()) == stock["size"]))
+    checks.append((f"at a comparable ink weight, so it does not read as "
+                   f"lighter or heavier than its neighbours "
+                   f"[{len(opaque)} vs stock {stock['low']}-{stock['high']}]",
+                   0.6 * stock["low"] <= len(opaque) <= 1.4 * stock["high"]))
+
+    # A BAR over a BLOCK, which is what a region looks like on the chart. The
+    # gap is the assertion: without it this is one plain rectangle, and the
+    # icon stops previewing its own result.
+    mid = (icon.width()) // 2
+    column = [not icon.transparency_get(mid, y) for y in range(icon.height())]
+    runs = [k for k, v in enumerate(column) if v and not column[k - 1]]
+    checks.append((f"and depict a colour bar ABOVE a region block, not one "
+                   f"plain rectangle [{len(runs)} inked run(s) down the "
+                   f"middle]", len(runs) == 2))
+    checks.append((f"and the button is drawn at least as wide as its icon, so "
+                   f"the image is rendered and not merely attached "
+                   f"[{win.region_btn.winfo_width()} px]",
+                   win.region_btn.winfo_width() >= icon.width()))
 
     # The control that brings another pair's regions onto the chart sits ABOVE
     # the chart. Below it, it was the last thing on a window it fitted by ten
@@ -2552,6 +2910,93 @@ def _main(argv=None):
                        win.selected_band is not None))
         checks.append(("a click did not create a mark",
                        len(win.bands) == 3))
+
+        # ---- Region mode, and the modes it is exclusive with ----------------
+        # Driven through the toolbar's OWN public toggles, which is what its
+        # buttons call. Asserting the widgetlock rather than the call is what
+        # makes this survive matplotlib renaming the mode enum: the release
+        # would stop happening and this would say so.
+        def click_chart(xdata):
+            """A real press-release on the chart, at a data x."""
+            cx, cy = win.figure.axes[0].transData.transform((xdata, 0.0))
+            for nm in ("button_press_event", "button_release_event"):
+                win.canvas.callbacks.process(
+                    nm, MouseEvent(nm, win.canvas, int(cx), int(cy),
+                                   button=MouseButton.LEFT))
+
+        checks.append((f"the window OPENS in Region mode, with the button "
+                       f"pressed [mode {win._toolbar_mode_name()}, button "
+                       f"{'on' if win._region_var.get() else 'off'}]",
+                       win.region_mode_active()
+                       and bool(win._region_var.get())))
+        checks.append(("and the span selector is live in it, so a drag marks "
+                       "immediately", win.span is not None and win.span.active))
+
+        win.toolbar.zoom()
+        checks.append((f"engaging Zoom steps OUT of Region and un-presses its "
+                       f"button [mode {win._toolbar_mode_name()}, button "
+                       f"{'on' if win._region_var.get() else 'off'}]",
+                       not win.region_mode_active()
+                       and not bool(win._region_var.get())))
+        checks.append(("and switches the span selector off, so a zoom drag "
+                       "cannot mark or drag a region's edge",
+                       win.span is not None and not win.span.active))
+
+        # The stray-click bug: the click handlers never consulted the lock.
+        win.select_band(win.bands[0])
+        held = win.selected_band
+        other = win.bands[1]
+        click_chart(other.patch.get_x() + other.patch.get_width() / 2)
+        checks.append((f"a click while Zoom is active leaves the selection "
+                       f"alone [{held.markset.name if held else None}]",
+                       win.selected_band is held))
+
+        locked_during_zoom = not win.canvas.widgetlock.available(win)
+        win.set_region_mode(True)
+        checks.append((f"pressing Region releases the widgetlock Zoom was "
+                       f"holding [held during zoom: {locked_during_zoom}]",
+                       locked_during_zoom
+                       and win.canvas.widgetlock.available(win)))
+        checks.append((f"and Region is the active mode again "
+                       f"[mode {win._toolbar_mode_name()}]",
+                       win.region_mode_active()
+                       and bool(win._region_var.get())))
+        checks.append(("with the selector live once more",
+                       win.span is not None and win.span.active))
+
+        click_chart(other.patch.get_x() + other.patch.get_width() / 2)
+        checks.append((f"and a click selects again, so leaving Zoom did not "
+                       f"leave the chart inert "
+                       f"[{win.selected_band.markset.name if win.selected_band else None}]",
+                       win.selected_band is other))
+
+        # Pan is the other half of the exclusivity, and "pan/zoom" contains
+        # the substring "zoom" -- a naive release would have called zoom() and
+        # engaged the mode it meant to clear.
+        win.toolbar.pan()
+        checks.append((f"engaging Pan also steps out of Region "
+                       f"[mode {win._toolbar_mode_name()}]",
+                       win._toolbar_mode_name() == "PAN"
+                       and not win.region_mode_active()))
+        win.set_region_mode(True)
+        checks.append((f"and pressing Region releases PAN rather than "
+                       f"toggling Zoom on [mode {win._toolbar_mode_name()}]",
+                       win._toolbar_mode_name() == "NONE"
+                       and win.region_mode_active()))
+
+        # Stepping out by the button, not by the toolbar: the selector goes
+        # quiet, and the chart stops taking selections.
+        win.set_region_mode(False)
+        checks.append(("un-pressing Region switches the selector off without "
+                       "any toolbar mode being engaged",
+                       win._toolbar_mode_name() == "NONE"
+                       and not win.region_mode_active()
+                       and win.span is not None and not win.span.active))
+        win.select_band(None)
+        click_chart(other.patch.get_x() + other.patch.get_width() / 2)
+        checks.append(("and a click does nothing while it is off",
+                       win.selected_band is None))
+        win.set_region_mode(True)
 
         # ---- adjusting the selected mark -----------------------------------
         entry = win.select_band(win.bands[0])
