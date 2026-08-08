@@ -100,6 +100,17 @@ except Exception as exc:                       # pragma: no cover - environment
 SPAN_HINT = ("Drag across the chart to define a region.  "
              "Click a mark to select it.")
 
+# Shown INSTEAD of the list when this pair has nothing marked. Names the
+# gesture and the button that enables it, because an empty box answers
+# neither question and a first use should not be a guess.
+NO_REGIONS_TEXT = (
+    "Nothing marked on this pair yet.\n\n"
+    "With Region pressed in the toolbar, drag across the chart to mark a "
+    "span of time. You will be asked for a name and a reason, and it "
+    "appears in this list.\n\n"
+    "Regions marked on other pairs can be shown above, without being "
+    "copied here.")
+
 # ---------------------------------------------------------------------------
 # How a region is drawn. One place, because the fill, the layering and the
 # ghost's grey are one decision: the ghost has to read against the region AND
@@ -1072,8 +1083,16 @@ class ViewWindow(tk.Toplevel):
         ttk.Label(right, text="Regions of interest",
                   font=("Segoe UI", 9, "bold")).pack(anchor="w")
 
-        holder = ttk.Frame(right)
-        holder.pack(fill="both", expand=True)
+        # The list and the empty-state message take the same place, one at a
+        # time. Not both, and not an empty list with a note beside it: the
+        # complaint this answers is that a pair with nothing marked showed an
+        # EMPTY BOX, and a box with column headings and no rows says only
+        # that something might have gone wrong.
+        self.mark_holder = holder = ttk.Frame(right)
+        self.mark_empty = ttk.Label(right, text=NO_REGIONS_TEXT,
+                                    wraplength=320, justify="left",
+                                    foreground="#555")
+        self._mark_list_showing = None      # neither, until the first sync
         self.mark_tree = ttk.Treeview(holder, columns=("where",),
                                       show="tree headings", height=16,
                                       selectmode="browse")
@@ -1092,6 +1111,29 @@ class ViewWindow(tk.Toplevel):
         self.mark_tree.bind("<<TreeviewSelect>>", self._on_row_selected)
         self._row_for = {}
         self.refresh_mark_list()
+
+    def _sync_empty_state(self):
+        """Show the list, or say what to do instead of an empty box.
+
+        Swapped only when it CHANGES. `pack_forget` followed by `pack` on
+        every refresh would re-pack the widget on every redraw -- visible as
+        a flicker, and it would also move it to the end of the parent's
+        packing order, which is how a panel quietly reorders itself.
+        """
+        holder = getattr(self, "mark_holder", None)
+        label = getattr(self, "mark_empty", None)
+        if holder is None or label is None:
+            return
+        want = "list" if self.occurrences else "empty"
+        if want == self._mark_list_showing:
+            return
+        self._mark_list_showing = want
+        if want == "list":
+            label.pack_forget()
+            holder.pack(fill="both", expand=True)
+        else:
+            holder.pack_forget()
+            label.pack(anchor="w", fill="x", pady=(4, 0))
 
     def refresh_mark_list(self):
         """Rebuild the rows from `occurrences`. Sets are parents."""
@@ -1124,6 +1166,7 @@ class ViewWindow(tk.Toplevel):
                     values=("outside" if outside else "",),
                     tags=tags)
                 self._row_for[row] = entry
+        self._sync_empty_state()
         self._sync_row_selection()
 
     def _on_row_selected(self, _event=None):
@@ -2863,7 +2906,12 @@ def _main(argv=None):
                  "Delete button": win.delete_btn,
                  "regions note": win.overlay_label,
                  "marks note": win.marks_label,
-                 "the regions list": win.mark_tree,
+                 # Whichever occupies the list's place. They swap, so naming
+                 # the Treeview alone would assert an absent widget is on
+                 # screen the moment a pair has nothing marked -- which is
+                 # every pair, the first time it is opened.
+                 "the regions list or its empty-state message":
+                     win.mark_holder if win.occurrences else win.mark_empty,
                  "the Region button": win.region_btn}
     absent = [n for n, w in furniture.items() if not w.winfo_ismapped()]
     checks.append((f"every control and status line is on screen at the size "
@@ -2981,8 +3029,9 @@ def _main(argv=None):
     # the chart, which is where it went after being the last thing on a window
     # it fitted by ten pixels; the panel is packed before the chart for that
     # same reason, so it still cannot be pushed anywhere.
+    list_slot = win.mark_holder if win.occurrences else win.mark_empty
     list_top = win.overlay_list.winfo_rooty() - win.winfo_rooty()
-    tree_top = win.mark_tree.winfo_rooty() - win.winfo_rooty()
+    tree_top = list_slot.winfo_rooty() - win.winfo_rooty()
     checks.append((f"the other-pairs checklist is in the panel ABOVE the "
                    f"regions list, so the control comes before what it "
                    f"controls [checklist y={list_top}, list y={tree_top}]",
@@ -2993,6 +3042,37 @@ def _main(argv=None):
                    f"window cannot cut it off [checklist x="
                    f"{win.overlay_list.winfo_rootx() - win.winfo_rootx()}]",
                    win.overlay_list.winfo_rootx() >= chart_right))
+
+    # ---- the empty state -----------------------------------------------------
+    # This window opens on a pair with nothing marked, which is the first
+    # thing anyone ever sees, and it used to be a box with column headings
+    # and no rows -- which says something might have gone wrong, not what to
+    # do next.
+    if win.occurrences:
+        checks.append(("the gate's window opens with nothing marked, so the "
+                       "empty state is the state under test", False))
+    else:
+        empty_text = str(win.mark_empty.cget("text"))
+        checks.append((f"with nothing marked the panel shows a MESSAGE, not "
+                       f"an empty list [showing "
+                       f"{'message' if win.mark_empty.winfo_ismapped() else 'LIST'}]",
+                       win.mark_empty.winfo_ismapped()
+                       and not win.mark_holder.winfo_ismapped()))
+        checks.append((f"and it is reachable, not merely packed "
+                       f"[viewable={bool(win.mark_empty.winfo_viewable())}]",
+                       bool(win.mark_empty.winfo_viewable())
+                       and not below_edge(win.mark_empty)
+                       and not past_right(win.mark_empty)))
+        checks.append((f"it names the GESTURE, so a first use is not a guess "
+                       f"[...{empty_text.splitlines()[2][:44]}...]",
+                       "drag across the chart" in empty_text.lower()))
+        checks.append(("and the MODE BUTTON that has to be pressed for the "
+                       "gesture to do anything",
+                       "Region" in empty_text))
+        checks.append(("and says another pair's regions can be shown without "
+                       "being copied here, which is the other thing the "
+                       "panel can do",
+                       "other pairs" in empty_text.lower()))
 
     expected = sk.zscore(res.data)
     drawn = win.plotted()
@@ -3147,6 +3227,15 @@ def _main(argv=None):
         checks.append(("reopening the pair loads only ITS sets, not the one "
                        f"drawn on another pair [{[m.name for m in win.marks]}]",
                        [m.name for m in win.marks] == ["internal tide"]))
+
+        # The empty state has to GIVE THE PLACE BACK. A message that stayed
+        # once regions existed would be worse than the empty box it replaced.
+        checks.append((f"with regions on this pair the LIST is shown and the "
+                       f"empty-state message is gone [showing "
+                       f"{'list' if win.mark_holder.winfo_ismapped() else 'MESSAGE'}]",
+                       bool(win.occurrences)
+                       and win.mark_holder.winfo_ismapped()
+                       and not win.mark_empty.winfo_ismapped()))
 
         # Read off the AXES, not off the window's own bookkeeping -- what is on
         # the chart is the claim being made. The SpanSelector keeps its own
