@@ -64,7 +64,7 @@ from __future__ import annotations
 
 import datetime as dt
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import messagebox, ttk
 from zoneinfo import ZoneInfo
@@ -85,6 +85,7 @@ try:
     import numpy as np
     matplotlib.use("TkAgg")
     import matplotlib.dates as mdates
+    import matplotlib.transforms
     from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                    NavigationToolbar2Tk)
     from matplotlib.figure import Figure
@@ -148,6 +149,19 @@ VIEW_PUSH_DELAY_MS = 350
 # and stays muted against the saturated series lines everywhere else.
 GHOST_GREY = "#B0B0B0"
 
+# The DST furniture's ink. Lighter than the axis text on purpose: it is a
+# CORRECTION TO THE LABELS, not another label, and it must not compete with
+# the series for attention. It is also the only new ink on this chart, which
+# is why it sits below the spine -- see `_draw_transitions`.
+DST_GREY = "#6B6B6B"
+
+# How far every row below the spine moves down to make room for the bracket
+# and its caption, in axes fractions. One constant, because the x label, the
+# legend anchor and the bottom margin all have to move by the SAME amount --
+# moving one without the others is how a caption ends up printed through a
+# label, which is what the first attempt did.
+DST_LABEL_PAD = 0.15
+
 UNAVAILABLE_MESSAGE = (
     "The chart view needs matplotlib, which is not installed.\n\n"
     "    pip install matplotlib\n\n"
@@ -189,6 +203,35 @@ def duration_text(td: dt.timedelta) -> str:
     parts = [f"{days} d" if days else "", f"{hours} h" if hours else "",
              f"{minutes} min" if minutes else ""]
     return " ".join(p for p in parts if p) or "0 min"
+
+
+def axis_x(index):
+    """The x values a series is plotted against. MUST be zone-aware.
+
+    The axis is tz-aware and labelled in local time by the locator, so the
+    instants go on it unchanged and no wall time is ever constructed. This
+    function exists for what it REFUSES.
+
+    A naive datetime handed to a tz-aware axis does not raise. It is read as
+    if it were already in the axis's zone and lands seven hours early:
+
+        naive local 2026-07-01 17:00  ->  x = 20634.83333
+        the instant it came from      ->  x = 20635.12500
+
+    Nothing reports that. It is the same shape as the failure AUDIT.md C4
+    records, and it would surface only in November, or -- for the ghost line,
+    which is plotted from a second index -- only when someone borrows a set.
+    So the array path refuses a naive index here, exactly as the scalar path
+    refuses a naive datetime in `_to_num`. Between them there is no way to
+    reach the axis without a zone.
+    """
+    if getattr(index, "tz", None) is None:
+        raise ValueError(
+            "the chart's x axis is timezone-aware, and this index carries no "
+            "zone. A naive index does not raise when it is plotted -- it is "
+            "read as local and lands seven hours early, silently. Pass the "
+            "UTC index; the axis labels it in local time itself.")
+    return index
 
 
 @dataclass
@@ -253,7 +296,7 @@ class Ghost:
     """The absent partner of a borrowed pair, standardised over THIS window."""
     ref: object            # the SeriesRef it was fetched by
     label: str             # legend text, carrying depth and reference frame
-    x: object              # naive local time, the axis this chart is drawn on
+    x: object              # the zone-aware instants; see axis_x
     values: object         # z-scores, computed over the window on screen
     line: object = None    # the artist, once drawn
     borrowers: tuple = ()  # the sets that asked for it
@@ -328,8 +371,7 @@ def load_ghost(study, ref, *, interval: str, aggregation: str, lo, hi,
     label = identity.legend_label(column, res.units.get(column, ""), False,
                                   res.geometry.get(column, ""))
     return Ghost(ref=ref, label=f"{label} — ghost: context, not compared",
-                 x=res.data.index.tz_convert(LOCAL_TZ).tz_localize(None),
-                 values=z.to_numpy())
+                 x=axis_x(res.data.index), values=z.to_numpy())
 
 
 class MarkDialog(tk.Toplevel):
@@ -713,6 +755,57 @@ class NameCheckList(ttk.Frame):
         return bool(self._vars[key].get())
 
 
+_DST_LOCATOR = None
+
+
+def _dst_locator_class():
+    """`AutoDateLocator`, minus the duplicate tick at a spring-forward.
+
+    Across the March transition the rrule asks for 02:00 and 03:00 local.
+    02:00 DOES NOT EXIST, `zoneinfo` folds it forward onto 03:00, and
+    matplotlib emits both -- so one position carries two ticks and two
+    identical labels drawn on top of each other:
+
+        20520.416667  03:00 PDT  '03:00'
+        20520.416667  03:00 PDT  '03:00'
+
+    Nine ticks, eight positions. It overprints, so it costs a slightly bolder
+    label rather than a visible error, and it would be easy to leave. It is
+    not left, because a tick list containing the same instant twice is a
+    latent claim that the axis visits it twice -- which is exactly the
+    misreading this whole change exists to prevent, one layer down.
+
+    Subclassed lazily for the same reason the toolbar is: `mdates` is None
+    when matplotlib failed to import, and this module must still import so
+    compare.py can explain why rather than refuse to start.
+    """
+    global _DST_LOCATOR
+    if _DST_LOCATOR is None:
+        class _DedupedAutoDateLocator(mdates.AutoDateLocator):
+            # BOTH entry points, and that is not belt and braces. `__call__`
+            # does not route through `tick_values`: it picks a sub-locator
+            # with `get_locator` and calls THAT, so an override on
+            # `tick_values` alone is bypassed for the ticks actually drawn.
+            # Overriding only `tick_values` was the first attempt and the gate
+            # caught it -- 8 ticks, 7 positions.
+            def __call__(self):
+                return self._dedupe(super().__call__())
+
+            def tick_values(self, vmin, vmax):
+                return self._dedupe(super().tick_values(vmin, vmax))
+
+            @staticmethod
+            def _dedupe(values):
+                out = []
+                for v in values:
+                    if not out or abs(v - out[-1]) > 1e-9:
+                        out.append(v)
+                return np.asarray(out)
+
+        _DST_LOCATOR = _DedupedAutoDateLocator
+    return _DST_LOCATOR
+
+
 _MODE_TOOLBAR = None
 
 
@@ -774,10 +867,10 @@ class ViewWindow(tk.Toplevel):
                                                  # workbook standardises with
 
         # The UTC index is the TRUTH about time in this window. `_xnum` is the
-        # same instants as matplotlib date numbers on the naive-local axis,
-        # built position for position from it, which is what lets a drag be
-        # resolved to an index and read back out of `_utc` without any zone
-        # ever being inferred. See annotations.snap_span.
+        # same instants as matplotlib date numbers, built position for
+        # position from it, which is what lets a drag be resolved to an index
+        # and read back out of `_utc` without any zone ever being inferred.
+        # See annotations.snap_span.
         self._utc = result.data.index
         self._xnum = []
         self.selection: tuple | None = None
@@ -1304,8 +1397,8 @@ class ViewWindow(tk.Toplevel):
         `patch` always spans the region, so hit testing has one artist to ask
         whatever the treatment.
         """
-        x0, x1 = (self._to_axis(clamped.start_utc),
-                  self._to_axis(clamped.end_utc))
+        x0, x1 = (self._to_num(clamped.start_utc),
+                  self._to_num(clamped.end_utc))
         patch = ax.axvspan(x0, x1, facecolor=REGION_FILL,
                            alpha=REGION_ALPHA, edgecolor="none",
                            linewidth=0, zorder=Z_REGION)
@@ -1594,16 +1687,6 @@ class ViewWindow(tk.Toplevel):
         if msg:
             messagebox.showwarning("Ghost line not drawn", msg, parent=self)
 
-    def _to_axis(self, when):
-        """A UTC instant -> the naive local value the axis is drawn on.
-
-        This IS the conversion snap_span refuses to make, and it is safe in
-        this direction only. One instant has exactly one local rendering; it is
-        the reverse -- a wall time back to an instant -- that is ambiguous for
-        an hour each November and undefined for an hour each March.
-        """
-        return when.astimezone(LOCAL_TZ).replace(tzinfo=None)
-
     def _append_rejection_note(self):
         if self.mark_problems:
             self.marks_note += (f"  {len(self.mark_problems)} annotation "
@@ -1654,14 +1737,18 @@ class ViewWindow(tk.Toplevel):
         # side would be truncated into saying nothing.
         ncol = 1 if any(len(t) > 44 for t in labels) else 2
         rows = -(-len(labels) // ncol)
+        # The same pad the x label moved by. The legend sits below it, so it
+        # has to move too, or the transition caption is printed through the
+        # first legend row instead of through the label.
+        pad = DST_LABEL_PAD if getattr(self, "transitions", None) else 0.0
         ax.legend(handles, labels, loc="upper center",
-                  bbox_to_anchor=(0.5, -0.16), ncol=ncol, frameon=False,
+                  bbox_to_anchor=(0.5, -0.16 - pad), ncol=ncol, frameon=False,
                   fontsize=9)
         # And give it the room it needs. The strip was sized for two entries;
         # attribution and a ghost line make four categories, and a legend that
         # outgrows its margin walks off the bottom of the figure unremarked.
         self.figure.subplots_adjust(
-            bottom=min(0.50, max(0.28, 0.14 + 0.07 * rows)))
+            bottom=min(0.56, max(0.28, 0.14 + 0.07 * rows + pad * 0.7)))
 
     # ------------------------------------------------------------ the view
     # Zoom is how you LOOK at the chart. Nothing here changes what is on it,
@@ -1846,30 +1933,22 @@ class ViewWindow(tk.Toplevel):
         and pan hold while active, but that was never the whole answer -- the
         click handlers below never consulted it at all.
         """
-        # Marking is refused outright on an axis that doubles back. Local time
-        # runs 01:00, 01:30, 01:00, 01:30 across the November fall-back, so an
-        # hour of the axis is not ascending and a bisect through it would
-        # return a confident wrong index. Better to say so than to store a mark
-        # that means an hour other than the one that was dragged.
-        # Click-to-select is wired up FIRST and unconditionally. Creating and
-        # adjusting need a monotonic axis to snap against; selecting and
-        # deleting do not, and a window that cannot be marked must not become
-        # one whose existing marks can never be removed.
+        # THIS USED TO REFUSE TO MARK a window whose axis doubled back. The
+        # axis was naive local time, which runs 01:00, 01:30, 01:00, 01:30
+        # across the November fall-back, and `snap_span` bisects -- so a drag
+        # into that hour would have returned a confident wrong index. The
+        # refusal was the right answer to the axis as it was.
+        #
+        # The axis is tz-aware now, so `_xnum` is a sequence of instants and
+        # ascends by construction; `build_comparison` bins them in order.
+        # There is nothing left to refuse, and a window spanning a transition
+        # can be marked like any other. `annotations.first_descent` is kept --
+        # it is the executable record of why the axis is tz-aware, and its
+        # gate demonstrates the failure rather than describing it -- but
+        # nothing in the drawing path consults it any more. See #15.
         self._press_x = None
         self.canvas.mpl_connect("button_press_event", self._on_press)
         self.canvas.mpl_connect("button_release_event", self._on_release)
-
-        self.descent = ann.first_descent(self._xnum)
-        if self.descent is not None:
-            when = ann.local_text(self._utc[self.descent])
-            self.span = None
-            self.span_text.set(
-                f"Marking is off for this window: local time runs backwards "
-                f"around {when}, where a DST fall-back makes one wall clock "
-                f"hour cover two different hours of real time. Existing marks "
-                f"can still be selected and deleted. Rebuild the window to "
-                f"exclude it.")
-            return
 
         ax = self.figure.axes[0]
         self.span = SpanSelector(
@@ -1913,11 +1992,9 @@ class ViewWindow(tk.Toplevel):
             return
         if event.inaxes is not self.figure.axes[0] or self._press_x is None:
             return
-        # With no selector there is no create gesture to be confused with, and
-        # snap_span cannot be trusted on the axis that refused it, so every
-        # release is a click.
-        moved = (self.span is not None
-                 and self.span_interval(self._press_x, event.xdata) is not None)
+        # A release that covered at least one sample is a drag, and the
+        # selector's own onselect owns it. Anything shorter is a click.
+        moved = self.span_interval(self._press_x, event.xdata) is not None
         self._press_x = None
         if moved:
             return                       # a real drag; onselect owns it
@@ -1962,8 +2039,7 @@ class ViewWindow(tk.Toplevel):
             self._sync_row_selection()
 
         if entry is None:
-            if self.span is not None:
-                self.span.set_visible(False)
+            self.span.set_visible(False)
             self.selection = None
             self.span_text.set(SPAN_HINT)
             self.canvas.draw_idle()
@@ -1978,9 +2054,9 @@ class ViewWindow(tk.Toplevel):
         # selectable so that clicking one says where it came from, and that is
         # all it is.
         shown = entry.drawn or entry.interval
-        if entry.is_foreign and self.span is not None:
+        if entry.is_foreign:
             self.span.set_visible(False)
-        elif self.span is not None:
+        else:
             self.span.set_visible(True)
             self.span.extents = (self._to_num(shown.start_utc),
                                  self._to_num(shown.end_utc))
@@ -2084,7 +2160,19 @@ class ViewWindow(tk.Toplevel):
             bar.set_height(hi - lo)
 
     def _to_num(self, when) -> float:
-        return float(mdates.date2num(self._to_axis(when)))
+        """A UTC instant -> its x on the axis. The scalar half of `axis_x`.
+
+        `coerce_utc` FIRST, and that is the whole point of the line. A naive
+        datetime reaching a tz-aware axis lands seven hours early and never
+        raises; refusing it here is what makes the shift unrepresentable
+        rather than merely tested for. The check is `annotations`' own, which
+        is already gated, so there is not a second notion of what a zone is.
+
+        No wall time is constructed in either direction any more. `_to_axis`
+        used to do it -- safely, one instant having exactly one local
+        rendering -- but the axis it converted FOR is gone.
+        """
+        return float(mdates.date2num(ann.coerce_utc(when, "axis x")))
 
     def _indices_for(self, interval) -> tuple:
         """Which samples an interval's edges sit on, for coverage."""
@@ -2647,18 +2735,31 @@ class ViewWindow(tk.Toplevel):
         colors = identity.series_colors(self.cols)
         labels = self._labels()
 
-        # Naive local time on the axis, matching how the workbook builds its
-        # x values. A tz-aware index would have matplotlib pick its own
-        # display zone, which is exactly the class of mistake this repo has
-        # already paid for once.
-        x = self.result.data.index.tz_convert(LOCAL_TZ).tz_localize(None)
+        # THE INSTANTS GO ON THE AXIS UNCHANGED. The data is UTC; the labels
+        # are local, and the zone is named exactly once, on the locator and
+        # the formatter below.
+        #
+        # This used to plot naive local time, converted here and stripped of
+        # its zone, on the reasoning that a tz-aware index would let
+        # matplotlib pick a display zone of its own. It does not -- a zone
+        # passed to the locator and formatter is used, and nothing is inferred
+        # -- and the naive axis cost more than it saved: across the November
+        # fall-back local time runs 01:00, 01:30, 01:00, 01:30, so an hour of
+        # the axis DOUBLED BACK and the line retraced itself, which reads as
+        # an instrument fault. Across the March spring-forward the same axis
+        # stayed monotonic, so nothing detected it, and half an hour of data
+        # was drawn three times as wide as its neighbours. See #15.
+        x = axis_x(self.result.data.index)
 
         # The plotted x of every sample, in the same order as `_utc`. An
         # ARRAY, because matplotlib's own snapping does arithmetic on it
-        # directly and a list raises inside _set_extents. `snap_span` and
-        # `first_descent` bisect and compare, which work on any sequence, so
-        # one representation serves both -- annotations stays free of the
-        # numeric stack because of what it IMPORTS, not what it is handed.
+        # directly and a list raises inside _set_extents. `snap_span` bisects,
+        # which works on any sequence, so one representation serves both --
+        # annotations stays free of the numeric stack because of what it
+        # IMPORTS, not what it is handed.
+        #
+        # Strictly ascending by construction now: these are instants, and
+        # `build_comparison` bins them in order.
         self._xnum = np.asarray(mdates.date2num(x), dtype=float)
 
         fig = Figure(figsize=(11.5, 5.0), dpi=100)
@@ -2674,7 +2775,14 @@ class ViewWindow(tk.Toplevel):
             self.series_lines[c] = line
 
         ax.set_ylabel("standard deviations")
-        ax.set_xlabel("time (local)")
+        # The x label carries the transition clause when this window spans
+        # one. The bracket says WHERE; this says it at all, and survives the
+        # transition being scrolled off the side by the wheel.
+        self.transitions = transitions_in(self.result.data.index)
+        xlabel = "time (local)"
+        if self.transitions:
+            xlabel += "  ·  " + ";  ".join(t.clause for t in self.transitions)
+        ax.set_xlabel(xlabel)
         # UNDER the regions, both of them. A gridline or a zero rule crossing
         # a dark region is the same noise the region's own edges were, and the
         # region is a backdrop rather than an overlay. `axisbelow` is what
@@ -2686,9 +2794,14 @@ class ViewWindow(tk.Toplevel):
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
 
-        locator = mdates.AutoDateLocator()
+        # The ONE place the display zone is named. The x data is UTC, so this
+        # is what makes the axis read in local time -- and because it is
+        # passed rather than inferred, the zone is a decision in the source
+        # rather than a property of the machine the chart is drawn on.
+        locator = _dst_locator_class()(tz=LOCAL_TZ)
         ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ax.xaxis.set_major_formatter(
+            mdates.ConciseDateFormatter(locator, tz=LOCAL_TZ))
 
         # PIN THE VIEW TO THE SERIES, and stop autoscaling.
         #
@@ -2710,6 +2823,15 @@ class ViewWindow(tk.Toplevel):
         # it is handed back. Recomputing it later from the lines would include
         # whatever else has since been drawn.
         self._series_ylim = ax.get_ylim()
+        self._draw_transitions(ax)
+        if self.transitions:
+            # The furniture stack under the spine is ticks, then bracket and
+            # caption, then the x label, then the legend. matplotlib knows
+            # nothing about the bracket, so it would place the label straight
+            # through it; each row below is moved down by hand instead. See
+            # DST_LABEL_PAD.
+            ax.xaxis.set_label_coords(0.5, -0.11 - DST_LABEL_PAD)
+
         # And the x range as built, which is the limit the wheel zooms out to.
         # Taken here rather than from `_xnum` because the axis is framed a
         # little wider than the data, and zooming out to the data would shave
@@ -2723,7 +2845,78 @@ class ViewWindow(tk.Toplevel):
         fig.subplots_adjust(left=0.06, right=0.99, top=0.97, bottom=0.28)
         return fig
 
+    def _draw_transitions(self, ax):
+        """Say at the axis what the tick labels cannot say for themselves.
+
+        BELOW THE SPINE, in a blended transform: x in data coordinates so it
+        tracks the wheel without being redrawn, y in axes coordinates so it
+        stays pinned under the ticks whatever the y range does.
+
+        Below, and not over the data, and that is the whole design. Two
+        treatments were available and both were refused:
+
+          * A SHADED BAND over the repeated hour. A dark block with a colour
+            bar is precisely what a marked region looks like here -- it means
+            "a person judged this interesting" -- and dressing a fact about
+            the calendar in the vocabulary of an interpretation is worse than
+            saying nothing. See `_band_patch`.
+          * A VERTICAL RULE at the instant. `_band_patch` records that edge
+            rules in the set's colour were removed because two saturated
+            verticals per region crossing the series were exactly the noise a
+            marked window exists to cut through. Spending that ink back for a
+            clock artifact is the wrong trade.
+
+        The lie is in the tick labels, so the correction goes where the lie
+        is: in the axis furniture. Nothing here crosses a series line.
+
+        `clip_on=False` throughout, because all of it is outside the axes.
+        """
+        self.transition_artists = []
+        if not self.transitions:
+            return
+
+        blended = matplotlib.transforms.blended_transform_factory(
+            ax.transData, ax.transAxes)
+        bar_y, cap_h, text_y = -0.075, 0.016, -0.10
+
+        for t in self.transitions:
+            x0 = self._to_num(t.start)
+            if t.repeats:
+                # A real interval is mislabelled, so bracket it.
+                x1 = self._to_num(t.end)
+                line, = ax.plot([x0, x1], [bar_y, bar_y], transform=blended,
+                                color=DST_GREY, linewidth=0.9, clip_on=False,
+                                solid_capstyle="butt")
+                self.transition_artists.append(line)
+                for x in (x0, x1):
+                    cap, = ax.plot([x, x], [bar_y - cap_h, bar_y + cap_h],
+                                   transform=blended, color=DST_GREY,
+                                   linewidth=0.9, clip_on=False)
+                    self.transition_artists.append(cap)
+                mid = (x0 + x1) / 2.0
+            else:
+                # Nothing is repeated -- the clock jumps. A single caret, so
+                # the glyph does not claim a duration that does not exist.
+                cap, = ax.plot([x0, x0], [bar_y - cap_h, bar_y + cap_h],
+                               transform=blended, color=DST_GREY,
+                               linewidth=0.9, clip_on=False)
+                self.transition_artists.append(cap)
+                mid = x0
+            label = ax.text(mid, text_y, t.caption, transform=blended,
+                            ha="center", va="top", fontsize=8, color=DST_GREY,
+                            clip_on=False)
+            self.transition_artists.append(label)
+
     # ------------------------------------------------------------ self-check
+
+    def transition_texts(self) -> list:
+        """What the chart actually SAYS about the transitions it spans.
+
+        Read off the artists rather than off `self.transitions`, so a gate
+        asserts what was drawn instead of what was intended.
+        """
+        return [a.get_text() for a in getattr(self, "transition_artists", [])
+                if hasattr(a, "get_text")]
 
     def plotted(self) -> dict:
         """The y data actually handed to matplotlib, per series.
@@ -2745,6 +2938,158 @@ class ViewWindow(tk.Toplevel):
 # asserts the two things that matter: that it is VIEWABLE rather than merely
 # constructed, and that the lines carry the same z-scores the workbook writes.
 # ---------------------------------------------------------------------------
+
+# The windows the DST review is done on. Wide enough on each side that the
+# transition is read against ordinary hours rather than at the frame's edge,
+# and narrow enough that the hourly ticks are actually drawn -- at 45 days the
+# locator ticks daily and the artifact this is all about is invisible.
+DST_WINDOWS = {
+    "fall": ("2026-10-31T18:00Z", "2026-11-01T18:00Z"),
+    "spring": ("2026-03-07T18:00Z", "2026-03-08T18:00Z"),
+}
+
+
+def transition_result(res, start, end, interval="30min"):
+    """`res` re-indexed onto a window spanning a DST transition.
+
+    EVERY STUDY IN THIS PROJECT SITS IN SUMMER. The 45-day pull windows in use
+    do not reach 1 November or 8 March, so the case the tz-aware axis exists
+    for cannot be put on a chart with real data at all. This fabricates the
+    one thing that has to be fabricated -- the index -- and nothing else.
+
+    The study, the ColumnInfos, the units, the geometry, the interval and the
+    aggregation are the REAL ones, carried across by `replace`. That is not
+    tidiness: a window built with `study=None` writes marks whose `study_id`
+    is null, which `MarkSet.from_json` then refuses on reload, so the half of
+    this feature that matters most -- that a span across the repeated hour can
+    be marked -- would go untested.
+
+    The values are a shape to look at an axis with. They are NOT a claim about
+    the ocean, and nothing should ever read them as one.
+    """
+    import numpy as np
+    import pandas as pd
+
+    # THIRTY MINUTES, not the study's hourly cadence, and the interval is
+    # carried onto the result so the readout does not describe a spacing the
+    # data does not have. At 1 h the fall-back produces two samples on the
+    # IDENTICAL naive local value rather than a descending pair -- equal is
+    # not less-than, so `first_descent` would not have fired and #5's guard
+    # never protected an hourly window at all. Sub-hourly is where the old
+    # axis visibly doubles back, and it is the cadence #15's example uses.
+    idx = pd.date_range(start, end, freq=interval, tz="UTC")
+    hours = (idx - idx[0]).total_seconds() / 3600.0
+    cols = list(res.data.columns)
+    # Phase-shifted per series so the pair does not draw as a single line, and
+    # a period short enough that the transition hour is legible against it.
+    data = pd.DataFrame(
+        {c: np.sin((hours / 6.0 + k / 3.0) * np.pi) for k, c in enumerate(cols)},
+        index=idx)
+    counts = pd.DataFrame(1, index=idx, columns=cols)
+    return replace(res, data=data, counts=counts, interval=interval)
+
+
+@dataclass(frozen=True)
+class Transition:
+    """A DST change inside the plotted window, and what to say about it.
+
+    `start`/`end` are the REAL interval the wall clock mislabels, so the
+    bracket is drawn where the labels are wrong rather than at an instant
+    chosen by eye. `end is None` for a spring-forward: nothing is repeated
+    there, the clock jumps, and a bracket with width would invent a duration.
+    """
+    instant: object        # first instant on the new offset, UTC
+    start: object          # UTC
+    end: object            # UTC, or None for a spring-forward
+    caption: str           # what sits under the bracket
+    clause: str            # what is appended to the x-axis label
+
+    @property
+    def repeats(self) -> bool:
+        return self.end is not None
+
+
+def _transition_instant(before, after):
+    """The instant the offset changes, bisected between two samples.
+
+    Found rather than named. A hard-coded 2026-11-01T09:00Z is a fact about
+    one year that quietly stops being true, and this project's most expensive
+    bug was a timestamp nobody checked.
+    """
+    lo, hi = before.to_pydatetime(), after.to_pydatetime()
+    base = lo.astimezone(LOCAL_TZ).utcoffset()
+    while (hi - lo) > dt.timedelta(minutes=1):
+        mid = lo + (hi - lo) / 2
+        if mid.astimezone(LOCAL_TZ).utcoffset() == base:
+            lo = mid
+        else:
+            hi = mid
+    return hi.replace(second=0, microsecond=0)
+
+
+def transitions_in(index) -> list:
+    """Every DST transition inside `index`, with the text that names it.
+
+    THE AXIS IS HONEST AND THE LABELS ARE NOT, which is the whole reason this
+    exists. On a tz-aware axis the x values are linear in real time, so the
+    line is right -- but `AutoDateLocator` generates ticks from WALL CLOCK
+    times, and the repeated hour has no wall time to sit at, so it is skipped:
+
+        20758.33333  2026-11-01 01:00 PDT  ->  '01:00'
+        20758.41667  2026-11-01 02:00 PST  ->  '02:00'   <- TWO hours
+        20758.45833  2026-11-01 03:00 PST  ->  '03:00'   <- one hour
+
+    Two adjacent labels an hour apart with two hours between them. Someone
+    measuring a feature against the axis is off by an hour, and nothing says
+    so. The spring-forward is the mirror image: '01:00' then '03:00', reading
+    as two hours where only one passed.
+    """
+    out = []
+    for i in range(1, len(index)):
+        before, after = index[i - 1], index[i]
+        off_b = before.tz_convert(LOCAL_TZ).utcoffset()
+        off_a = after.tz_convert(LOCAL_TZ).utcoffset()
+        if off_b == off_a:
+            continue
+        t = _transition_instant(before, after)
+        delta = off_a - off_b
+        wall = t.astimezone(LOCAL_TZ).replace(tzinfo=None)
+        day = f"{wall:%d %b}".lstrip("0")
+        if delta < dt.timedelta(0):
+            # Fall back. The wall hour from `wall` onwards is served twice,
+            # once on each offset, so the real interval it covers runs from
+            # one |delta| before the change to one after.
+            span = -delta
+            out.append(Transition(
+                instant=t, start=t - span, end=t + span,
+                caption=f"{wall:%H:%M}–{wall + span:%H:%M} happens twice",
+                clause=f"{day} {wall:%H:%M}–{wall + span:%H:%M} occurs twice, "
+                       f"so those two labels are {int(2 * span.total_seconds() // 3600)} h apart"))
+        else:
+            # Spring forward. Nothing is repeated; a wall hour is skipped.
+            out.append(Transition(
+                instant=t, start=t, end=None,
+                caption=f"{wall - delta:%H:%M}–{wall:%H:%M} never happens",
+                clause=f"{day} {wall - delta:%H:%M}–{wall:%H:%M} does not "
+                       f"exist, so those two labels are "
+                       f"{int(delta.total_seconds() // 3600)} h apart"))
+    return out
+
+
+def transition_index(index):
+    """Where the UTC offset changes inside `index`, or None.
+
+    Returns the position of the FIRST sample on the far side of the
+    transition. Found by comparing offsets rather than by naming a date,
+    because a hard-coded instant is a fact about 2026 that stops being true,
+    and this project has already paid once for a timestamp nobody checked.
+    """
+    offsets = [t.tz_convert(LOCAL_TZ).utcoffset() for t in index]
+    for i in range(1, len(offsets)):
+        if offsets[i] != offsets[i - 1]:
+            return i
+    return None
+
 
 def _default_pair(study, by_key):
     """One QARTOD-flagged series and one unflagged, when the study has both.
@@ -2784,7 +3129,9 @@ def _default_pair(study, by_key):
 def _main(argv=None):
     import argparse
     import json
+    import shutil
     import sys
+    import tempfile
 
     import numpy as np
     import pandas as pd
@@ -2816,7 +3163,15 @@ def _main(argv=None):
                          "set, two borrowed ones and a ghost line at once -- "
                          "the picture the overlay's visual review is of, since "
                          "no gate can assert that a borrowed band READS as "
-                         "borrowed")
+                         "borrowed. With --check it ALSO writes a -dst and a "
+                         "-spring companion beside it, which are the pictures "
+                         "the DST review is of")
+    ap.add_argument("--dst", choices=("fall", "spring"), default=None,
+                    help="open a window spanning a DST transition instead of "
+                         "the study's own window. The index is fabricated, "
+                         "because every study here sits in summer and the "
+                         "transition cannot otherwise be looked at. Marks go "
+                         "to a temp directory, never into the study")
     args = ap.parse_args(argv)
 
     from pathlib import Path
@@ -2871,11 +3226,25 @@ def _main(argv=None):
         return 1
     print(f"rows  : {len(res.data)}  cols: {list(res.data.columns)}")
 
+    # A window on a fabricated transition, for the review no gate can do: a
+    # person has to zoom into the repeated hour and try a drag across it.
+    # Marks go to a temp directory and never into the study -- the window's
+    # index is invented, and a mark against an invented instant has no
+    # business in a study's evidence.
+    base_res = res              # before any --dst wrap; the gate builds its own
+    dst_dir = None
+    if args.dst:
+        lo_s, hi_s = DST_WINDOWS[args.dst]
+        res = transition_result(res, lo_s, hi_s)
+        dst_dir = Path(tempfile.mkdtemp(prefix=f"view-dst-{args.dst}-"))
+        print(f"dst   : {args.dst} — {lo_s} .. {hi_s}, {len(res.data)} rows")
+        print(f"marks : {dst_dir}  (temp; nothing is written to the study)")
+
     root_tk = tk.Tk()
     root_tk.title("view gate")
     root_tk.geometry("300x120")
     root_tk.update()
-    win = ViewWindow(root_tk, res, study=info)
+    win = ViewWindow(root_tk, res, study=info, annotations_dir=dst_dir)
     win.update()
     win.update_idletasks()
 
@@ -3102,8 +3471,14 @@ def _main(argv=None):
     checks.append((f"legend carries depth/frame {legend_texts}", has_geom))
 
     # ---- marking ----------------------------------------------------------
-    checks.append(("this window's local axis ascends, so marking is on",
-                   win.descent is None and win.span is not None))
+    # Asserted with numpy rather than through `annotations.first_descent`,
+    # which the window itself no longer calls. A gate that checks the app's
+    # own helper agrees with a mistake the two of them share.
+    ascends = bool(np.all(np.diff(win._xnum) > 0))
+    checks.append((f"the plotted x values strictly ascend, so marking is on "
+                   f"[{len(win._xnum)} samples, min step "
+                   f"{float(np.min(np.diff(win._xnum))) * 24:.3f} h]",
+                   ascends and win.span is not None))
 
     # matplotlib snaps by doing arithmetic on snap_values, so a list raises
     # inside _set_extents -- and the CallbackRegistry swallows it, leaving the
@@ -3186,9 +3561,6 @@ def _main(argv=None):
     # ---- reopening a marked pair renders the marks --------------------------
     # Against a temp directory, not the study's: the store is a function of a
     # path, and a gate should not leave marks in someone's real study.
-    import shutil
-    import tempfile
-
     tmp = Path(tempfile.mkdtemp(prefix="view-gate-"))
     win.destroy()
     try:
@@ -3278,9 +3650,7 @@ def _main(argv=None):
         # The length is part of the assertion: `all()` over an empty zip is
         # True, so without it this passes loudest when nothing was drawn at all.
         drawn_x = sorted((p.get_x(), p.get_x() + p.get_width()) for p in spans)
-        want_x = sorted((mdates.date2num(win._to_axis(a)),
-                         mdates.date2num(win._to_axis(b)))
-                        for a, b in inside)
+        want_x = sorted((win._to_num(a), win._to_num(b)) for a, b in inside)
         placed = (len(drawn_x) == len(want_x)
                   and all(abs(g[0] - w[0]) < 1e-6 and abs(g[1] - w[1]) < 1e-6
                           for g, w in zip(drawn_x, want_x)))
@@ -3746,27 +4116,17 @@ def _main(argv=None):
                        edge_ok and not any(b.markset.name == "straddler"
                                            for b in win.bands)))
 
-        # A window whose axis was refused for marking must still be deletable.
-        # #5 turns the selector off across a DST fall-back; only creating and
-        # adjusting need a monotonic axis, and a window that cannot be marked
-        # must not become one whose marks can never be removed.
-        keep_span, win.span = win.span, None
-        stuck = ann.Store(tmp)
-        stuck.confirm(study_id=info.study_id, pair=refs, name="stranded",
-                      reason="left on an unmarkable window",
-                      start_utc=idx[700], end_utc=idx[740])
-        win.redraw_marks()
-        target = next(b for b in win.bands if b.markset.name == "stranded")
-        picked = win.select_band(target)
-        checks.append(("with the selector refused, a mark can still be "
-                       "selected", picked is target
-                       and win.selected_band is target))
-        win.delete_selected()
-        checks.append(("and deleted, so an unmarkable window is not one whose "
-                       "marks are stuck there forever",
-                       not any(b.markset.name == "stranded"
-                               for b in win.bands)))
-        win.span = keep_span
+        # REMOVED WITH THE REFUSAL. This block set `win.span = None` by hand to
+        # simulate the window #5 refused to mark across a DST fall-back, and
+        # asserted its marks could still be selected and deleted. The axis is
+        # tz-aware now, nothing refuses the selector, and `span` is never None
+        # -- so the check was asserting a state the app can no longer reach,
+        # which is fiction rather than coverage. There is no reachable
+        # analogue: with Region off, a click is meant to do nothing, and the
+        # check below at "and a click does nothing while it is off" says so.
+        # #6's actual fix -- the click handlers connected first and
+        # unconditionally -- is still in `_install_span_selector` and is still
+        # exercised by the Region-mode checks. See #15.
 
         # ---- the mark list reaches what the chart cannot --------------------
         far = ann.Store(tmp)
@@ -4761,6 +5121,159 @@ def _main(argv=None):
                        and win.overlay_ids == []))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- windows that SPAN a DST transition ---------------------------------
+    # The case this whole change exists for, and the one no real study can
+    # reach: every pull window in use sits in summer. Only the index is
+    # fabricated; see transition_result.
+    for kind, title in (("fall", "fall-back"), ("spring", "spring-forward")):
+        tdir = Path(tempfile.mkdtemp(prefix=f"view-gate-{kind}-"))
+        twin = None
+        try:
+            lo_s, hi_s = DST_WINDOWS[kind]
+            tres = transition_result(base_res, lo_s, hi_s)
+            tidx = tres.data.index
+            k = transition_index(tidx)
+
+            # THE FIXTURE MUST ACTUALLY SPAN A TRANSITION or every check below
+            # passes for the wrong reason. Demonstrated against the OLD axis --
+            # the naive local values these same instants used to be plotted on
+            # -- rather than asserted from a date somebody typed.
+            naive = mdates.date2num(
+                tidx.tz_convert(LOCAL_TZ).tz_localize(None))
+            steps = np.diff(naive) * 24.0
+            if kind == "fall":
+                broke = ann.first_descent(naive)
+                checks.append((
+                    f"the {title} fixture really spans the transition: on the "
+                    f"OLD naive-local axis it doubles back at index {broke}, "
+                    f"and two samples share one wall time",
+                    broke is not None and k is not None
+                    and len(set(naive.tolist())) < len(naive)))
+            else:
+                checks.append((
+                    f"the {title} fixture really spans the transition: on the "
+                    f"OLD naive-local axis it stayed ASCENDING -- nothing "
+                    f"detected it -- while one step ran {steps.max():.1f} h "
+                    f"against a {steps.min():.1f} h cadence",
+                    k is not None and ann.first_descent(naive) is None
+                    and steps.max() > steps.min() * 2.5))
+
+            # A mark straddling the transition, written before the window is
+            # built so it is loaded rather than added.
+            trefs = tuple(ann.SeriesRef(tres.columns[c].key, c)
+                          for c in tres.data.columns)
+            across = (tidx[k - 4], tidx[k + 4])
+            ann.Store(tdir).confirm(
+                study_id=info.study_id, pair=trefs, name="across the transition",
+                reason="gate fixture", start_utc=across[0], end_utc=across[1])
+
+            twin = ViewWindow(root_tk, tres, study=info, annotations_dir=tdir)
+            twin.update()
+            twin.update_idletasks()
+
+            # 1. Ascending, READ BACK OFF THE ARTIST rather than off `_xnum`.
+            # `_xnum` is the window's own bookkeeping and would agree with a
+            # mistake the two of them share; `get_xdata` is what matplotlib
+            # actually holds. This is the acceptance criterion.
+            drawn = {c: mdates.date2num(line.get_xdata())
+                     for c, line in twin.series_lines.items()}
+            asc = all(bool(np.all(np.diff(x) > 0)) for x in drawn.values())
+            uniq = all(len(set(x.tolist())) == len(x) for x in drawn.values())
+            worst = min(float(np.min(np.diff(x))) for x in drawn.values())
+            checks.append((
+                f"[{title}] the plotted x values strictly ascend, so the line "
+                f"cannot retrace itself [{len(tidx)} samples, smallest step "
+                f"{worst * 24:.3f} h]", asc))
+            checks.append((
+                f"[{title}] and no two instants share one x, which is what "
+                f"the naive axis could not manage", uniq))
+
+            # 2. A drag ACROSS the transition resolves to the right instants.
+            # snap_span was refused here before; this is the evidence it now
+            # works rather than merely being allowed to run.
+            got = twin.span_interval(float(twin._xnum[k - 4]),
+                                     float(twin._xnum[k + 4]))
+            checks.append((
+                f"[{title}] a drag across the transition round-trips to the "
+                f"exact instants it covered [{got[0]} -> {got[1]}]"
+                if got else f"[{title}] a drag across the transition returned "
+                            f"nothing",
+                got is not None and got[0] == tidx[k - 4]
+                and got[1] == tidx[k + 4] and (got[2], got[3]) == (k - 4, k + 4)))
+            checks.append((
+                f"[{title}] and the selector is LIVE on this window, where it "
+                f"used to be refused outright", twin.span is not None))
+
+            # 3. The band is where its STORED instants say. This is the check
+            # that would catch a missed naive-local site as a 7 h offset.
+            spans = [b.patch for b in twin.bands]
+            want = sorted((twin._to_num(across[0]), twin._to_num(across[1])),)
+            drawn_x = sorted((p.get_x(), p.get_x() + p.get_width())
+                             for p in spans)
+            checks.append((
+                f"[{title}] the band straddling the transition is drawn at its "
+                f"stored instants, not seven hours off [{len(spans)} band(s)]",
+                len(drawn_x) == 1
+                and abs(drawn_x[0][0] - want[0]) < 1e-9
+                and abs(drawn_x[0][1] - want[1]) < 1e-9))
+
+            # 4. The chart SAYS something about the hour, and says the right
+            # thing. No gate can assert that it reads correctly to a person --
+            # that is what --dst and the companion PNGs are for -- but a
+            # silent chart must not pass, and neither must one naming the
+            # wrong hour.
+            said = twin.transition_texts()
+            wall = t_local = twin.transitions[0].instant.astimezone(
+                LOCAL_TZ).replace(tzinfo=None) if twin.transitions else None
+            if kind == "fall":
+                wanted, phrase = f"{wall:%H:%M}", "happens twice"
+            else:
+                wanted, phrase = f"{wall - dt.timedelta(hours=1):%H:%M}", \
+                    "never happens"
+            checks.append((
+                f"[{title}] the chart states what the labels cannot, naming "
+                f"the hour [{said}]",
+                len(twin.transitions) == 1 and len(said) == 1
+                and phrase in said[0] and wanted in said[0]))
+            checks.append((
+                f"[{title}] and the x axis label carries it too, so it "
+                f"survives the transition being scrolled off "
+                f"[{twin.figure.axes[0].get_xlabel()[:72]}...]",
+                "time (local)" in twin.figure.axes[0].get_xlabel()
+                and wanted in twin.figure.axes[0].get_xlabel()))
+            checks.append((
+                f"[{title}] the bracket is drawn BELOW the spine, so no new "
+                f"ink crosses a series line [{len(twin.transition_artists)} "
+                f"artists]",
+                bool(twin.transition_artists)
+                and all(a.get_clip_on() is False
+                        for a in twin.transition_artists)))
+
+            # And the tick list carries no instant twice. At a spring-forward
+            # the rrule asks for 02:00 and 03:00 local, which fold onto one
+            # position; see _dst_locator_class.
+            axz = twin.figure.axes[0]
+            axz.set_xlim(twin._to_num(tidx[k - 6]), twin._to_num(tidx[k + 6]))
+            twin.canvas.draw()
+            ticks = list(axz.get_xticks())
+            checks.append((
+                f"[{title}] zoomed to hourly ticks, no instant is ticked twice "
+                f"[{len(ticks)} ticks, {len(set(np.round(ticks, 9)))} "
+                f"positions]",
+                len(ticks) == len(set(np.round(ticks, 9)))))
+            axz.set_xlim(twin._window_xlim)
+            twin.canvas.draw()
+
+            if args.shot:
+                stem = Path(args.shot)
+                out = stem.with_name(f"{stem.stem}-{kind}{stem.suffix}")
+                twin.figure.savefig(out, dpi=110, facecolor="white")
+                print(f"shot  : {out}")
+        finally:
+            if twin is not None:
+                twin.destroy()
+            shutil.rmtree(tdir, ignore_errors=True)
 
     print("\nview gate:")
     for what, ok in checks:
