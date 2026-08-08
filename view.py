@@ -1864,30 +1864,22 @@ class ViewWindow(tk.Toplevel):
         and pan hold while active, but that was never the whole answer -- the
         click handlers below never consulted it at all.
         """
-        # Marking is refused outright on an axis that doubles back. Local time
-        # runs 01:00, 01:30, 01:00, 01:30 across the November fall-back, so an
-        # hour of the axis is not ascending and a bisect through it would
-        # return a confident wrong index. Better to say so than to store a mark
-        # that means an hour other than the one that was dragged.
-        # Click-to-select is wired up FIRST and unconditionally. Creating and
-        # adjusting need a monotonic axis to snap against; selecting and
-        # deleting do not, and a window that cannot be marked must not become
-        # one whose existing marks can never be removed.
+        # THIS USED TO REFUSE TO MARK a window whose axis doubled back. The
+        # axis was naive local time, which runs 01:00, 01:30, 01:00, 01:30
+        # across the November fall-back, and `snap_span` bisects -- so a drag
+        # into that hour would have returned a confident wrong index. The
+        # refusal was the right answer to the axis as it was.
+        #
+        # The axis is tz-aware now, so `_xnum` is a sequence of instants and
+        # ascends by construction; `build_comparison` bins them in order.
+        # There is nothing left to refuse, and a window spanning a transition
+        # can be marked like any other. `annotations.first_descent` is kept --
+        # it is the executable record of why the axis is tz-aware, and its
+        # gate demonstrates the failure rather than describing it -- but
+        # nothing in the drawing path consults it any more. See #15.
         self._press_x = None
         self.canvas.mpl_connect("button_press_event", self._on_press)
         self.canvas.mpl_connect("button_release_event", self._on_release)
-
-        self.descent = ann.first_descent(self._xnum)
-        if self.descent is not None:
-            when = ann.local_text(self._utc[self.descent])
-            self.span = None
-            self.span_text.set(
-                f"Marking is off for this window: local time runs backwards "
-                f"around {when}, where a DST fall-back makes one wall clock "
-                f"hour cover two different hours of real time. Existing marks "
-                f"can still be selected and deleted. Rebuild the window to "
-                f"exclude it.")
-            return
 
         ax = self.figure.axes[0]
         self.span = SpanSelector(
@@ -1931,11 +1923,9 @@ class ViewWindow(tk.Toplevel):
             return
         if event.inaxes is not self.figure.axes[0] or self._press_x is None:
             return
-        # With no selector there is no create gesture to be confused with, and
-        # snap_span cannot be trusted on the axis that refused it, so every
-        # release is a click.
-        moved = (self.span is not None
-                 and self.span_interval(self._press_x, event.xdata) is not None)
+        # A release that covered at least one sample is a drag, and the
+        # selector's own onselect owns it. Anything shorter is a click.
+        moved = self.span_interval(self._press_x, event.xdata) is not None
         self._press_x = None
         if moved:
             return                       # a real drag; onselect owns it
@@ -1980,8 +1970,7 @@ class ViewWindow(tk.Toplevel):
             self._sync_row_selection()
 
         if entry is None:
-            if self.span is not None:
-                self.span.set_visible(False)
+            self.span.set_visible(False)
             self.selection = None
             self.span_text.set(SPAN_HINT)
             self.canvas.draw_idle()
@@ -1996,9 +1985,9 @@ class ViewWindow(tk.Toplevel):
         # selectable so that clicking one says where it came from, and that is
         # all it is.
         shown = entry.drawn or entry.interval
-        if entry.is_foreign and self.span is not None:
+        if entry.is_foreign:
             self.span.set_visible(False)
-        elif self.span is not None:
+        else:
             self.span.set_visible(True)
             self.span.extents = (self._to_num(shown.start_utc),
                                  self._to_num(shown.end_utc))
@@ -3150,8 +3139,14 @@ def _main(argv=None):
     checks.append((f"legend carries depth/frame {legend_texts}", has_geom))
 
     # ---- marking ----------------------------------------------------------
-    checks.append(("this window's local axis ascends, so marking is on",
-                   win.descent is None and win.span is not None))
+    # Asserted with numpy rather than through `annotations.first_descent`,
+    # which the window itself no longer calls. A gate that checks the app's
+    # own helper agrees with a mistake the two of them share.
+    ascends = bool(np.all(np.diff(win._xnum) > 0))
+    checks.append((f"the plotted x values strictly ascend, so marking is on "
+                   f"[{len(win._xnum)} samples, min step "
+                   f"{float(np.min(np.diff(win._xnum))) * 24:.3f} h]",
+                   ascends and win.span is not None))
 
     # matplotlib snaps by doing arithmetic on snap_values, so a list raises
     # inside _set_extents -- and the CallbackRegistry swallows it, leaving the
@@ -3792,27 +3787,17 @@ def _main(argv=None):
                        edge_ok and not any(b.markset.name == "straddler"
                                            for b in win.bands)))
 
-        # A window whose axis was refused for marking must still be deletable.
-        # #5 turns the selector off across a DST fall-back; only creating and
-        # adjusting need a monotonic axis, and a window that cannot be marked
-        # must not become one whose marks can never be removed.
-        keep_span, win.span = win.span, None
-        stuck = ann.Store(tmp)
-        stuck.confirm(study_id=info.study_id, pair=refs, name="stranded",
-                      reason="left on an unmarkable window",
-                      start_utc=idx[700], end_utc=idx[740])
-        win.redraw_marks()
-        target = next(b for b in win.bands if b.markset.name == "stranded")
-        picked = win.select_band(target)
-        checks.append(("with the selector refused, a mark can still be "
-                       "selected", picked is target
-                       and win.selected_band is target))
-        win.delete_selected()
-        checks.append(("and deleted, so an unmarkable window is not one whose "
-                       "marks are stuck there forever",
-                       not any(b.markset.name == "stranded"
-                               for b in win.bands)))
-        win.span = keep_span
+        # REMOVED WITH THE REFUSAL. This block set `win.span = None` by hand to
+        # simulate the window #5 refused to mark across a DST fall-back, and
+        # asserted its marks could still be selected and deleted. The axis is
+        # tz-aware now, nothing refuses the selector, and `span` is never None
+        # -- so the check was asserting a state the app can no longer reach,
+        # which is fiction rather than coverage. There is no reachable
+        # analogue: with Region off, a click is meant to do nothing, and the
+        # check below at "and a click does nothing while it is off" says so.
+        # #6's actual fix -- the click handlers connected first and
+        # unconditionally -- is still in `_install_span_selector` and is still
+        # exercised by the Region-mode checks. See #15.
 
         # ---- the mark list reaches what the chart cannot --------------------
         far = ann.Store(tmp)
