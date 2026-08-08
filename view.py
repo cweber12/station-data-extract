@@ -889,6 +889,29 @@ def _dst_formatter_class():
     return _DST_FORMATTER
 
 
+def cursor_readout(value) -> str:
+    """The instant under the cursor, for the toolbar's coordinate readout.
+
+    Same zone and same shape as the tick labels, because the readout sits
+    directly under them and two formats for one instant read as two opinions.
+    Assigned to `ax.fmt_xdata`, which is what `Axes.format_xdata` uses when
+    set, and `format_coord` -- the toolbar message -- goes through that.
+
+    UNCONDITIONAL, where the tick labels show the designator only when the
+    window spans a transition. The tick labels are conditional because a
+    designator on every tick is ink spent against a misreading that cannot
+    occur; that argument does not carry here. This is one short string that
+    appears only under the cursor, so it costs four characters in a place
+    nothing competes for -- and unlike a tick it has no offset text beside it
+    naming the day and no axis label naming the zone, so if it does not say
+    which offset it is on, nothing on the toolbar does.
+
+    NO SECONDS. The samples are half-hourly and nothing else on the window
+    prints them; `:00` on every reading is a precision the data does not have.
+    """
+    return mdates.num2date(value, tz=LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
+
+
 _MODE_TOOLBAR = None
 
 
@@ -2899,6 +2922,11 @@ class ViewWindow(tk.Toplevel):
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(_dst_formatter_class()(
             locator, tz=LOCAL_TZ, show_zone=bool(self.transitions)))
+        # And the toolbar's cursor readout, which the formatter above does NOT
+        # reach: `format_data_short` is a separate path and produced a bare
+        # `2026-11-01 01:00:00` for both instants of a repeated hour, one wall
+        # time under a tick label that had just resolved it. See #33.
+        ax.fmt_xdata = cursor_readout
         if self.transitions:
             # A designator makes every time label half again as long, and the
             # two ticks either side of the change sit an hour apart on an axis
@@ -5138,6 +5166,20 @@ def _main(argv=None):
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # ---- the toolbar's cursor readout ---------------------------------------
+    # Driven through `format_xdata`, the entry point the toolbar message goes
+    # through, rather than reading `fmt_xdata` back -- which would confirm only
+    # that the attribute was assigned, not that matplotlib uses it.
+    axw = win.figure.axes[0]
+    read = axw.format_xdata(float(win._xnum[0]))
+    checks.append((
+        f"the cursor readout carries its zone designator even with no "
+        f"transition in view, so it is self-describing [{read}]",
+        read.split()[-1] in ("PST", "PDT")))
+    checks.append((
+        f"and prints no seconds, which nothing else on the window does "
+        f"[{read}]", re.search(r"\d{2}:\d{2}:\d{2}", read) is None))
+
     # ---- windows that SPAN a DST transition ---------------------------------
     # The case this whole change exists for, and the one no real study can
     # reach: every pull window in use sits in summer. Only the index is
@@ -5287,6 +5329,22 @@ def _main(argv=None):
                 f"[{title}] the x axis names the IANA zone "
                 f"[{axz.get_xlabel()}]",
                 LOCAL_TZ.key in axz.get_xlabel()))
+
+            # 5. AND SO DOES THE CURSOR READOUT. The tick labels above were
+            # the fix in #15; this is the same defect on the toolbar, which
+            # `format_data_short` served and the formatter never reached. The
+            # acceptance criterion is that the two instants of a repeated wall
+            # hour produce DIFFERENT strings.
+            reads = [axz.format_xdata(twin._to_num(e))
+                     for e in twin.transitions[0].edges]
+            checks.append((
+                f"[{title}] the cursor readout resolves the two instants "
+                f"either side of the change to different strings [{reads}]",
+                reads[0] != reads[1]))
+            checks.append((
+                f"[{title}] and it agrees with the tick label above it, rather "
+                f"than being a second opinion in another format [{got}]",
+                all(g in r for g, r in zip(got, reads))))
 
             axz.set_xlim(twin._window_xlim)
             twin.canvas.draw()
