@@ -1977,22 +1977,88 @@ class ViewWindow(tk.Toplevel):
                 f"on screen, in this study: sharing both makes it the same "
                 f"comparison, which loads as native marks, and sharing neither "
                 f"gives it no bearing on what is drawn.")
-        if set_id not in self.overlay_ids:
-            self.overlay_ids.append(set_id)
-        self.redraw_marks()
-        # Here, and not inside the redraw: borrowing is an action, and an
-        # action may move the frame. Drawing may not.
-        self._apply_ylim()
+        self._set_overlay_ids(self.overlay_ids + [set_id])
         return cand
 
     def remove_overlay(self, set_id: str) -> bool:
         """Stop drawing a borrowed set. True if it was on the chart."""
         if set_id not in self.overlay_ids:
             return False
-        self.overlay_ids = [i for i in self.overlay_ids if i != set_id]
+        self._set_overlay_ids([i for i in self.overlay_ids if i != set_id])
+        return True
+
+    def _set_overlay_ids(self, ids) -> bool:
+        """Assign what is borrowed and repaint ONCE. True if it changed.
+
+        The single place `overlay_ids` moves. Showing a name can bring
+        several sets on at once, and doing that through the per-set entry
+        point redrew once per set -- and a redraw RELOADS THE WHOLE STORE
+        FROM DISK, so borrowing a name covering three sets read every
+        annotation file three times and repainted three times to arrive at
+        one picture. Worse, each intermediate repaint was a state no one
+        asked for.
+
+        Order is preserved and duplicates dropped, so the caller can hand in
+        `existing + more` without having to think about either.
+        """
+        wanted = list(dict.fromkeys(ids))
+        if wanted == self.overlay_ids:
+            return False
+        self.overlay_ids = wanted
         self.redraw_marks()
+        # Here, and not inside the redraw: borrowing is an action, and an
+        # action may move the frame. Drawing may not.
         self._apply_ylim()
         return True
+
+    # ------------------------------------------- borrowing, by NAME
+    # What the control offers. A name is the unit a person thinks in, and
+    # `annotations.group_by_name` is where the rule lives; these are the two
+    # verbs over it plus the state the checkboxes read back.
+
+    def overlay_groups(self) -> list:
+        """The offers, grouped by name and ordered. The seam under the list."""
+        return ann.group_by_name(self.candidates)
+
+    def group_named(self, name: str):
+        """The offer carrying `name`, or None."""
+        return next((g for g in self.overlay_groups() if g.name == name), None)
+
+    def shown_names(self) -> set:
+        """Names with at least one set on the chart."""
+        return {g.name for g in self.overlay_groups()
+                if g.state(self.overlay_ids) != "none"}
+
+    def show_name(self, name: str):
+        """Borrow EVERY eligible set carrying `name`. Returns the group.
+
+        All of them, because the name is what was asked for. Showing
+        whichever set happened to sort first would answer a question nobody
+        asked and leave the rest of the phenomenon off the chart.
+        """
+        group = self.group_named(name)
+        if group is None:
+            raise RuntimeError(
+                f"“{name}” is not on offer for this pair. A set is offered "
+                f"only when it shares EXACTLY ONE series with what is on "
+                f"screen, in this study.")
+        self._set_overlay_ids(self.overlay_ids + list(group.set_ids))
+        return group
+
+    def hide_name(self, name: str) -> bool:
+        """Stop drawing every set carrying `name`. True if anything changed.
+
+        Every set, including the case where only some of them were on the
+        chart: unticking a name means the name is gone, and leaving a
+        remnant behind an unticked box is how a chart starts disagreeing
+        with its own controls.
+        """
+        group = self.group_named(name)
+        if group is None:
+            return False
+        drop = set(group.set_ids)
+        return self._set_overlay_ids(
+            [i for i in self.overlay_ids if i not in drop])
 
     # ------------------------------------------------------------- deleting
 

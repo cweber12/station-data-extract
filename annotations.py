@@ -457,6 +457,81 @@ class Candidate:
         return f"{self.markset.name}  —  {self.markset.pair_text}"
 
 
+@dataclass(frozen=True)
+class NameGroup:
+    """Every borrowable set carrying one NAME, offered as a single choice.
+
+    A name is the unit a person thinks in. "Internal tide" marked on three
+    comparisons is three sets and one phenomenon, and offering them as three
+    lines that read identically apart from a trailing pair asks for a choice
+    nobody has the information to make from this window -- the pair they
+    differ by is not the pair on screen, in any of the three cases.
+
+    So the group is the offer, and showing it shows all of them. What the
+    sets are individually is still reachable: `set_ids` is what the window
+    borrows by, and the legend attributes each one separately once drawn.
+    """
+    name: str
+    candidates: tuple
+
+    @property
+    def set_ids(self) -> tuple:
+        return tuple(c.markset.set_id for c in self.candidates)
+
+    @property
+    def n_regions(self) -> int:
+        return sum(len(c.markset.intervals) for c in self.candidates)
+
+    @property
+    def pair_texts(self) -> tuple:
+        """The source pairs, in order, without repeats."""
+        out = []
+        for c in self.candidates:
+            if c.markset.pair_text not in out:
+                out.append(c.markset.pair_text)
+        return tuple(out)
+
+    def state(self, shown_ids) -> str:
+        """"all", "some" or "none" of this group is on the chart.
+
+        "some" is reachable because a single set can still be borrowed
+        directly -- the per-set seam did not go away when the control started
+        working in names. A row that claimed "shown" while half its regions
+        were absent would be the kind of quiet lie this repo keeps paying
+        for, so the caller is told the difference and says so.
+        """
+        on = sum(1 for i in self.set_ids if i in set(shown_ids))
+        if on == 0:
+            return "none"
+        return "all" if on == len(self.set_ids) else "some"
+
+    @property
+    def offer_text(self) -> str:
+        """What the row says. Counts the REGIONS, which is what gets drawn.
+
+        The set count is not shown: two sets under one name is a fact about
+        how the marking happened, not about what appears on the chart, and
+        the pairs behind it are named underneath anyway.
+        """
+        n = self.n_regions
+        return f"{self.name}  ({n} region{'s' if n != 1 else ''})"
+
+
+def group_by_name(candidates) -> list:
+    """Candidates grouped into NameGroups, ordered by name.
+
+    Ordered so the control does not reshuffle itself between refreshes:
+    `eligible_overlays` returns whatever order the catalogue was in, and a
+    list of checkboxes that reorders under the pointer is a list that gets
+    the wrong one ticked.
+    """
+    by_name = {}
+    for c in candidates:
+        by_name.setdefault(c.markset.name, []).append(c)
+    return [NameGroup(name, tuple(by_name[name]))
+            for name in sorted(by_name, key=str.casefold)]
+
+
 def eligible_overlays(sets, keys, study_id: str | None = None) -> list:
     """The sets that could be borrowed onto this pair: EXACTLY ONE shared.
 
@@ -1163,14 +1238,18 @@ def _main(argv=None):
         salinity = SeriesRef("observations.parquet::LJAC1::sea_water_salinity",
                              "LJAC1.sea_water_salinity")
 
-        def a_set(name, members, study=study_id):
+        def a_set(name, members, study=study_id, set_id=None, intervals=None):
+            # `set_id` is overridable because two sets can legitimately share
+            # a NAME -- which is the case the grouping below exists for -- and
+            # the slug alone would collide them into one.
             return MarkSet(
-                set_id=f"id-{_slug(name)}", name=name, reason="",
+                set_id=set_id or f"id-{_slug(name)}", name=name, reason="",
                 color=SET_COLORS[0],
                 created_utc=dt.datetime(2026, 8, 1, tzinfo=utc),
                 study_id=study, pair=members,
-                intervals=[Interval(dt.datetime(2026, 7, 20, 0, tzinfo=utc),
-                                    dt.datetime(2026, 7, 20, 6, tzinfo=utc))])
+                intervals=intervals or
+                [Interval(dt.datetime(2026, 7, 20, 0, tzinfo=utc),
+                          dt.datetime(2026, 7, 20, 6, tzinfo=utc))])
 
         # On screen: LJAC1 temperature against 46254 temperature -- the case
         # the whole feature exists for, where the two fail to line up and the
@@ -1223,6 +1302,58 @@ def _main(argv=None):
            bool(offered) and water.label in offered[0].offer_text
            and temp_ljac1.label in offered[0].offer_text
            and "water level" in offered[0].offer_text)
+
+        # ---- grouping the offers by NAME ------------------------------------
+        # Headless on purpose. This is the rule behind the control that shows
+        # another pair's regions, and a rule that can only be exercised by
+        # opening a window is a rule that stops being exercised.
+        # One name, two sets, marked on two DIFFERENT pairs -- which is the
+        # whole reason the offer is a name and not a set.
+        twin_a = a_set("twin", (temp_ljac1, water), set_id="a__twin")
+        twin_b = a_set(
+            "twin", (temp_ljac1, salinity), set_id="b__twin",
+            intervals=[Interval(dt.datetime(2026, 7, 21, 0, tzinfo=utc),
+                                dt.datetime(2026, 7, 21, 6, tzinfo=utc)),
+                       Interval(dt.datetime(2026, 7, 22, 0, tzinfo=utc),
+                                dt.datetime(2026, 7, 22, 6, tzinfo=utc))])
+        grouped = group_by_name(eligible_overlays(
+            catalogue + [twin_a, twin_b], viewing, study_id))
+        names = [g.name for g in grouped]
+        ok(f"two sets sharing a name are ONE offer, not two lines differing "
+           f"only in a trailing pair [{names}]",
+           names.count("twin") == 1 and len(names) == len(set(names)))
+        ok(f"and the offers are ordered by name, so a refresh cannot "
+           f"reshuffle the row under the pointer [{names}]",
+           names == sorted(names, key=str.casefold))
+
+        twin = next(g for g in grouped if g.name == "twin")
+        ok(f"the group carries every set id under that name, which is what "
+           f"gets borrowed [{len(twin.set_ids)} sets]",
+           set(twin.set_ids) == {"a__twin", "b__twin"})
+        ok(f"and counts REGIONS rather than sets, because regions are what "
+           f"appear on the chart [{twin.offer_text}]",
+           twin.n_regions == 3 and "3 regions" in twin.offer_text)
+        ok(f"and names both source pairs, without repeating one "
+           f"[{len(twin.pair_texts)} pair(s)]",
+           len(twin.pair_texts) == 2
+           and len(set(twin.pair_texts)) == 2)
+
+        # The three states, because "some" is reachable and must not be
+        # reported as "shown".
+        ok("a group with nothing borrowed reads none",
+           twin.state([]) == "none")
+        ok("with every set borrowed it reads all",
+           twin.state(["a__twin", "b__twin"]) == "all")
+        ok("and with one of two borrowed it reads SOME, rather than "
+           "claiming the whole name is on the chart",
+           twin.state(["a__twin"]) == "some")
+        ok("a set id belonging to some other name does not count towards it",
+           twin.state(["something__else"]) == "none")
+
+        singular = [g for g in grouped if g.n_regions == 1]
+        ok(f"a one-region offer is not pluralised "
+           f"[{singular[0].offer_text if singular else ''}]",
+           bool(singular) and "(1 region)" in singular[0].offer_text)
 
         # ---- clipping -------------------------------------------------------
         ivs = [Interval(dt.datetime(2026, 7, 20, 0, tzinfo=utc),
