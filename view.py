@@ -179,12 +179,17 @@ def pair_refusal(n: int) -> str | None:
 
 
 def subtitle_for(result) -> str:
-    """One line describing the build, in the workbook's idiom."""
+    """One line describing the build, in the workbook's idiom.
+
+    The endpoints carry their zone designator for the same reason
+    `annotations.local_text` does: a window that starts or ends inside a
+    repeated hour would otherwise name an instant it cannot identify.
+    """
     lo = result.data.index[0].tz_convert(LOCAL_TZ)
     hi = result.data.index[-1].tz_convert(LOCAL_TZ)
     n = len(result.data)
     return (f"{result.interval} {result.aggregation}  ·  "
-            f"{lo:%Y-%m-%d %H:%M} to {hi:%Y-%m-%d %H:%M} local  ·  "
+            f"{lo:%Y-%m-%d %H:%M %Z} to {hi:%Y-%m-%d %H:%M %Z}  ·  "
             f"{n:,} intervals")
 
 
@@ -2185,7 +2190,7 @@ class ViewWindow(tk.Toplevel):
         iv = entry.interval
         text = (f"Selected “{entry.markset.name}”:  "
                 f"{ann.local_text(iv.start_utc)}  →  "
-                f"{ann.local_text(iv.end_utc)}  local"
+                f"{ann.local_text(iv.end_utc)}"
                 f"  ·  {duration_text(iv.end_utc - iv.start_utc)}")
         if entry.is_foreign:
             # Where it came from, on selection rather than only in the legend.
@@ -2274,7 +2279,7 @@ class ViewWindow(tk.Toplevel):
         return self._utc[i0], self._utc[i1], i0, i1
 
     def _span_summary(self, start, end, i0: int, i1: int) -> str:
-        return (f"{ann.local_text(start)}  →  {ann.local_text(end)}  local"
+        return (f"{ann.local_text(start)}  →  {ann.local_text(end)}"
                 f"  ·  {duration_text(end - start)}"
                 f"  ·  {i1 - i0 + 1} intervals of {self.result.interval}")
 
@@ -2599,7 +2604,7 @@ class ViewWindow(tk.Toplevel):
         lines = [f"Delete this mark?", "",
                  f"    {ms.name}",
                  f"    {ann.local_text(iv.start_utc)} → "
-                 f"{ann.local_text(iv.end_utc)} local"]
+                 f"{ann.local_text(iv.end_utc)}"]
         if ms.reason:
             lines.append(f"    “{ms.reason}”")
         lines.append("")
