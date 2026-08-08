@@ -440,46 +440,58 @@ def _stock_icon_stats(master=None):
 
 
 def _region_icon(master):
-    """A 20x20 marquee over a trace: "select a span of this chart".
+    """The standard "select area" glyph: a frame open at one corner, and a
+    plus sitting in the opening.
 
-    DRAWN, not shipped. matplotlib resolves its own toolbar icons through the
-    private `cbook._get_data_path`, and a PNG committed here would be the one
-    file in this repo whose content cannot be read in a diff -- an icon that
-    nobody can review is an icon nobody can correct.
+    TRANSCRIBED FROM AN SVG, exactly. The source is the public-domain
+    select-area icon from SVG Repo, whose `viewBox` is `0 0 24 24` -- the same
+    canvas matplotlib's toolbar icons use, so every coordinate in its path
+    maps 1:1 onto a pixel here and nothing is approximated. The original path,
+    for anyone checking this against it:
+
+        M13,8 L13,6 L19,6 C20.1,6 21,6.9 21,8 L21,19 C21,20.1 20.1,21 19,21
+        L8,21 C6.9,21 6,20.1 6,19 L6,13 L8,13 L8,19 L19,19 L19,8 L13,8 Z
+        M6,6 L6,3 L8,3 L8,6 L11,6 L11,8 L8,8 L8,11 L6,11 L6,8 L3,8 L3,6 L6,6 Z
+
+    The file itself is not used, because THIS TK CANNOT READ ONE: SVG support
+    arrived in Tk 8.7 and the interpreter here is 8.6.15, so `PhotoImage`
+    refuses it with "couldn't recognize data in image file". Rasterising at
+    build time would mean a new dependency and a committed binary, and a
+    binary is the one file in this repo whose content cannot be read in a
+    diff. Transcribed, the shape is reviewable and correctable in place.
 
     A fresh PhotoImage is fully transparent, so only the inked pixels are set
     and the button's own background shows through in any theme. The caller
     must keep the returned image alive: Tk drops an image the moment its last
     Python reference goes, and the button then renders empty.
     """
-    # Matched to its neighbours, which is the whole point of an icon here:
-    # matplotlib's are 24x24 PURE BLACK silhouettes of about 220 inked pixels
-    # -- solid shapes, no outlines, no second colour. A two-tone 20x20 badge
-    # sat in that row looking like something from another program.
     ink = "#000000"
     size = 24
     img = tk.PhotoImage(master=master, width=size, height=size)
 
-    # The icon IS a region: the colour bar, then the block under it. It
-    # previews its own result, which is the most a 24 px glyph can do.
-    #
-    # Vertical because a region is a span of time and nothing else -- a square
-    # would imply the y range is part of the claim, which CONTEXT.md is at
-    # pains to deny.
-    #
-    # Two solid shapes and a gap, and nothing overlapping. A trace crossing
-    # the block was tried twice: with one colour it has to be knocked out of
-    # the block as negative space, and at this size the knockout either
-    # vanishes at 2 px or severs the block at 3 px. Neighbouring glyphs are
-    # single silhouettes for the same reason.
-    # Width chosen to land inside the stock icons' ink weight (228-284 px);
-    # at ten columns this read visibly lighter than everything beside it.
-    x0, x1 = 6, 17
-    for x in range(x0, x1 + 1):
-        for y in range(2, 5):                     # the colour bar, on top
-            img.put(ink, to=(x, y))
-        for y in range(7, 22):                    # the region under it
-            img.put(ink, to=(x, y))
+    def fill(xa, xb, ya, yb):
+        """The SVG's coordinates are edges; a span [a,b) is b-a pixels."""
+        for x in range(xa, xb):
+            for y in range(ya, yb):
+                img.put(ink, to=(x, y))
+
+    # The frame, two units thick, open at the top left. Four segments, read
+    # straight off the path above.
+    fill(13, 19, 6, 8)        # top,    x 13->19
+    fill(19, 21, 6, 21)       # right,  y 6->21
+    fill(6, 21, 19, 21)       # bottom, x 6->21
+    fill(6, 8, 13, 21)        # left,   y 13->21
+
+    # The three rounded corners. The source rounds them with a radius-2 arc;
+    # at 24 px that is one pixel off each outer corner, and the fourth corner
+    # is not rounded because it is not there -- that opening is the point of
+    # the glyph.
+    for corner in ((20, 6), (20, 20), (6, 20)):
+        img.transparency_set(*corner, True)
+
+    # The plus, in the opening. Centred on the corner the frame gives up.
+    fill(6, 8, 3, 11)         # vertical arm
+    fill(3, 11, 6, 8)         # horizontal arm
     return img
 
 
@@ -2537,32 +2549,43 @@ def _main(argv=None):
     checks.append((f"and the image survived, with pixels actually drawn "
                    f"[{icon.width()}x{icon.height()}, {len(opaque)} inked]",
                    (icon.width(), icon.height()) == (24, 24)
-                   and len(opaque) > 150))
+                   and len(opaque) > 80))
 
-    # COHESION, asserted rather than asserted-in-a-comment. matplotlib's own
-    # toolbar icons are 24x24 pure-black silhouettes of roughly 210-250 inked
-    # pixels; a two-tone 20x20 badge sat in that row looking like it came from
-    # another program. Same canvas, same single colour, comparable weight.
+    # COHESION, measured rather than asserted in a comment: the same canvas
+    # and the same single pure black as matplotlib's own toolbar icons.
+    #
+    # WEIGHT IS DELIBERATELY NOT COMPARED. It used to be, and the bound said
+    # 0.6x the lightest stock icon. This glyph is an OUTLINE -- a frame two
+    # units thick -- where the stock ones are filled silhouettes, so it inks
+    # about 105 px against their 228-284 and always will. That is the style
+    # that was asked for, not a defect, and a bound loose enough to admit it
+    # would be loose enough to admit anything. The floor above is what still
+    # catches an icon that failed to draw.
     stock = _stock_icon_stats()
     checks.append((f"and match the stock toolbar icons: same canvas, ONE "
                    f"colour, pure black [{sorted(inked)} vs stock "
                    f"{sorted(stock['colours'])}]",
                    inked == {(0, 0, 0)}
                    and (icon.width(), icon.height()) == stock["size"]))
-    checks.append((f"at a comparable ink weight, so it does not read as "
-                   f"lighter or heavier than its neighbours "
-                   f"[{len(opaque)} vs stock {stock['low']}-{stock['high']}]",
-                   0.6 * stock["low"] <= len(opaque) <= 1.4 * stock["high"]))
 
-    # A BAR over a BLOCK, which is what a region looks like on the chart. The
-    # gap is the assertion: without it this is one plain rectangle, and the
-    # icon stops previewing its own result.
-    mid = (icon.width()) // 2
-    column = [not icon.transparency_get(mid, y) for y in range(icon.height())]
-    runs = [k for k, v in enumerate(column) if v and not column[k - 1]]
-    checks.append((f"and depict a colour bar ABOVE a region block, not one "
-                   f"plain rectangle [{len(runs)} inked run(s) down the "
-                   f"middle]", len(runs) == 2))
+    # The transcription, checked against the SVG it came from rather than
+    # against how it looks. Four claims, each a coordinate in that path:
+    # the frame is HOLLOW, it is OPEN at the top left, and the plus is in the
+    # opening -- above the frame and to the left of it.
+    def lit(x, y):
+        return not icon.transparency_get(x, y)
+
+    shape = {"hollow interior": not lit(14, 14),
+             "right edge": lit(19, 12),
+             "bottom edge": lit(12, 19),
+             "corner left open": not lit(11, 6) and not lit(12, 6),
+             "plus above frame": lit(6, 3) and lit(7, 4),
+             "plus left of frame": lit(3, 6) and lit(4, 7)}
+    wrong = [k for k, v in shape.items() if not v]
+    checks.append((f"and depict a select-area frame with a plus in its open "
+                   f"corner, transcribed from the source path "
+                   f"[{'all 6 hold' if not wrong else 'WRONG: ' + ', '.join(wrong)}]",
+                   not wrong))
     checks.append((f"and the button is drawn at least as wide as its icon, so "
                    f"the image is rendered and not merely attached "
                    f"[{win.region_btn.winfo_width()} px]",
