@@ -64,7 +64,7 @@ from __future__ import annotations
 
 import datetime as dt
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import messagebox, ttk
 from zoneinfo import ZoneInfo
@@ -2783,6 +2783,71 @@ class ViewWindow(tk.Toplevel):
 # constructed, and that the lines carry the same z-scores the workbook writes.
 # ---------------------------------------------------------------------------
 
+# The windows the DST review is done on. Wide enough on each side that the
+# transition is read against ordinary hours rather than at the frame's edge,
+# and narrow enough that the hourly ticks are actually drawn -- at 45 days the
+# locator ticks daily and the artifact this is all about is invisible.
+DST_WINDOWS = {
+    "fall": ("2026-10-31T18:00Z", "2026-11-01T18:00Z"),
+    "spring": ("2026-03-07T18:00Z", "2026-03-08T18:00Z"),
+}
+
+
+def transition_result(res, start, end, interval="30min"):
+    """`res` re-indexed onto a window spanning a DST transition.
+
+    EVERY STUDY IN THIS PROJECT SITS IN SUMMER. The 45-day pull windows in use
+    do not reach 1 November or 8 March, so the case the tz-aware axis exists
+    for cannot be put on a chart with real data at all. This fabricates the
+    one thing that has to be fabricated -- the index -- and nothing else.
+
+    The study, the ColumnInfos, the units, the geometry, the interval and the
+    aggregation are the REAL ones, carried across by `replace`. That is not
+    tidiness: a window built with `study=None` writes marks whose `study_id`
+    is null, which `MarkSet.from_json` then refuses on reload, so the half of
+    this feature that matters most -- that a span across the repeated hour can
+    be marked -- would go untested.
+
+    The values are a shape to look at an axis with. They are NOT a claim about
+    the ocean, and nothing should ever read them as one.
+    """
+    import numpy as np
+    import pandas as pd
+
+    # THIRTY MINUTES, not the study's hourly cadence, and the interval is
+    # carried onto the result so the readout does not describe a spacing the
+    # data does not have. At 1 h the fall-back produces two samples on the
+    # IDENTICAL naive local value rather than a descending pair -- equal is
+    # not less-than, so `first_descent` would not have fired and #5's guard
+    # never protected an hourly window at all. Sub-hourly is where the old
+    # axis visibly doubles back, and it is the cadence #15's example uses.
+    idx = pd.date_range(start, end, freq=interval, tz="UTC")
+    hours = (idx - idx[0]).total_seconds() / 3600.0
+    cols = list(res.data.columns)
+    # Phase-shifted per series so the pair does not draw as a single line, and
+    # a period short enough that the transition hour is legible against it.
+    data = pd.DataFrame(
+        {c: np.sin((hours / 6.0 + k / 3.0) * np.pi) for k, c in enumerate(cols)},
+        index=idx)
+    counts = pd.DataFrame(1, index=idx, columns=cols)
+    return replace(res, data=data, counts=counts, interval=interval)
+
+
+def transition_index(index):
+    """Where the UTC offset changes inside `index`, or None.
+
+    Returns the position of the FIRST sample on the far side of the
+    transition. Found by comparing offsets rather than by naming a date,
+    because a hard-coded instant is a fact about 2026 that stops being true,
+    and this project has already paid once for a timestamp nobody checked.
+    """
+    offsets = [t.tz_convert(LOCAL_TZ).utcoffset() for t in index]
+    for i in range(1, len(offsets)):
+        if offsets[i] != offsets[i - 1]:
+            return i
+    return None
+
+
 def _default_pair(study, by_key):
     """One QARTOD-flagged series and one unflagged, when the study has both.
 
@@ -2821,7 +2886,9 @@ def _default_pair(study, by_key):
 def _main(argv=None):
     import argparse
     import json
+    import shutil
     import sys
+    import tempfile
 
     import numpy as np
     import pandas as pd
@@ -2853,7 +2920,15 @@ def _main(argv=None):
                          "set, two borrowed ones and a ghost line at once -- "
                          "the picture the overlay's visual review is of, since "
                          "no gate can assert that a borrowed band READS as "
-                         "borrowed")
+                         "borrowed. With --check it ALSO writes a -dst and a "
+                         "-spring companion beside it, which are the pictures "
+                         "the DST review is of")
+    ap.add_argument("--dst", choices=("fall", "spring"), default=None,
+                    help="open a window spanning a DST transition instead of "
+                         "the study's own window. The index is fabricated, "
+                         "because every study here sits in summer and the "
+                         "transition cannot otherwise be looked at. Marks go "
+                         "to a temp directory, never into the study")
     args = ap.parse_args(argv)
 
     from pathlib import Path
@@ -2908,11 +2983,25 @@ def _main(argv=None):
         return 1
     print(f"rows  : {len(res.data)}  cols: {list(res.data.columns)}")
 
+    # A window on a fabricated transition, for the review no gate can do: a
+    # person has to zoom into the repeated hour and try a drag across it.
+    # Marks go to a temp directory and never into the study -- the window's
+    # index is invented, and a mark against an invented instant has no
+    # business in a study's evidence.
+    base_res = res              # before any --dst wrap; the gate builds its own
+    dst_dir = None
+    if args.dst:
+        lo_s, hi_s = DST_WINDOWS[args.dst]
+        res = transition_result(res, lo_s, hi_s)
+        dst_dir = Path(tempfile.mkdtemp(prefix=f"view-dst-{args.dst}-"))
+        print(f"dst   : {args.dst} — {lo_s} .. {hi_s}, {len(res.data)} rows")
+        print(f"marks : {dst_dir}  (temp; nothing is written to the study)")
+
     root_tk = tk.Tk()
     root_tk.title("view gate")
     root_tk.geometry("300x120")
     root_tk.update()
-    win = ViewWindow(root_tk, res, study=info)
+    win = ViewWindow(root_tk, res, study=info, annotations_dir=dst_dir)
     win.update()
     win.update_idletasks()
 
@@ -3229,9 +3318,6 @@ def _main(argv=None):
     # ---- reopening a marked pair renders the marks --------------------------
     # Against a temp directory, not the study's: the store is a function of a
     # path, and a gate should not leave marks in someone's real study.
-    import shutil
-    import tempfile
-
     tmp = Path(tempfile.mkdtemp(prefix="view-gate-"))
     win.destroy()
     try:
@@ -4792,6 +4878,112 @@ def _main(argv=None):
                        and win.overlay_ids == []))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- windows that SPAN a DST transition ---------------------------------
+    # The case this whole change exists for, and the one no real study can
+    # reach: every pull window in use sits in summer. Only the index is
+    # fabricated; see transition_result.
+    for kind, title in (("fall", "fall-back"), ("spring", "spring-forward")):
+        tdir = Path(tempfile.mkdtemp(prefix=f"view-gate-{kind}-"))
+        twin = None
+        try:
+            lo_s, hi_s = DST_WINDOWS[kind]
+            tres = transition_result(base_res, lo_s, hi_s)
+            tidx = tres.data.index
+            k = transition_index(tidx)
+
+            # THE FIXTURE MUST ACTUALLY SPAN A TRANSITION or every check below
+            # passes for the wrong reason. Demonstrated against the OLD axis --
+            # the naive local values these same instants used to be plotted on
+            # -- rather than asserted from a date somebody typed.
+            naive = mdates.date2num(
+                tidx.tz_convert(LOCAL_TZ).tz_localize(None))
+            steps = np.diff(naive) * 24.0
+            if kind == "fall":
+                broke = ann.first_descent(naive)
+                checks.append((
+                    f"the {title} fixture really spans the transition: on the "
+                    f"OLD naive-local axis it doubles back at index {broke}, "
+                    f"and two samples share one wall time",
+                    broke is not None and k is not None
+                    and len(set(naive.tolist())) < len(naive)))
+            else:
+                checks.append((
+                    f"the {title} fixture really spans the transition: on the "
+                    f"OLD naive-local axis it stayed ASCENDING -- nothing "
+                    f"detected it -- while one step ran {steps.max():.1f} h "
+                    f"against a {steps.min():.1f} h cadence",
+                    k is not None and ann.first_descent(naive) is None
+                    and steps.max() > steps.min() * 2.5))
+
+            # A mark straddling the transition, written before the window is
+            # built so it is loaded rather than added.
+            trefs = tuple(ann.SeriesRef(tres.columns[c].key, c)
+                          for c in tres.data.columns)
+            across = (tidx[k - 4], tidx[k + 4])
+            ann.Store(tdir).confirm(
+                study_id=info.study_id, pair=trefs, name="across the transition",
+                reason="gate fixture", start_utc=across[0], end_utc=across[1])
+
+            twin = ViewWindow(root_tk, tres, study=info, annotations_dir=tdir)
+            twin.update()
+            twin.update_idletasks()
+
+            # 1. Ascending, READ BACK OFF THE ARTIST rather than off `_xnum`.
+            # `_xnum` is the window's own bookkeeping and would agree with a
+            # mistake the two of them share; `get_xdata` is what matplotlib
+            # actually holds. This is the acceptance criterion.
+            drawn = {c: mdates.date2num(line.get_xdata())
+                     for c, line in twin.series_lines.items()}
+            asc = all(bool(np.all(np.diff(x) > 0)) for x in drawn.values())
+            uniq = all(len(set(x.tolist())) == len(x) for x in drawn.values())
+            worst = min(float(np.min(np.diff(x))) for x in drawn.values())
+            checks.append((
+                f"[{title}] the plotted x values strictly ascend, so the line "
+                f"cannot retrace itself [{len(tidx)} samples, smallest step "
+                f"{worst * 24:.3f} h]", asc))
+            checks.append((
+                f"[{title}] and no two instants share one x, which is what "
+                f"the naive axis could not manage", uniq))
+
+            # 2. A drag ACROSS the transition resolves to the right instants.
+            # snap_span was refused here before; this is the evidence it now
+            # works rather than merely being allowed to run.
+            got = twin.span_interval(float(twin._xnum[k - 4]),
+                                     float(twin._xnum[k + 4]))
+            checks.append((
+                f"[{title}] a drag across the transition round-trips to the "
+                f"exact instants it covered [{got[0]} -> {got[1]}]"
+                if got else f"[{title}] a drag across the transition returned "
+                            f"nothing",
+                got is not None and got[0] == tidx[k - 4]
+                and got[1] == tidx[k + 4] and (got[2], got[3]) == (k - 4, k + 4)))
+            checks.append((
+                f"[{title}] and the selector is LIVE on this window, where it "
+                f"used to be refused outright", twin.span is not None))
+
+            # 3. The band is where its STORED instants say. This is the check
+            # that would catch a missed naive-local site as a 7 h offset.
+            spans = [b.patch for b in twin.bands]
+            want = sorted((twin._to_num(across[0]), twin._to_num(across[1])),)
+            drawn_x = sorted((p.get_x(), p.get_x() + p.get_width())
+                             for p in spans)
+            checks.append((
+                f"[{title}] the band straddling the transition is drawn at its "
+                f"stored instants, not seven hours off [{len(spans)} band(s)]",
+                len(drawn_x) == 1
+                and abs(drawn_x[0][0] - want[0]) < 1e-9
+                and abs(drawn_x[0][1] - want[1]) < 1e-9))
+
+            if args.shot:
+                stem = Path(args.shot)
+                out = stem.with_name(f"{stem.stem}-{kind}{stem.suffix}")
+                twin.figure.savefig(out, dpi=110, facecolor="white")
+                print(f"shot  : {out}")
+        finally:
+            if twin is not None:
+                twin.destroy()
+            shutil.rmtree(tdir, ignore_errors=True)
 
     print("\nview gate:")
     for what, ok in checks:
