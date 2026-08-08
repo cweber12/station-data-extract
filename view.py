@@ -106,8 +106,16 @@ SPAN_HINT = ("Drag across the chart to define a region.  "
 # against the white outside it, so moving either without the other breaks it.
 # ---------------------------------------------------------------------------
 REGION_FILL = "#000000"
-REGION_ALPHA = 0.40           # over white this renders about #999999
-REGION_ALPHA_SELECTED = 0.55  # selection darkens; it never changes the shape
+REGION_ALPHA = 1.00
+
+# Selection GROWS THE BAR. It used to darken the block, which stops being
+# possible the moment the block is fully opaque -- there is nothing past
+# black, and a "darker" selected region would have had to be rendered
+# LIGHTER, inverting the very cue it was supposed to give. Height of the bar
+# works at any fill, adds no outline and moves nothing, so the one thing this
+# treatment exists to avoid cannot creep back in through the selection.
+REGION_BAR = 0.022
+REGION_BAR_SELECTED = 0.075
 
 # Stacking, low to high. The region is a BACKDROP: above the grid, which it is
 # meant to cover, and below every line, which it may never obscure.
@@ -117,8 +125,12 @@ Z_REGION_BAR = 0.7
 Z_GHOST = 1.5
 Z_SERIES = 2.0
 
-# The ghost's grey answers to REGION_ALPHA and must be re-chosen with it.
-GHOST_GREY = "#6E6E6E"
+# The ghost's grey answers to REGION_ALPHA and must be re-chosen with it. At a
+# 40% fill the region rendered about #999999 and NO grey worked: light vanished
+# inside the region, dark vanished against the white outside it. An opaque
+# block is what makes a light grey possible -- it reads clearly against black,
+# and stays muted against the saturated series lines everywhere else.
+GHOST_GREY = "#B0B0B0"
 
 UNAVAILABLE_MESSAGE = (
     "The chart view needs matplotlib, which is not installed.\n\n"
@@ -1020,10 +1032,25 @@ class ViewWindow(tk.Toplevel):
         patch = ax.axvspan(x0, x1, facecolor=REGION_FILL,
                            alpha=REGION_ALPHA, edgecolor="none",
                            linewidth=0, zorder=Z_REGION)
-        lo, hi = (0.0, 0.022) if foreign else (0.978, 1.0)
+        lo, hi = self._bar_extent(foreign, chosen=False)
         bar = ax.axvspan(x0, x1, ymin=lo, ymax=hi, facecolor="#" + color,
                          linewidth=0, zorder=Z_REGION_BAR)
         return patch, (bar,)
+
+    @staticmethod
+    def _bar_extent(foreign: bool, chosen: bool) -> tuple:
+        """(ymin, ymax) in axes coordinates for a region's colour bar.
+
+        One function, so the bar drawn at creation and the bar resized on
+        selection cannot drift apart -- they did not, but they were two
+        literals in two places, which is how they would have.
+
+        Grows INWARD from whichever edge it is anchored to, so the edge it
+        names stays the edge it names: a bottom bar that grew downward would
+        leave the plot area, and a top bar that grew upward would too.
+        """
+        thick = REGION_BAR_SELECTED if chosen else REGION_BAR
+        return (0.0, thick) if foreign else (1.0 - thick, 1.0)
 
     def _draw_native(self):
         """One band per interval, per set drawn on THIS pair."""
@@ -1622,21 +1649,26 @@ class ViewWindow(tk.Toplevel):
     def _restyle_bands(self):
         """The selected region reads as selected, without changing what it is.
 
-        Selection DARKENS, and does nothing else. It does not add an outline,
-        because an outline appearing on click is the same noise this treatment
-        removed, arriving one region at a time. It does not recolour the fill
-        either: the fill is neutral for every region, and a selected one that
-        turned the set's colour would be the only coloured block on the chart
-        and would read as a different kind of thing.
+        Selection GROWS THE BAR, and does nothing else. It does not add an
+        outline, because an outline appearing on click is the same noise this
+        treatment removed, arriving one region at a time. It does not touch
+        the fill either: the fill is opaque black and there is nothing past
+        black, so a "darker" selection would have to render LIGHTER, which
+        inverts the cue.
 
-        Both kinds restyle identically, and their bar positions are what still
-        tell them apart -- selection is not allowed to be the one moment the
-        two look alike, and now it cannot be, because it does not touch shape.
+        Both kinds restyle identically and the bar stays on its own edge, so
+        selection is not the one moment a borrowed region and one of this
+        pair's own look alike.
         """
         for entry in self.bands:
             chosen = entry is self.selected_band
-            entry.patch.set_alpha(REGION_ALPHA_SELECTED if chosen
-                                  else REGION_ALPHA)
+            bar = next((a for a in entry.decorations
+                        if hasattr(a, "set_height")), None)
+            if bar is None:
+                continue
+            lo, hi = self._bar_extent(entry.is_foreign, chosen)
+            bar.set_y(lo)
+            bar.set_height(hi - lo)
 
     def _to_num(self, when) -> float:
         return float(mdates.date2num(self._to_axis(when)))
@@ -2885,12 +2917,37 @@ def _main(argv=None):
                        and ann.local_text(target.interval.start_utc)
                        in win.span_text.get()))
         others = [b for b in win.bands if b is not target]
-        checks.append((f"the selected region reads apart from the others "
-                       f"[{target.patch.get_alpha():.2f} vs "
-                       f"{[round(b.patch.get_alpha(), 2) for b in others]}]",
+
+        def bar_height(band):
+            bar = next(a for a in band.decorations if hasattr(a, "get_height"))
+            return abs(bar.get_height())
+
+        checks.append((f"the selected region reads apart from the others, by a "
+                       f"TALLER BAR [{bar_height(target):.3f} vs "
+                       f"{[round(bar_height(b), 3) for b in others]}]",
                        bool(others)
-                       and all(target.patch.get_alpha() > b.patch.get_alpha()
+                       and all(bar_height(target) > bar_height(b)
                                for b in others)))
+        # The cue that stopped being available. Darkening cannot signal
+        # anything once the fill is opaque, and a selection rendered lighter
+        # would invert the signal, so assert the fill is NOT what moved.
+        checks.append((f"and NOT by a change of fill, which is opaque for "
+                       f"every region and has nowhere darker to go "
+                       f"[{target.patch.get_alpha():.2f} vs "
+                       f"{sorted({round(b.patch.get_alpha(), 2) for b in others})}]",
+                       all(target.patch.get_alpha() == b.patch.get_alpha()
+                           for b in others)))
+        # The bar must stay on its own edge while it grows, or a selected
+        # borrowed region would creep toward looking like one of ours.
+        def bar_edge(band):
+            bar = next(a for a in band.decorations if hasattr(a, "get_y"))
+            return bar.get_y() + (0 if band.is_foreign else bar.get_height())
+
+        checks.append((f"and the bar grows INWARD, staying anchored to the "
+                       f"edge that says which pair it belongs to "
+                       f"[anchored at {bar_edge(target):.2f}]",
+                       abs(bar_edge(target) - (0.0 if target.is_foreign
+                                               else 1.0)) < 1e-9))
         checks.append(("selecting resolves to the interval's samples, so a "
                        "later edit can recompute coverage",
                        win._selected_indices
@@ -3673,10 +3730,24 @@ def _main(argv=None):
         ghost_rgb = ghost_lines[0].get_color().lstrip("#").upper()
         r, g, b = (int(ghost_rgb[i:i + 2], 16) for i in (0, 2, 4))
         grey = abs(r - g) < 8 and abs(g - b) < 8
-        checks.append((f"and grey, at no series colour, and mid rather than "
-                       f"light -- a light line reads inside a shaded region "
-                       f"and vanishes outside it [{ghost_rgb}]",
-                       grey and 0x50 <= r <= 0x90
+        # LIGHT, and that reverses what this check used to assert. It wanted a
+        # MID grey, because a light line vanished inside the old 15% shading
+        # and the ghost had to survive both backdrops. The region is opaque
+        # black now, so the two backdrops swapped: mid grey is what disappears
+        # inside a region, and light grey is what reads against it while
+        # staying muted against the saturated series lines outside.
+        #
+        # Tied to the fill on purpose. A ghost grey chosen against one
+        # REGION_ALPHA is wrong for another, and the pair of them was the one
+        # thing that could not be got right at 40% -- no grey worked at all.
+        region_lum = 255 * (1 - REGION_ALPHA)     # the fill, over white
+        ghost_lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        checks.append((f"and grey, at no series colour, and LIGHT enough to "
+                       f"read against an opaque region while staying muted on "
+                       f"white [{ghost_rgb}, luminance {ghost_lum:.0f} vs "
+                       f"region {region_lum:.0f}]",
+                       grey and 0xA0 <= r <= 0xD0
+                       and ghost_lum - region_lum >= 100
                        and ghost_rgb not in
                        {c.upper() for c in identity.SERIES_COLORS}))
 
