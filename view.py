@@ -191,6 +191,35 @@ def duration_text(td: dt.timedelta) -> str:
     return " ".join(p for p in parts if p) or "0 min"
 
 
+def axis_x(index):
+    """The x values a series is plotted against. MUST be zone-aware.
+
+    The axis is tz-aware and labelled in local time by the locator, so the
+    instants go on it unchanged and no wall time is ever constructed. This
+    function exists for what it REFUSES.
+
+    A naive datetime handed to a tz-aware axis does not raise. It is read as
+    if it were already in the axis's zone and lands seven hours early:
+
+        naive local 2026-07-01 17:00  ->  x = 20634.83333
+        the instant it came from      ->  x = 20635.12500
+
+    Nothing reports that. It is the same shape as the failure AUDIT.md C4
+    records, and it would surface only in November, or -- for the ghost line,
+    which is plotted from a second index -- only when someone borrows a set.
+    So the array path refuses a naive index here, exactly as the scalar path
+    refuses a naive datetime in `_to_num`. Between them there is no way to
+    reach the axis without a zone.
+    """
+    if getattr(index, "tz", None) is None:
+        raise ValueError(
+            "the chart's x axis is timezone-aware, and this index carries no "
+            "zone. A naive index does not raise when it is plotted -- it is "
+            "read as local and lands seven hours early, silently. Pass the "
+            "UTC index; the axis labels it in local time itself.")
+    return index
+
+
 @dataclass
 class Band:
     """One drawn occurrence, and what it is an occurrence OF.
@@ -253,7 +282,7 @@ class Ghost:
     """The absent partner of a borrowed pair, standardised over THIS window."""
     ref: object            # the SeriesRef it was fetched by
     label: str             # legend text, carrying depth and reference frame
-    x: object              # naive local time, the axis this chart is drawn on
+    x: object              # the zone-aware instants; see axis_x
     values: object         # z-scores, computed over the window on screen
     line: object = None    # the artist, once drawn
     borrowers: tuple = ()  # the sets that asked for it
@@ -328,8 +357,7 @@ def load_ghost(study, ref, *, interval: str, aggregation: str, lo, hi,
     label = identity.legend_label(column, res.units.get(column, ""), False,
                                   res.geometry.get(column, ""))
     return Ghost(ref=ref, label=f"{label} — ghost: context, not compared",
-                 x=res.data.index.tz_convert(LOCAL_TZ).tz_localize(None),
-                 values=z.to_numpy())
+                 x=axis_x(res.data.index), values=z.to_numpy())
 
 
 class MarkDialog(tk.Toplevel):
@@ -774,10 +802,10 @@ class ViewWindow(tk.Toplevel):
                                                  # workbook standardises with
 
         # The UTC index is the TRUTH about time in this window. `_xnum` is the
-        # same instants as matplotlib date numbers on the naive-local axis,
-        # built position for position from it, which is what lets a drag be
-        # resolved to an index and read back out of `_utc` without any zone
-        # ever being inferred. See annotations.snap_span.
+        # same instants as matplotlib date numbers, built position for
+        # position from it, which is what lets a drag be resolved to an index
+        # and read back out of `_utc` without any zone ever being inferred.
+        # See annotations.snap_span.
         self._utc = result.data.index
         self._xnum = []
         self.selection: tuple | None = None
@@ -1304,8 +1332,8 @@ class ViewWindow(tk.Toplevel):
         `patch` always spans the region, so hit testing has one artist to ask
         whatever the treatment.
         """
-        x0, x1 = (self._to_axis(clamped.start_utc),
-                  self._to_axis(clamped.end_utc))
+        x0, x1 = (self._to_num(clamped.start_utc),
+                  self._to_num(clamped.end_utc))
         patch = ax.axvspan(x0, x1, facecolor=REGION_FILL,
                            alpha=REGION_ALPHA, edgecolor="none",
                            linewidth=0, zorder=Z_REGION)
@@ -1593,16 +1621,6 @@ class ViewWindow(tk.Toplevel):
         msg = self.ghost_message()
         if msg:
             messagebox.showwarning("Ghost line not drawn", msg, parent=self)
-
-    def _to_axis(self, when):
-        """A UTC instant -> the naive local value the axis is drawn on.
-
-        This IS the conversion snap_span refuses to make, and it is safe in
-        this direction only. One instant has exactly one local rendering; it is
-        the reverse -- a wall time back to an instant -- that is ambiguous for
-        an hour each November and undefined for an hour each March.
-        """
-        return when.astimezone(LOCAL_TZ).replace(tzinfo=None)
 
     def _append_rejection_note(self):
         if self.mark_problems:
@@ -2084,7 +2102,19 @@ class ViewWindow(tk.Toplevel):
             bar.set_height(hi - lo)
 
     def _to_num(self, when) -> float:
-        return float(mdates.date2num(self._to_axis(when)))
+        """A UTC instant -> its x on the axis. The scalar half of `axis_x`.
+
+        `coerce_utc` FIRST, and that is the whole point of the line. A naive
+        datetime reaching a tz-aware axis lands seven hours early and never
+        raises; refusing it here is what makes the shift unrepresentable
+        rather than merely tested for. The check is `annotations`' own, which
+        is already gated, so there is not a second notion of what a zone is.
+
+        No wall time is constructed in either direction any more. `_to_axis`
+        used to do it -- safely, one instant having exactly one local
+        rendering -- but the axis it converted FOR is gone.
+        """
+        return float(mdates.date2num(ann.coerce_utc(when, "axis x")))
 
     def _indices_for(self, interval) -> tuple:
         """Which samples an interval's edges sit on, for coverage."""
@@ -2647,18 +2677,31 @@ class ViewWindow(tk.Toplevel):
         colors = identity.series_colors(self.cols)
         labels = self._labels()
 
-        # Naive local time on the axis, matching how the workbook builds its
-        # x values. A tz-aware index would have matplotlib pick its own
-        # display zone, which is exactly the class of mistake this repo has
-        # already paid for once.
-        x = self.result.data.index.tz_convert(LOCAL_TZ).tz_localize(None)
+        # THE INSTANTS GO ON THE AXIS UNCHANGED. The data is UTC; the labels
+        # are local, and the zone is named exactly once, on the locator and
+        # the formatter below.
+        #
+        # This used to plot naive local time, converted here and stripped of
+        # its zone, on the reasoning that a tz-aware index would let
+        # matplotlib pick a display zone of its own. It does not -- a zone
+        # passed to the locator and formatter is used, and nothing is inferred
+        # -- and the naive axis cost more than it saved: across the November
+        # fall-back local time runs 01:00, 01:30, 01:00, 01:30, so an hour of
+        # the axis DOUBLED BACK and the line retraced itself, which reads as
+        # an instrument fault. Across the March spring-forward the same axis
+        # stayed monotonic, so nothing detected it, and half an hour of data
+        # was drawn three times as wide as its neighbours. See #15.
+        x = axis_x(self.result.data.index)
 
         # The plotted x of every sample, in the same order as `_utc`. An
         # ARRAY, because matplotlib's own snapping does arithmetic on it
-        # directly and a list raises inside _set_extents. `snap_span` and
-        # `first_descent` bisect and compare, which work on any sequence, so
-        # one representation serves both -- annotations stays free of the
-        # numeric stack because of what it IMPORTS, not what it is handed.
+        # directly and a list raises inside _set_extents. `snap_span` bisects,
+        # which works on any sequence, so one representation serves both --
+        # annotations stays free of the numeric stack because of what it
+        # IMPORTS, not what it is handed.
+        #
+        # Strictly ascending by construction now: these are instants, and
+        # `build_comparison` bins them in order.
         self._xnum = np.asarray(mdates.date2num(x), dtype=float)
 
         fig = Figure(figsize=(11.5, 5.0), dpi=100)
@@ -2686,9 +2729,14 @@ class ViewWindow(tk.Toplevel):
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
 
-        locator = mdates.AutoDateLocator()
+        # The ONE place the display zone is named. The x data is UTC, so this
+        # is what makes the axis read in local time -- and because it is
+        # passed rather than inferred, the zone is a decision in the source
+        # rather than a property of the machine the chart is drawn on.
+        locator = mdates.AutoDateLocator(tz=LOCAL_TZ)
         ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ax.xaxis.set_major_formatter(
+            mdates.ConciseDateFormatter(locator, tz=LOCAL_TZ))
 
         # PIN THE VIEW TO THE SERIES, and stop autoscaling.
         #
@@ -3278,9 +3326,7 @@ def _main(argv=None):
         # The length is part of the assertion: `all()` over an empty zip is
         # True, so without it this passes loudest when nothing was drawn at all.
         drawn_x = sorted((p.get_x(), p.get_x() + p.get_width()) for p in spans)
-        want_x = sorted((mdates.date2num(win._to_axis(a)),
-                         mdates.date2num(win._to_axis(b)))
-                        for a, b in inside)
+        want_x = sorted((win._to_num(a), win._to_num(b)) for a, b in inside)
         placed = (len(drawn_x) == len(want_x)
                   and all(abs(g[0] - w[0]) < 1e-6 and abs(g[1] - w[1]) < 1e-6
                           for g, w in zip(drawn_x, want_x)))
