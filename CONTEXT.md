@@ -60,6 +60,42 @@ _Avoid_: borrowed set, foreign set, overlay, imported marks
 The member of a borrowed set's pair that is absent from the current chart,
 drawn faintly for context. Never a compared series.
 
+### Time
+
+**Instant**:
+A single point in time, the same one everywhere on earth. What every stored
+timestamp is, always in UTC. A region's start and end are instants; so is every
+sample on a chart's x axis.
+_Avoid_: timestamp, datetime, time (when the instant is what is meant)
+
+**Wall time**:
+What a clock on the wall reads — `01:00` on 1 November. **Not an instant.** It
+happens twice across a November fall-back and not at all across a March
+spring-forward, so on its own it cannot say which moment is meant.
+_Avoid_: local time (when the bare reading is what is meant), naive time
+
+**Offset**:
+How far a wall time is from UTC, as `-07:00` or `-08:00`. What turns a wall time
+into an instant. Written into every stored `start_local` / `end_local`.
+
+**Zone designator**:
+The short form that says which offset is in force — `PDT`, `PST`. What every
+local time shown to a person carries, and the only thing distinguishing the two
+`01:00`s at a fall-back. Unicode LDML calls it the _specific non-location
+format_.
+_Avoid_: timezone abbreviation, tz name (which is the IANA identifier, below)
+
+**IANA zone**:
+`America/Los_Angeles` — the identifier naming the whole set of rules, including
+when the offset changes. Named on the chart's x axis and in every stored set's
+`tz` field. An offset alone does not identify a zone.
+
+**DST transition**:
+The instant the offset changes. A **fall-back** repeats a wall hour; a
+**spring-forward** skips one. The chart ticks both instants either side of it
+and lets the designators say which is which; it does not caption them. See
+`docs/adr/0003-time-representation-standards.md`.
+
 ### Where it all lives
 
 **Study**:

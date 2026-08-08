@@ -174,9 +174,28 @@ def format_local(t: dt.datetime, tzname: str = DISPLAY_TZ) -> str:
 
 
 def local_text(t: dt.datetime, tzname: str = DISPLAY_TZ) -> str:
-    """'2026-07-20 14:00' -- what a label or a readout shows."""
+    """'2026-07-20 14:00 PDT' -- what a label or a readout shows.
+
+    THE DESIGNATOR IS NOT DECORATION. Without it this returned a bare wall
+    time, and across the November fall-back two different regions rendered as
+    the identical string: `2026-11-01 01:00` names one instant in PDT and
+    another an hour later in PST, and the region list, the drag readout and
+    the delete confirmation could not tell a reader which was which.
+
+    RFC 3339 section 4.4 refuses unqualified local time outright -- "the
+    interoperability problems of unqualified local time are deemed
+    unacceptable" -- and section 4.1 blames exactly this: daylight saving
+    rules. Unicode LDML (TR 35) names the format for presenting a specific
+    time as the SPECIFIC NON-LOCATION format, `z`, which is PDT/PST rather
+    than the generic PT. `%Z` is that format.
+
+    The stored form was never affected: `format_local` writes a full ISO 8601
+    offset, and the loader reads UTC. This is the DISPLAY helper, and it was
+    the one place a local rendering lost the only thing that made it an
+    instant.
+    """
     return _to_plain_utc(t).astimezone(ZoneInfo(tzname)).strftime(
-        "%Y-%m-%d %H:%M")
+        "%Y-%m-%d %H:%M %Z")
 
 
 # ---------------------------------------------------------------------------
@@ -921,7 +940,7 @@ def _main(argv=None):
                   f"{len(s.intervals)} interval(s)")
             for i in s.intervals:
                 print(f"    {local_text(i.start_utc, s.tz)} -> "
-                      f"{local_text(i.end_utc, s.tz)} local")
+                      f"{local_text(i.end_utc, s.tz)}")
         for p in problems:
             print(f"REJECTED  {p}")
         return 1 if problems else 0
@@ -1393,6 +1412,30 @@ def _main(argv=None):
            first_descent(wall) == 2,
            f"first descent at index {first_descent(wall)} "
            f"({wall[1]:%H:%M} -> {wall[2]:%H:%M})")
+
+        # ---- what a person is SHOWN can identify the instant ---------------
+        # RFC 3339 s4.4 refuses unqualified local time; Unicode LDML (TR 35)
+        # names the specific non-location format -- PDT/PST -- as the one to
+        # use when presenting a specific time. Without it these two instants
+        # rendered identically in the region list, the drag readout and the
+        # delete confirmation, and no one reading them could tell which
+        # region was which.
+        ambiguous = (dt.datetime(2026, 11, 1, 8, 0, tzinfo=utc),
+                     dt.datetime(2026, 11, 1, 9, 0, tzinfo=utc))
+        shown = [local_text(t) for t in ambiguous]
+        ok(f"the two instants of a repeated wall hour DISPLAY differently "
+           f"[{shown[0]} vs {shown[1]}]",
+           shown[0] != shown[1] and ambiguous[0] != ambiguous[1])
+        ok("and it is the zone designator that separates them, not the wall "
+           "time, which is identical",
+           shown[0].rsplit(" ", 1)[0] == shown[1].rsplit(" ", 1)[0]
+           and shown[0].rsplit(" ", 1)[1] != shown[1].rsplit(" ", 1)[1],
+           f"{shown[0].rsplit(' ', 1)} vs {shown[1].rsplit(' ', 1)}")
+        ok("a summer instant still reads as daylight time, so the designator "
+           "is real and not a constant",
+           local_text(dt.datetime(2026, 7, 20, 21, 0, tzinfo=utc)).endswith(
+               "PDT"),
+           local_text(dt.datetime(2026, 7, 20, 21, 0, tzinfo=utc)))
 
         # ---- palette --------------------------------------------------------
         import identity                     # pure; imported HERE, not at module

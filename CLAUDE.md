@@ -160,6 +160,31 @@ zone. Every downstream conclusion built on it was wrong.
 - `ingest/clockcheck.py` is the only real evidence. A study that changes ingest
   must still pass it: air temperature within ±1.5 h at LJAC1.
 
+**UTC is the record; local time is display only.** This is
+[NDBC's own split](https://www.ndbc.noaa.gov/faq/measdes.shtml) — "Both
+Realtime and Historical files show times in UTC only", with local time offered
+to a *viewer*. Storage, comparison and snapping all happen on UTC instants.
+
+**A wall time with no offset or designator is not an instant.**
+[RFC 3339 §4.4](https://www.rfc-editor.org/rfc/rfc3339) calls unqualified local
+time's interoperability problems "unacceptable"; §4.1 blames daylight saving
+rules specifically. So:
+
+- Every local time a person is shown carries its zone designator — PDT, PST.
+  That is the [Unicode LDML](https://unicode.org/reports/tr35/tr35-dates.html)
+  *specific non-location format*, the one TR 35 names for presenting a specific
+  time. `annotations.local_text` does this and is gated on it.
+- Anywhere a zone is named, name the **IANA identifier**
+  (`America/Los_Angeles`), not an offset and not "local". An offset does not
+  identify a zone — see [RFC 9557](https://www.rfc-editor.org/rfc/rfc9557.html).
+- A chart spanning a DST transition **shows** it rather than explaining it:
+  both instants either side of the change are ticked and their designators
+  differ. No standard describes annotating a transition; every standard
+  describes identifying an instant.
+
+Full sourcing, including what NIST does and does not say, is in
+`docs/adr/0003-time-representation-standards.md`.
+
 ### Data boundaries
 
 - `sources/` is read-only input. Never write into it from code.
