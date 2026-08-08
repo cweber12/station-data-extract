@@ -85,6 +85,7 @@ try:
     import numpy as np
     matplotlib.use("TkAgg")
     import matplotlib.dates as mdates
+    import matplotlib.transforms
     from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                    NavigationToolbar2Tk)
     from matplotlib.figure import Figure
@@ -147,6 +148,19 @@ VIEW_PUSH_DELAY_MS = 350
 # block is what makes a light grey possible -- it reads clearly against black,
 # and stays muted against the saturated series lines everywhere else.
 GHOST_GREY = "#B0B0B0"
+
+# The DST furniture's ink. Lighter than the axis text on purpose: it is a
+# CORRECTION TO THE LABELS, not another label, and it must not compete with
+# the series for attention. It is also the only new ink on this chart, which
+# is why it sits below the spine -- see `_draw_transitions`.
+DST_GREY = "#6B6B6B"
+
+# How far every row below the spine moves down to make room for the bracket
+# and its caption, in axes fractions. One constant, because the x label, the
+# legend anchor and the bottom margin all have to move by the SAME amount --
+# moving one without the others is how a caption ends up printed through a
+# label, which is what the first attempt did.
+DST_LABEL_PAD = 0.15
 
 UNAVAILABLE_MESSAGE = (
     "The chart view needs matplotlib, which is not installed.\n\n"
@@ -739,6 +753,57 @@ class NameCheckList(ttk.Frame):
         """
         self._boxes[key].invoke()
         return bool(self._vars[key].get())
+
+
+_DST_LOCATOR = None
+
+
+def _dst_locator_class():
+    """`AutoDateLocator`, minus the duplicate tick at a spring-forward.
+
+    Across the March transition the rrule asks for 02:00 and 03:00 local.
+    02:00 DOES NOT EXIST, `zoneinfo` folds it forward onto 03:00, and
+    matplotlib emits both -- so one position carries two ticks and two
+    identical labels drawn on top of each other:
+
+        20520.416667  03:00 PDT  '03:00'
+        20520.416667  03:00 PDT  '03:00'
+
+    Nine ticks, eight positions. It overprints, so it costs a slightly bolder
+    label rather than a visible error, and it would be easy to leave. It is
+    not left, because a tick list containing the same instant twice is a
+    latent claim that the axis visits it twice -- which is exactly the
+    misreading this whole change exists to prevent, one layer down.
+
+    Subclassed lazily for the same reason the toolbar is: `mdates` is None
+    when matplotlib failed to import, and this module must still import so
+    compare.py can explain why rather than refuse to start.
+    """
+    global _DST_LOCATOR
+    if _DST_LOCATOR is None:
+        class _DedupedAutoDateLocator(mdates.AutoDateLocator):
+            # BOTH entry points, and that is not belt and braces. `__call__`
+            # does not route through `tick_values`: it picks a sub-locator
+            # with `get_locator` and calls THAT, so an override on
+            # `tick_values` alone is bypassed for the ticks actually drawn.
+            # Overriding only `tick_values` was the first attempt and the gate
+            # caught it -- 8 ticks, 7 positions.
+            def __call__(self):
+                return self._dedupe(super().__call__())
+
+            def tick_values(self, vmin, vmax):
+                return self._dedupe(super().tick_values(vmin, vmax))
+
+            @staticmethod
+            def _dedupe(values):
+                out = []
+                for v in values:
+                    if not out or abs(v - out[-1]) > 1e-9:
+                        out.append(v)
+                return np.asarray(out)
+
+        _DST_LOCATOR = _DedupedAutoDateLocator
+    return _DST_LOCATOR
 
 
 _MODE_TOOLBAR = None
@@ -1672,14 +1737,18 @@ class ViewWindow(tk.Toplevel):
         # side would be truncated into saying nothing.
         ncol = 1 if any(len(t) > 44 for t in labels) else 2
         rows = -(-len(labels) // ncol)
+        # The same pad the x label moved by. The legend sits below it, so it
+        # has to move too, or the transition caption is printed through the
+        # first legend row instead of through the label.
+        pad = DST_LABEL_PAD if getattr(self, "transitions", None) else 0.0
         ax.legend(handles, labels, loc="upper center",
-                  bbox_to_anchor=(0.5, -0.16), ncol=ncol, frameon=False,
+                  bbox_to_anchor=(0.5, -0.16 - pad), ncol=ncol, frameon=False,
                   fontsize=9)
         # And give it the room it needs. The strip was sized for two entries;
         # attribution and a ghost line make four categories, and a legend that
         # outgrows its margin walks off the bottom of the figure unremarked.
         self.figure.subplots_adjust(
-            bottom=min(0.50, max(0.28, 0.14 + 0.07 * rows)))
+            bottom=min(0.56, max(0.28, 0.14 + 0.07 * rows + pad * 0.7)))
 
     # ------------------------------------------------------------ the view
     # Zoom is how you LOOK at the chart. Nothing here changes what is on it,
@@ -2706,7 +2775,14 @@ class ViewWindow(tk.Toplevel):
             self.series_lines[c] = line
 
         ax.set_ylabel("standard deviations")
-        ax.set_xlabel("time (local)")
+        # The x label carries the transition clause when this window spans
+        # one. The bracket says WHERE; this says it at all, and survives the
+        # transition being scrolled off the side by the wheel.
+        self.transitions = transitions_in(self.result.data.index)
+        xlabel = "time (local)"
+        if self.transitions:
+            xlabel += "  ·  " + ";  ".join(t.clause for t in self.transitions)
+        ax.set_xlabel(xlabel)
         # UNDER the regions, both of them. A gridline or a zero rule crossing
         # a dark region is the same noise the region's own edges were, and the
         # region is a backdrop rather than an overlay. `axisbelow` is what
@@ -2722,7 +2798,7 @@ class ViewWindow(tk.Toplevel):
         # is what makes the axis read in local time -- and because it is
         # passed rather than inferred, the zone is a decision in the source
         # rather than a property of the machine the chart is drawn on.
-        locator = mdates.AutoDateLocator(tz=LOCAL_TZ)
+        locator = _dst_locator_class()(tz=LOCAL_TZ)
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(
             mdates.ConciseDateFormatter(locator, tz=LOCAL_TZ))
@@ -2747,6 +2823,15 @@ class ViewWindow(tk.Toplevel):
         # it is handed back. Recomputing it later from the lines would include
         # whatever else has since been drawn.
         self._series_ylim = ax.get_ylim()
+        self._draw_transitions(ax)
+        if self.transitions:
+            # The furniture stack under the spine is ticks, then bracket and
+            # caption, then the x label, then the legend. matplotlib knows
+            # nothing about the bracket, so it would place the label straight
+            # through it; each row below is moved down by hand instead. See
+            # DST_LABEL_PAD.
+            ax.xaxis.set_label_coords(0.5, -0.11 - DST_LABEL_PAD)
+
         # And the x range as built, which is the limit the wheel zooms out to.
         # Taken here rather than from `_xnum` because the axis is framed a
         # little wider than the data, and zooming out to the data would shave
@@ -2760,7 +2845,78 @@ class ViewWindow(tk.Toplevel):
         fig.subplots_adjust(left=0.06, right=0.99, top=0.97, bottom=0.28)
         return fig
 
+    def _draw_transitions(self, ax):
+        """Say at the axis what the tick labels cannot say for themselves.
+
+        BELOW THE SPINE, in a blended transform: x in data coordinates so it
+        tracks the wheel without being redrawn, y in axes coordinates so it
+        stays pinned under the ticks whatever the y range does.
+
+        Below, and not over the data, and that is the whole design. Two
+        treatments were available and both were refused:
+
+          * A SHADED BAND over the repeated hour. A dark block with a colour
+            bar is precisely what a marked region looks like here -- it means
+            "a person judged this interesting" -- and dressing a fact about
+            the calendar in the vocabulary of an interpretation is worse than
+            saying nothing. See `_band_patch`.
+          * A VERTICAL RULE at the instant. `_band_patch` records that edge
+            rules in the set's colour were removed because two saturated
+            verticals per region crossing the series were exactly the noise a
+            marked window exists to cut through. Spending that ink back for a
+            clock artifact is the wrong trade.
+
+        The lie is in the tick labels, so the correction goes where the lie
+        is: in the axis furniture. Nothing here crosses a series line.
+
+        `clip_on=False` throughout, because all of it is outside the axes.
+        """
+        self.transition_artists = []
+        if not self.transitions:
+            return
+
+        blended = matplotlib.transforms.blended_transform_factory(
+            ax.transData, ax.transAxes)
+        bar_y, cap_h, text_y = -0.075, 0.016, -0.10
+
+        for t in self.transitions:
+            x0 = self._to_num(t.start)
+            if t.repeats:
+                # A real interval is mislabelled, so bracket it.
+                x1 = self._to_num(t.end)
+                line, = ax.plot([x0, x1], [bar_y, bar_y], transform=blended,
+                                color=DST_GREY, linewidth=0.9, clip_on=False,
+                                solid_capstyle="butt")
+                self.transition_artists.append(line)
+                for x in (x0, x1):
+                    cap, = ax.plot([x, x], [bar_y - cap_h, bar_y + cap_h],
+                                   transform=blended, color=DST_GREY,
+                                   linewidth=0.9, clip_on=False)
+                    self.transition_artists.append(cap)
+                mid = (x0 + x1) / 2.0
+            else:
+                # Nothing is repeated -- the clock jumps. A single caret, so
+                # the glyph does not claim a duration that does not exist.
+                cap, = ax.plot([x0, x0], [bar_y - cap_h, bar_y + cap_h],
+                               transform=blended, color=DST_GREY,
+                               linewidth=0.9, clip_on=False)
+                self.transition_artists.append(cap)
+                mid = x0
+            label = ax.text(mid, text_y, t.caption, transform=blended,
+                            ha="center", va="top", fontsize=8, color=DST_GREY,
+                            clip_on=False)
+            self.transition_artists.append(label)
+
     # ------------------------------------------------------------ self-check
+
+    def transition_texts(self) -> list:
+        """What the chart actually SAYS about the transitions it spans.
+
+        Read off the artists rather than off `self.transitions`, so a gate
+        asserts what was drawn instead of what was intended.
+        """
+        return [a.get_text() for a in getattr(self, "transition_artists", [])
+                if hasattr(a, "get_text")]
 
     def plotted(self) -> dict:
         """The y data actually handed to matplotlib, per series.
@@ -2831,6 +2987,93 @@ def transition_result(res, start, end, interval="30min"):
         index=idx)
     counts = pd.DataFrame(1, index=idx, columns=cols)
     return replace(res, data=data, counts=counts, interval=interval)
+
+
+@dataclass(frozen=True)
+class Transition:
+    """A DST change inside the plotted window, and what to say about it.
+
+    `start`/`end` are the REAL interval the wall clock mislabels, so the
+    bracket is drawn where the labels are wrong rather than at an instant
+    chosen by eye. `end is None` for a spring-forward: nothing is repeated
+    there, the clock jumps, and a bracket with width would invent a duration.
+    """
+    instant: object        # first instant on the new offset, UTC
+    start: object          # UTC
+    end: object            # UTC, or None for a spring-forward
+    caption: str           # what sits under the bracket
+    clause: str            # what is appended to the x-axis label
+
+    @property
+    def repeats(self) -> bool:
+        return self.end is not None
+
+
+def _transition_instant(before, after):
+    """The instant the offset changes, bisected between two samples.
+
+    Found rather than named. A hard-coded 2026-11-01T09:00Z is a fact about
+    one year that quietly stops being true, and this project's most expensive
+    bug was a timestamp nobody checked.
+    """
+    lo, hi = before.to_pydatetime(), after.to_pydatetime()
+    base = lo.astimezone(LOCAL_TZ).utcoffset()
+    while (hi - lo) > dt.timedelta(minutes=1):
+        mid = lo + (hi - lo) / 2
+        if mid.astimezone(LOCAL_TZ).utcoffset() == base:
+            lo = mid
+        else:
+            hi = mid
+    return hi.replace(second=0, microsecond=0)
+
+
+def transitions_in(index) -> list:
+    """Every DST transition inside `index`, with the text that names it.
+
+    THE AXIS IS HONEST AND THE LABELS ARE NOT, which is the whole reason this
+    exists. On a tz-aware axis the x values are linear in real time, so the
+    line is right -- but `AutoDateLocator` generates ticks from WALL CLOCK
+    times, and the repeated hour has no wall time to sit at, so it is skipped:
+
+        20758.33333  2026-11-01 01:00 PDT  ->  '01:00'
+        20758.41667  2026-11-01 02:00 PST  ->  '02:00'   <- TWO hours
+        20758.45833  2026-11-01 03:00 PST  ->  '03:00'   <- one hour
+
+    Two adjacent labels an hour apart with two hours between them. Someone
+    measuring a feature against the axis is off by an hour, and nothing says
+    so. The spring-forward is the mirror image: '01:00' then '03:00', reading
+    as two hours where only one passed.
+    """
+    out = []
+    for i in range(1, len(index)):
+        before, after = index[i - 1], index[i]
+        off_b = before.tz_convert(LOCAL_TZ).utcoffset()
+        off_a = after.tz_convert(LOCAL_TZ).utcoffset()
+        if off_b == off_a:
+            continue
+        t = _transition_instant(before, after)
+        delta = off_a - off_b
+        wall = t.astimezone(LOCAL_TZ).replace(tzinfo=None)
+        day = f"{wall:%d %b}".lstrip("0")
+        if delta < dt.timedelta(0):
+            # Fall back. The wall hour from `wall` onwards is served twice,
+            # once on each offset, so the real interval it covers runs from
+            # one |delta| before the change to one after.
+            span = -delta
+            out.append(Transition(
+                instant=t, start=t - span, end=t + span,
+                caption=f"{wall:%H:%M}–{wall + span:%H:%M} happens twice",
+                clause=f"{day} {wall:%H:%M}–{wall + span:%H:%M} occurs twice, "
+                       f"so those two labels are {int(2 * span.total_seconds() // 3600)} h apart"))
+        else:
+            # Spring forward. Nothing is repeated; a wall hour is skipped.
+            out.append(Transition(
+                instant=t, start=t, end=None,
+                caption=f"{wall - delta:%H:%M}–{wall:%H:%M} never happens",
+                clause=f"{day} {wall - delta:%H:%M}–{wall:%H:%M} does not "
+                       f"exist, so those two labels are "
+                       f"{int(delta.total_seconds() // 3600)} h apart"))
+    return out
 
 
 def transition_index(index):
@@ -4974,6 +5217,53 @@ def _main(argv=None):
                 len(drawn_x) == 1
                 and abs(drawn_x[0][0] - want[0]) < 1e-9
                 and abs(drawn_x[0][1] - want[1]) < 1e-9))
+
+            # 4. The chart SAYS something about the hour, and says the right
+            # thing. No gate can assert that it reads correctly to a person --
+            # that is what --dst and the companion PNGs are for -- but a
+            # silent chart must not pass, and neither must one naming the
+            # wrong hour.
+            said = twin.transition_texts()
+            wall = t_local = twin.transitions[0].instant.astimezone(
+                LOCAL_TZ).replace(tzinfo=None) if twin.transitions else None
+            if kind == "fall":
+                wanted, phrase = f"{wall:%H:%M}", "happens twice"
+            else:
+                wanted, phrase = f"{wall - dt.timedelta(hours=1):%H:%M}", \
+                    "never happens"
+            checks.append((
+                f"[{title}] the chart states what the labels cannot, naming "
+                f"the hour [{said}]",
+                len(twin.transitions) == 1 and len(said) == 1
+                and phrase in said[0] and wanted in said[0]))
+            checks.append((
+                f"[{title}] and the x axis label carries it too, so it "
+                f"survives the transition being scrolled off "
+                f"[{twin.figure.axes[0].get_xlabel()[:72]}...]",
+                "time (local)" in twin.figure.axes[0].get_xlabel()
+                and wanted in twin.figure.axes[0].get_xlabel()))
+            checks.append((
+                f"[{title}] the bracket is drawn BELOW the spine, so no new "
+                f"ink crosses a series line [{len(twin.transition_artists)} "
+                f"artists]",
+                bool(twin.transition_artists)
+                and all(a.get_clip_on() is False
+                        for a in twin.transition_artists)))
+
+            # And the tick list carries no instant twice. At a spring-forward
+            # the rrule asks for 02:00 and 03:00 local, which fold onto one
+            # position; see _dst_locator_class.
+            axz = twin.figure.axes[0]
+            axz.set_xlim(twin._to_num(tidx[k - 6]), twin._to_num(tidx[k + 6]))
+            twin.canvas.draw()
+            ticks = list(axz.get_xticks())
+            checks.append((
+                f"[{title}] zoomed to hourly ticks, no instant is ticked twice "
+                f"[{len(ticks)} ticks, {len(set(np.round(ticks, 9)))} "
+                f"positions]",
+                len(ticks) == len(set(np.round(ticks, 9)))))
+            axz.set_xlim(twin._window_xlim)
+            twin.canvas.draw()
 
             if args.shot:
                 stem = Path(args.shot)
