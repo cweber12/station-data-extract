@@ -140,6 +140,25 @@ has happened repeatedly here and catching it is worth more than looking tidy.
 
 ---
 
+## Agent skills
+
+### Issue tracker
+
+GitHub issues on `cweber12/station-data-extract`, via the `gh` CLI.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles use their own names as label strings.
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root.
+See `docs/agents/domain.md`.
+
+---
+
 ## Non-negotiable invariants
 
 These were expensive to learn. Violating one silently corrupts results.
