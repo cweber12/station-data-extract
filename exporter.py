@@ -65,21 +65,66 @@ def _autosize(ws, minw=10, maxw=34):
         ws.column_dimensions[letter].width = min(max(minw, longest + 2), maxw)
 
 
+def _time_block(index):
+    """Headers and per-row values for the leading time columns of a data sheet.
+
+    UTC IS FIRST BECAUSE IT IS THE RECORD. It is what the charts are drawn
+    against, and it is the only column here that names an instant on its own.
+    Local time sits beside it as display, which is NDBC's own split and the
+    decision in docs/adr/0003.
+
+    Every sheet gets both. `counts` and `normalized` used to carry local time
+    alone, so across a fall-back they held two rows with a byte-identical
+    timestamp naming two different hours -- and unlike `data` there was no
+    second column to resolve them. Once such a workbook leaves this repo that
+    hour is gone.
+
+    The `zone` column appears ONLY when the window spans a transition. Outside
+    one, a wall time in a named zone is already unambiguous and a designator on
+    every row is ink spent against a misreading that cannot occur -- the same
+    rule the view's tick labels follow, for the same reason.
+    """
+    spans = bool(sk.transitions_in(index))
+    headers = ["time (UTC)", f"time (local, {LOCAL_TZ.key})"]
+    if spans:
+        headers.append("zone")
+
+    local = index.tz_convert(LOCAL_TZ)
+    rows = []
+    for tu, tl in zip(index, local):
+        row = [tu.replace(tzinfo=None), tl.replace(tzinfo=None)]
+        if spans:
+            # LDML specific non-location format -- PDT/PST. Paired with the
+            # local column it names an instant; alone, neither does.
+            row.append(tl.strftime("%Z"))
+        rows.append(row)
+    return headers, rows
+
+
+def _write_time_columns(ws, headers, times):
+    """Write the leading time columns, returning the first free column index."""
+    for j, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=j, value=h)
+    for i, row in enumerate(times, start=2):
+        for j, v in enumerate(row, start=1):
+            cell = ws.cell(row=i, column=j, value=v)
+            if isinstance(v, datetime):
+                cell.number_format = DT_FMT
+    return len(headers) + 1
+
+
 def _write_data_sheet(wb, result):
     ws = wb.create_sheet("data")
     cols = list(result.data.columns)
 
-    ws.cell(row=1, column=1, value="time (local)")
-    ws.cell(row=1, column=2, value="time (UTC)")
-    for j, c in enumerate(cols, start=3):
+    headers, times = _time_block(result.data.index)
+    first = _write_time_columns(ws, headers, times)
+    for j, c in enumerate(cols, start=first):
         unit = result.units.get(c, "")
         ws.cell(row=1, column=j, value=f"{c} [{unit}]" if unit else c)
 
-    local = result.data.index.tz_convert(LOCAL_TZ)
-    for i, (tl, tu) in enumerate(zip(local, result.data.index), start=2):
-        ws.cell(row=i, column=1, value=tl.replace(tzinfo=None)).number_format = DT_FMT
-        ws.cell(row=i, column=2, value=tu.replace(tzinfo=None)).number_format = DT_FMT
-        for j, c in enumerate(cols, start=3):
+    for i in range(2, len(times) + 2):
+        for j, c in enumerate(cols, start=first):
             v = result.data.iloc[i - 2][c]
             cell = ws.cell(row=i, column=j,
                            value=None if pd.isna(v) else float(v))
@@ -95,11 +140,11 @@ def _write_data_sheet(wb, result):
 
 def _write_counts_sheet(wb, result, cols):
     ws = wb.create_sheet("counts")
-    ws.cell(row=1, column=1, value="time (local)")
-    for j, c in enumerate(cols, start=2):
+    headers, times = _time_block(result.data.index)
+    first = _write_time_columns(ws, headers, times)
+    for j, c in enumerate(cols, start=first):
         ws.cell(row=1, column=j, value=c)
 
-    local = result.data.index.tz_convert(LOCAL_TZ)
     expected = {}
     for c in cols:
         try:
@@ -108,9 +153,8 @@ def _write_counts_sheet(wb, result, cols):
         except Exception:
             expected[c] = 1
 
-    for i, tl in enumerate(local, start=2):
-        ws.cell(row=i, column=1, value=tl.replace(tzinfo=None)).number_format = DT_FMT
-        for j, c in enumerate(cols, start=2):
+    for i in range(2, len(times) + 2):
+        for j, c in enumerate(cols, start=first):
             n = int(result.counts.iloc[i - 2][c]) if c in result.counts else 0
             cell = ws.cell(row=i, column=j, value=n)
             if n < expected[c] / 2:
@@ -212,14 +256,13 @@ def _write_zscore_sheet(wb, result, cols):
     ws = wb.create_sheet("normalized")
     z = sk.zscore(result.data)
 
-    ws.cell(row=1, column=1, value="time (local)")
-    for j, c in enumerate(cols, start=2):
+    headers, times = _time_block(result.data.index)
+    first = _write_time_columns(ws, headers, times)
+    for j, c in enumerate(cols, start=first):
         ws.cell(row=1, column=j, value=c)
 
-    local = result.data.index.tz_convert(LOCAL_TZ)
-    for i, tl in enumerate(local, start=2):
-        ws.cell(row=i, column=1, value=tl.replace(tzinfo=None)).number_format = DT_FMT
-        for j, c in enumerate(cols, start=2):
+    for i in range(2, len(times) + 2):
+        for j, c in enumerate(cols, start=first):
             v = z.iloc[i - 2][c]
             ws.cell(row=i, column=j,
                     value=None if pd.isna(v) else float(v)).number_format = NUM_FMT
@@ -646,10 +689,12 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws,
     geometry = getattr(result, "geometry", None)
     made = []
 
-    # Sheet column of each series: the data sheet has two time columns before
-    # the data, the z-score sheet only one.
-    raw_ix = {c: 3 + i for i, c in enumerate(cols)}
-    z_ix = {c: 2 + i for i, c in enumerate(cols)}
+    # Sheet column of each series. Every data sheet now carries the same time
+    # block, so one offset serves both -- they used to differ because only
+    # `data` had a UTC column.
+    first = len(_time_block(result.data.index)[0]) + 1
+    raw_ix = {c: first + i for i, c in enumerate(cols)}
+    z_ix = dict(raw_ix)
 
     groups = _unit_groups(result, cols)
     # One colour per series for the whole workbook, so a line keeps its
@@ -1122,13 +1167,58 @@ def _check(root: Path) -> int:
                    f"missing {sorted(want - set(wb.sheetnames))}"
                    if not want <= set(wb.sheetnames) else "")
 
+            spans = bool(sk.transitions_in(res.data.index))
             for sheet in ("data", "counts", "normalized"):
                 ws = wb[sheet]
                 headers = [ws.cell(row=1, column=c).value
-                           for c in range(1, 4)]
-                record(f"{label}: {sheet} row 1 carries its time headers",
-                       any(h and "time" in str(h) for h in headers),
-                       f"headers {headers}")
+                           for c in range(1, ws.max_column + 1)]
+                want = ["time (UTC)", f"time (local, {LOCAL_TZ.key})"]
+                if spans:
+                    want.append("zone")
+                record(f"{label}: {sheet} leads with {want}",
+                       headers[:len(want)] == want, f"headers {headers[:4]}")
+
+                n = len(res.data)
+                utc = [ws.cell(row=r, column=1).value for r in range(2, n + 2)]
+                loc = [ws.cell(row=r, column=2).value for r in range(2, n + 2)]
+                record(f"{label}: {sheet} UTC column names {n} unique instants",
+                       len(set(utc)) == n and all(u is not None for u in utc),
+                       f"{len(set(utc))} unique of {n}")
+
+                if spans:
+                    zone = [ws.cell(row=r, column=3).value
+                            for r in range(2, n + 2)]
+                    pairs = list(zip(loc, zone))
+                    # These demonstrate the DEFECT, not a defect in the gate:
+                    # they prove the window really is one where local time
+                    # fails, so the resolution check below cannot pass on a
+                    # window where nothing was ever ambiguous. The two
+                    # transitions fail in OPPOSITE ways and asserting the same
+                    # thing of both would be vacuous for one of them.
+                    if "fall" in label:
+                        repeats = n - len(set(loc))
+                        record(f"{label}: {sheet} local column REPEATS a wall "
+                               f"time, so alone it cannot name an instant",
+                               repeats > 0, f"{repeats} repeated wall time(s)")
+                    else:
+                        gaps = [(loc[k] - loc[k - 1]).total_seconds() / 60
+                                for k in range(1, n)]
+                        record(f"{label}: {sheet} local column SKIPS an hour, "
+                               f"so a reader measuring against it is off",
+                               max(gaps) > 30,
+                               f"largest wall-clock step {max(gaps):.0f} min "
+                               f"where 30 min elapsed")
+                    record(f"{label}: {sheet} local+zone resolves every row",
+                           len(set(pairs)) == n,
+                           f"{len(set(pairs))} unique of {n}")
+                    record(f"{label}: {sheet} zone designators are real",
+                           set(zone) <= {"PST", "PDT"} and len(set(zone)) == 2,
+                           f"designators {sorted(set(zone))}")
+                else:
+                    record(f"{label}: {sheet} has NO zone column, since "
+                           f"nothing here is ambiguous",
+                           "zone" not in [str(h) for h in headers],
+                           f"headers {headers[:4]}")
             wb.close()
 
     print("\nexporter gate:")
