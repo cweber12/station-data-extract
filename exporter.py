@@ -179,8 +179,14 @@ def _write_stats_sheet(wb, result, cols, lag_table=None, reference=None):
     n = len(result.data)
     last = n + 1  # data sheet last row
 
+    # Where the data actually starts on the `data` sheet. Derived, not the
+    # literal 3 it used to be: that assumed exactly two leading time columns,
+    # so on a window spanning a DST transition -- which adds a `zone` column --
+    # every formula on this sheet silently pointed one column left, at text.
+    first = len(_time_block(result.data.index)[0]) + 1
+
     def dref(c_index):
-        L = get_column_letter(c_index + 3)
+        L = get_column_letter(c_index + first)
         return f"data!${L}$2:${L}${last}"
 
     ws.cell(row=1, column=1, value="Summary").font = TITLE
@@ -368,10 +374,36 @@ def _style_common(ch):
         ch.legend.txPr = _text_props(900)
 
 
-def _style_time_axis(ch, index, title="time (local)", target_ticks=11):
-    """A real numeric axis carrying date serials -- no category collapsing."""
-    lo = _serial(index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
-    hi = _serial(index[-1].tz_convert(LOCAL_TZ).replace(tzinfo=None))
+def _utc_serial(t) -> float:
+    """Excel serial for a UTC instant. The one place the charts get their x."""
+    return _serial(t.replace(tzinfo=None))
+
+
+def _style_time_axis(ch, index, title=f"time (UTC)", target_ticks=11):
+    """A real numeric axis carrying UTC date serials -- no category collapsing.
+
+    WHY UTC AND NOT LOCAL. An Excel cell holds a serial number and a display
+    format; there is nowhere for a zone to live, and a value axis derives its
+    labels from the numeric scale rather than from any text a sheet could
+    supply. So local serials are not a labelling choice here, they are the
+    GEOMETRY -- and local time is not monotonic. Across the November fall-back
+    the serials run 01:00, 01:30, 01:00, 01:30 and the line doubles back on
+    itself for an hour; across the March spring-forward they jump 01:30 to
+    03:00 and half an hour of data is drawn three times as wide as its
+    neighbours. Both read as instrument behaviour, and nothing on the sheet
+    said otherwise.
+
+    UTC is continuous by construction, so the geometry is honest for every
+    window without a special case. Local time is still on the sheet, beside
+    it, which is where a zone can actually be carried -- see `_time_block`.
+
+    This is what every authority cited in docs/adr/0003 does for DATA. That
+    ADR rejects a UTC axis for the interactive view, where an analyst reads
+    diurnal signals off the screen and would be doing arithmetic on every
+    glance; a delivered workbook is the archive half of the same split.
+    """
+    lo = _utc_serial(index[0])
+    hi = _utc_serial(index[-1])
     step = _tick_step(hi - lo, target_ticks)
     ch.x_axis.scaling.min = round(lo, 6)
     ch.x_axis.scaling.max = round(hi, 6)
@@ -682,7 +714,7 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws,
     width = _plot_width(_span_days(result.data.index), cm_per_day)
     units = sorted({result.units.get(c, "") for c in cols if result.units.get(c)})
     mixed = len(units) > 1
-    x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
+    x_lo = _utc_serial(result.data.index[0])
     lo = result.data.index[0].tz_convert(LOCAL_TZ)
     hi = result.data.index[-1].tz_convert(LOCAL_TZ)
     legend_row = CHART_TOP_ROW + CHART_ROWS + 1
@@ -832,7 +864,7 @@ def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
     n = len(result.data)
     # Same window, same scale -- this panel has to line up with chart_raw's.
     width = _plot_width(_span_days(result.data.index), cm_per_day)
-    x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
+    x_lo = _utc_serial(result.data.index[0])
     frame = result.data[derived]
     idx = [3 + cols.index(c) for c in derived]
     # Same colours as everywhere else -- the index appears on chart_raw too.
@@ -1107,6 +1139,23 @@ def default_output_name(cols, interval) -> str:
 # refresh. A workbook is a deliverable; the deliverable is the thing to check.
 # ---------------------------------------------------------------------------
 
+def _axis_title_text(axis) -> str:
+    """The axis title as plain text, dug out of the reopened chart XML.
+
+    openpyxl stores a title as rich text: a list of paragraphs, each a list of
+    runs. Reading it back is fiddly enough that a gate tempted to skip it would
+    assert nothing about what the axis actually SAYS -- which is half of what
+    this issue is about.
+    """
+    title = getattr(axis, "title", None)
+    if title is None:
+        return ""
+    rich = getattr(getattr(title, "tx", None), "rich", None)
+    if rich is None:
+        return ""
+    return "".join(r.t or "" for p in rich.p for r in (p.r or []))
+
+
 def _fixture(start_utc: str, periods: int = 96, freq: str = "30min"):
     """A minimal two-series BuildResult over a chosen window.
 
@@ -1219,6 +1268,66 @@ def _check(root: Path) -> int:
                            f"nothing here is ambiguous",
                            "zone" not in [str(h) for h in headers],
                            f"headers {headers[:4]}")
+
+            # ---- the charts are drawn on real time ------------------------
+            n = len(res.data)
+            utc = list(res.data.index)
+            # Computed here from the epoch rather than through _utc_serial.
+            # Sharing the helper with the code under test makes the comparison
+            # self-consistent: patching the helper moved BOTH sides and the
+            # check stayed green against an axis that had gone back to local
+            # time. A gate that cannot fail is not a gate.
+            def expect(t):
+                return ((t.replace(tzinfo=None) - EXCEL_EPOCH)
+                        .total_seconds() / 86400.0)
+            want_lo, want_hi = expect(utc[0]), expect(utc[-1])
+            for cname in ("chart_raw", "chart_zscore"):
+                cws = wb[cname]
+                plots = [c for c in cws._charts
+                         if c.x_axis.scaling.min is not None
+                         and not c.x_axis.delete]
+                record(f"{label}: {cname} has a visible time axis",
+                       bool(plots), f"{len(cws._charts)} chart(s)")
+                for ch in plots[:1]:
+                    lo, hi = ch.x_axis.scaling.min, ch.x_axis.scaling.max
+                    # The bug this catches: reordering the sheet moved the
+                    # series' x values onto the UTC column while these bounds
+                    # were still computed from local time, leaving the frame
+                    # 7 h away from the data it framed.
+                    record(f"{label}: {cname} axis bounds ARE the data's UTC "
+                           f"span, not some other zone's",
+                           abs(lo - want_lo) < 1e-6 and abs(hi - want_hi) < 1e-6,
+                           f"axis [{lo}, {hi}] vs UTC [{round(want_lo, 6)}, "
+                           f"{round(want_hi, 6)}]")
+                    record(f"{label}: {cname} x axis is titled UTC",
+                           "UTC" in str(_axis_title_text(ch.x_axis)),
+                           f"title {_axis_title_text(ch.x_axis)!r}")
+                    src = ch.series[0].xVal.numRef.f
+                    record(f"{label}: {cname} plots against column A, which "
+                           f"is time (UTC)", "$A$" in src, f"xVal {src}")
+
+            # ---- the plotted x values never go backwards -----------------
+            for sheet in ("data", "normalized"):
+                ws = wb[sheet]
+                xs = [ws.cell(row=r, column=1).value for r in range(2, n + 2)]
+                back = [k for k in range(1, n) if xs[k] <= xs[k - 1]]
+                record(f"{label}: {sheet} column A never goes backwards, so "
+                       f"no line doubles back",
+                       not back, f"{len(back)} reversal(s)")
+                steps = {round((xs[k] - xs[k - 1]).total_seconds() / 60)
+                         for k in range(1, n)}
+                record(f"{label}: {sheet} every step is the same 30 min, so "
+                       f"no hour is drawn wider than it was",
+                       steps == {30}, f"steps seen {sorted(steps)} min")
+
+            # ---- the stats formulas point at data, not at the time block --
+            sws = wb["stats"]
+            formula = str(sws.cell(row=3, column=4).value or "")
+            want_col = get_column_letter(
+                len(_time_block(res.data.index)[0]) + 1)
+            record(f"{label}: stats formulas point at column {want_col}, the "
+                   f"first DATA column",
+                   f"${want_col}$" in formula, f"formula {formula}")
             wb.close()
 
     print("\nexporter gate:")
