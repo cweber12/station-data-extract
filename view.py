@@ -3042,97 +3042,20 @@ def transition_result(res, start, end, interval="30min"):
     return replace(res, data=data, counts=counts, interval=interval)
 
 
-@dataclass(frozen=True)
-class Transition:
-    """A DST change inside the plotted window.
-
-    `edges` are the two instants either side of it, and they are the whole
-    payload: ticked, and labelled with their zone designators, they SHOW the
-    anomaly instead of describing it.
-
-        fall-back    01:00 PDT  and  01:00 PST   -- one wall time, twice
-        spring-fwd   01:00 PST  and  03:00 PDT   -- 02:00 is absent
-
-    An earlier revision carried a caption and an x-label clause here and drew
-    a bracket under the axis. Both are gone. See `_dst_formatter_class` for
-    the standards that say a designator, not prose, is the way to resolve an
-    ambiguous wall time.
-    """
-    instant: object        # first instant on the new offset, UTC
-    delta: object          # new offset minus old; negative at a fall-back
-
-    @property
-    def edges(self) -> tuple:
-        """The two instants a reader has to be able to tell apart."""
-        step = abs(self.delta)
-        return (self.instant - step, self.instant)
-
-    @property
-    def repeats(self) -> bool:
-        """True at a fall-back, where one wall time serves two instants."""
-        return self.delta < dt.timedelta(0)
-
-
-def _transition_instant(before, after):
-    """The instant the offset changes, bisected between two samples.
-
-    Found rather than named. A hard-coded 2026-11-01T09:00Z is a fact about
-    one year that quietly stops being true, and this project's most expensive
-    bug was a timestamp nobody checked.
-    """
-    lo, hi = before.to_pydatetime(), after.to_pydatetime()
-    base = lo.astimezone(LOCAL_TZ).utcoffset()
-    while (hi - lo) > dt.timedelta(minutes=1):
-        mid = lo + (hi - lo) / 2
-        if mid.astimezone(LOCAL_TZ).utcoffset() == base:
-            lo = mid
-        else:
-            hi = mid
-    return hi.replace(second=0, microsecond=0)
-
-
-def transitions_in(index) -> list:
-    """Every DST transition inside `index`.
-
-    THE AXIS IS HONEST AND THE LABELS ARE NOT, which is why this exists. On a
-    tz-aware axis the x values are linear in real time, so the line is right
-    -- but `AutoDateLocator` generates ticks from WALL CLOCK times, and the
-    repeated hour has no wall time to sit at, so it is skipped:
-
-        20758.33333  2026-11-01 01:00 PDT  ->  '01:00'
-        20758.41667  2026-11-01 02:00 PST  ->  '02:00'   <- TWO hours
-        20758.45833  2026-11-01 03:00 PST  ->  '03:00'   <- one hour
-
-    Two adjacent labels an hour apart with two hours between them. Someone
-    measuring a feature against the axis is off by an hour. The spring-forward
-    is the mirror image: '01:00' then '03:00', reading as two hours where only
-    one passed.
-    """
-    out = []
-    for i in range(1, len(index)):
-        before, after = index[i - 1], index[i]
-        off_b = before.tz_convert(LOCAL_TZ).utcoffset()
-        off_a = after.tz_convert(LOCAL_TZ).utcoffset()
-        if off_b == off_a:
-            continue
-        out.append(Transition(instant=_transition_instant(before, after),
-                              delta=off_a - off_b))
-    return out
-
-
-def transition_index(index):
-    """Where the UTC offset changes inside `index`, or None.
-
-    Returns the position of the FIRST sample on the far side of the
-    transition. Found by comparing offsets rather than by naming a date,
-    because a hard-coded instant is a fact about 2026 that stops being true,
-    and this project has already paid once for a timestamp nobody checked.
-    """
-    offsets = [t.tz_convert(LOCAL_TZ).utcoffset() for t in index]
-    for i in range(1, len(offsets)):
-        if offsets[i] != offsets[i - 1]:
-            return i
-    return None
+# ---------------------------------------------------------------------------
+# DST transitions moved to `sensorkit`
+#
+# `exporter` needs the same answer for the workbook's charts (#31) and
+# cannot import this module -- `view` imports matplotlib and tkinter, and
+# importgate asserts the headless export path never acquires either. Two
+# copies of the rule that decides when a wall time is ambiguous is exactly
+# the kind of drift this project's time invariants exist to prevent, so the
+# helpers moved to the module both already import. Re-exported here because
+# they read as part of this module's vocabulary at the call sites below.
+# ---------------------------------------------------------------------------
+Transition = sk.Transition
+transitions_in = sk.transitions_in
+transition_index = sk.transition_index
 
 
 def _default_pair(study, by_key):
