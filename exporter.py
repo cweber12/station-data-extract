@@ -1050,3 +1050,112 @@ def default_output_name(cols, interval) -> str:
     short = "_".join(slug(c) for c in cols[:3])
     more = f"_plus{len(cols) - 3}" if len(cols) > 3 else ""
     return f"compare_{short}{more}_{interval}_{stamp}.xlsx"
+
+
+# ---------------------------------------------------------------------------
+# The gate
+#
+# Everything here reopens the SAVED FILE and asserts against what is in it.
+# Asserting against the objects still in memory would prove only that this
+# module did what it meant to -- and "it succeeded but wrote the previous
+# table" is a failure this repo has already paid for once, in the Power Query
+# refresh. A workbook is a deliverable; the deliverable is the thing to check.
+# ---------------------------------------------------------------------------
+
+def _fixture(start_utc: str, periods: int = 96, freq: str = "30min"):
+    """A minimal two-series BuildResult over a chosen window.
+
+    Deliberately synthetic. A fixture pinned to a real study would move when
+    the study is re-pulled, and the windows this gate needs -- ones that cross
+    a DST transition -- do not exist in any study on disk.
+    """
+    idx = pd.date_range(start_utc, periods=periods, freq=freq, tz="UTC")
+    n = len(idx)
+    data = pd.DataFrame(
+        {"A.sea_water_temperature": np.linspace(14.0, 18.0, n),
+         "B.air_temperature": np.linspace(19.0, 15.0, n)}, index=idx)
+    counts = pd.DataFrame({c: np.full(n, 2) for c in data.columns}, index=idx)
+    return sk.BuildResult(
+        data, counts,
+        units={"A.sea_water_temperature": "degC", "B.air_temperature": "degC"},
+        cadences={"A.sea_water_temperature": "10min",
+                  "B.air_temperature": "10min"},
+        sources={"A.sea_water_temperature": "fixture",
+                 "B.air_temperature": "fixture"},
+        interval="30min", aggregation="mean", overlap="intersection",
+        min_samples=1)
+
+
+def _check(root: Path) -> int:
+    import tempfile
+    from openpyxl import load_workbook
+
+    checks: list[tuple[str, bool, str]] = []
+
+    def record(label, ok, note=""):
+        checks.append((label, bool(ok), note))
+
+    # Windows chosen so each crosses a transition in the MIDDLE, not at an
+    # edge: a transition on the first or last sample would be invisible to a
+    # check that looks at consecutive pairs.
+    cases = [
+        ("summer, spans nothing", "2026-07-01 00:00"),
+        ("fall-back, 1 Nov", "2026-10-31 12:00"),
+        ("spring-forward, 8 Mar", "2026-03-07 12:00"),
+    ]
+
+    with tempfile.TemporaryDirectory() as td:
+        for label, start in cases:
+            res = _fixture(start)
+            try:
+                out = write_workbook(res, root, Path(td) / f"{start[:10]}.xlsx")
+            except Exception as e:
+                record(f"{label}: workbook writes", False, repr(e)[:200])
+                continue
+            record(f"{label}: workbook writes [{out.name}]", out.exists())
+
+            wb = load_workbook(out)
+            want = {"data", "counts", "normalized", "stats", "provenance",
+                    "chart_raw", "chart_zscore"}
+            record(f"{label}: every sheet is in the saved file",
+                   want <= set(wb.sheetnames),
+                   f"missing {sorted(want - set(wb.sheetnames))}"
+                   if not want <= set(wb.sheetnames) else "")
+
+            for sheet in ("data", "counts", "normalized"):
+                ws = wb[sheet]
+                headers = [ws.cell(row=1, column=c).value
+                           for c in range(1, 4)]
+                record(f"{label}: {sheet} row 1 carries its time headers",
+                       any(h and "time" in str(h) for h in headers),
+                       f"headers {headers}")
+            wb.close()
+
+    print("\nexporter gate:")
+    for label, ok, note in checks:
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+        if note:
+            print(f"          [{note}]")
+    passed = sum(1 for _l, ok, _n in checks if ok)
+    print(f"\n{passed}/{len(checks)} checks passed")
+    return 0 if passed == len(checks) else 1
+
+
+def _main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Write the comparison workbook. --check exports fixtures "
+                    "over DST-spanning windows and asserts against the SAVED "
+                    "file.")
+    ap.add_argument("--check", action="store_true",
+                    help="run the gate and exit non-zero on failure")
+    ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
+    args = ap.parse_args(argv)
+    if not args.check:
+        ap.print_help()
+        return 0
+    return _check(args.root)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
