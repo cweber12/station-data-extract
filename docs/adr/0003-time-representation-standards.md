@@ -160,4 +160,7 @@ standard solution.
 
 - `CLAUDE.md`, "Time" — the invariants, which now cite these sources
 - `CONTEXT.md`, "Time" — instant, wall time, offset, zone designator
-- Issue #15 (the view chart), issue #31 (the workbook, still open)
+- [0004](0004-the-workbook-is-charted-on-utc.md) — the same question for the
+  exported workbook, which reaches the opposite answer because Excel has no
+  tz-aware axis and a deliverable is read without this repo
+- Issue #15 (the view chart), issue #31 (the workbook)

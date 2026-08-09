@@ -65,21 +65,66 @@ def _autosize(ws, minw=10, maxw=34):
         ws.column_dimensions[letter].width = min(max(minw, longest + 2), maxw)
 
 
+def _time_block(index):
+    """Headers and per-row values for the leading time columns of a data sheet.
+
+    UTC IS FIRST BECAUSE IT IS THE RECORD. It is what the charts are drawn
+    against, and it is the only column here that names an instant on its own.
+    Local time sits beside it as display, which is NDBC's own split and the
+    decision in docs/adr/0003.
+
+    Every sheet gets both. `counts` and `normalized` used to carry local time
+    alone, so across a fall-back they held two rows with a byte-identical
+    timestamp naming two different hours -- and unlike `data` there was no
+    second column to resolve them. Once such a workbook leaves this repo that
+    hour is gone.
+
+    The `zone` column appears ONLY when the window spans a transition. Outside
+    one, a wall time in a named zone is already unambiguous and a designator on
+    every row is ink spent against a misreading that cannot occur -- the same
+    rule the view's tick labels follow, for the same reason.
+    """
+    spans = bool(sk.transitions_in(index))
+    headers = ["time (UTC)", f"time (local, {LOCAL_TZ.key})"]
+    if spans:
+        headers.append("zone")
+
+    local = index.tz_convert(LOCAL_TZ)
+    rows = []
+    for tu, tl in zip(index, local):
+        row = [tu.replace(tzinfo=None), tl.replace(tzinfo=None)]
+        if spans:
+            # LDML specific non-location format -- PDT/PST. Paired with the
+            # local column it names an instant; alone, neither does.
+            row.append(tl.strftime("%Z"))
+        rows.append(row)
+    return headers, rows
+
+
+def _write_time_columns(ws, headers, times):
+    """Write the leading time columns, returning the first free column index."""
+    for j, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=j, value=h)
+    for i, row in enumerate(times, start=2):
+        for j, v in enumerate(row, start=1):
+            cell = ws.cell(row=i, column=j, value=v)
+            if isinstance(v, datetime):
+                cell.number_format = DT_FMT
+    return len(headers) + 1
+
+
 def _write_data_sheet(wb, result):
     ws = wb.create_sheet("data")
     cols = list(result.data.columns)
 
-    ws.cell(row=1, column=1, value="time (local)")
-    ws.cell(row=1, column=2, value="time (UTC)")
-    for j, c in enumerate(cols, start=3):
+    headers, times = _time_block(result.data.index)
+    first = _write_time_columns(ws, headers, times)
+    for j, c in enumerate(cols, start=first):
         unit = result.units.get(c, "")
         ws.cell(row=1, column=j, value=f"{c} [{unit}]" if unit else c)
 
-    local = result.data.index.tz_convert(LOCAL_TZ)
-    for i, (tl, tu) in enumerate(zip(local, result.data.index), start=2):
-        ws.cell(row=i, column=1, value=tl.replace(tzinfo=None)).number_format = DT_FMT
-        ws.cell(row=i, column=2, value=tu.replace(tzinfo=None)).number_format = DT_FMT
-        for j, c in enumerate(cols, start=3):
+    for i in range(2, len(times) + 2):
+        for j, c in enumerate(cols, start=first):
             v = result.data.iloc[i - 2][c]
             cell = ws.cell(row=i, column=j,
                            value=None if pd.isna(v) else float(v))
@@ -95,11 +140,11 @@ def _write_data_sheet(wb, result):
 
 def _write_counts_sheet(wb, result, cols):
     ws = wb.create_sheet("counts")
-    ws.cell(row=1, column=1, value="time (local)")
-    for j, c in enumerate(cols, start=2):
+    headers, times = _time_block(result.data.index)
+    first = _write_time_columns(ws, headers, times)
+    for j, c in enumerate(cols, start=first):
         ws.cell(row=1, column=j, value=c)
 
-    local = result.data.index.tz_convert(LOCAL_TZ)
     expected = {}
     for c in cols:
         try:
@@ -108,9 +153,8 @@ def _write_counts_sheet(wb, result, cols):
         except Exception:
             expected[c] = 1
 
-    for i, tl in enumerate(local, start=2):
-        ws.cell(row=i, column=1, value=tl.replace(tzinfo=None)).number_format = DT_FMT
-        for j, c in enumerate(cols, start=2):
+    for i in range(2, len(times) + 2):
+        for j, c in enumerate(cols, start=first):
             n = int(result.counts.iloc[i - 2][c]) if c in result.counts else 0
             cell = ws.cell(row=i, column=j, value=n)
             if n < expected[c] / 2:
@@ -135,8 +179,14 @@ def _write_stats_sheet(wb, result, cols, lag_table=None, reference=None):
     n = len(result.data)
     last = n + 1  # data sheet last row
 
+    # Where the data actually starts on the `data` sheet. Derived, not the
+    # literal 3 it used to be: that assumed exactly two leading time columns,
+    # so on a window spanning a DST transition -- which adds a `zone` column --
+    # every formula on this sheet silently pointed one column left, at text.
+    first = len(_time_block(result.data.index)[0]) + 1
+
     def dref(c_index):
-        L = get_column_letter(c_index + 3)
+        L = get_column_letter(c_index + first)
         return f"data!${L}$2:${L}${last}"
 
     ws.cell(row=1, column=1, value="Summary").font = TITLE
@@ -212,14 +262,13 @@ def _write_zscore_sheet(wb, result, cols):
     ws = wb.create_sheet("normalized")
     z = sk.zscore(result.data)
 
-    ws.cell(row=1, column=1, value="time (local)")
-    for j, c in enumerate(cols, start=2):
+    headers, times = _time_block(result.data.index)
+    first = _write_time_columns(ws, headers, times)
+    for j, c in enumerate(cols, start=first):
         ws.cell(row=1, column=j, value=c)
 
-    local = result.data.index.tz_convert(LOCAL_TZ)
-    for i, tl in enumerate(local, start=2):
-        ws.cell(row=i, column=1, value=tl.replace(tzinfo=None)).number_format = DT_FMT
-        for j, c in enumerate(cols, start=2):
+    for i in range(2, len(times) + 2):
+        for j, c in enumerate(cols, start=first):
             v = z.iloc[i - 2][c]
             ws.cell(row=i, column=j,
                     value=None if pd.isna(v) else float(v)).number_format = NUM_FMT
@@ -325,10 +374,36 @@ def _style_common(ch):
         ch.legend.txPr = _text_props(900)
 
 
-def _style_time_axis(ch, index, title="time (local)", target_ticks=11):
-    """A real numeric axis carrying date serials -- no category collapsing."""
-    lo = _serial(index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
-    hi = _serial(index[-1].tz_convert(LOCAL_TZ).replace(tzinfo=None))
+def _utc_serial(t) -> float:
+    """Excel serial for a UTC instant. The one place the charts get their x."""
+    return _serial(t.replace(tzinfo=None))
+
+
+def _style_time_axis(ch, index, title=f"time (UTC)", target_ticks=11):
+    """A real numeric axis carrying UTC date serials -- no category collapsing.
+
+    WHY UTC AND NOT LOCAL. An Excel cell holds a serial number and a display
+    format; there is nowhere for a zone to live, and a value axis derives its
+    labels from the numeric scale rather than from any text a sheet could
+    supply. So local serials are not a labelling choice here, they are the
+    GEOMETRY -- and local time is not monotonic. Across the November fall-back
+    the serials run 01:00, 01:30, 01:00, 01:30 and the line doubles back on
+    itself for an hour; across the March spring-forward they jump 01:30 to
+    03:00 and half an hour of data is drawn three times as wide as its
+    neighbours. Both read as instrument behaviour, and nothing on the sheet
+    said otherwise.
+
+    UTC is continuous by construction, so the geometry is honest for every
+    window without a special case. Local time is still on the sheet, beside
+    it, which is where a zone can actually be carried -- see `_time_block`.
+
+    This is what every authority cited in docs/adr/0003 does for DATA. That
+    ADR rejects a UTC axis for the interactive view, where an analyst reads
+    diurnal signals off the screen and would be doing arithmetic on every
+    glance; a delivered workbook is the archive half of the same split.
+    """
+    lo = _utc_serial(index[0])
+    hi = _utc_serial(index[-1])
     step = _tick_step(hi - lo, target_ticks)
     ch.x_axis.scaling.min = round(lo, 6)
     ch.x_axis.scaling.max = round(hi, 6)
@@ -639,25 +714,34 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws,
     width = _plot_width(_span_days(result.data.index), cm_per_day)
     units = sorted({result.units.get(c, "") for c in cols if result.units.get(c)})
     mixed = len(units) > 1
-    x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
+    x_lo = _utc_serial(result.data.index[0])
     lo = result.data.index[0].tz_convert(LOCAL_TZ)
     hi = result.data.index[-1].tz_convert(LOCAL_TZ)
     legend_row = CHART_TOP_ROW + CHART_ROWS + 1
     geometry = getattr(result, "geometry", None)
     made = []
 
-    # Sheet column of each series: the data sheet has two time columns before
-    # the data, the z-score sheet only one.
-    raw_ix = {c: 3 + i for i, c in enumerate(cols)}
-    z_ix = {c: 2 + i for i, c in enumerate(cols)}
+    # Sheet column of each series. Every data sheet now carries the same time
+    # block, so one offset serves both -- they used to differ because only
+    # `data` had a UTC column.
+    first = len(_time_block(result.data.index)[0]) + 1
+    raw_ix = {c: first + i for i, c in enumerate(cols)}
+    z_ix = dict(raw_ix)
 
     groups = _unit_groups(result, cols)
     # One colour per series for the whole workbook, so a line keeps its
     # identity from the raw panel to the z-score sheet to the legends.
     colors = identity.series_colors(cols)
 
+    # UTC first, because that is what the axis below is drawn on and a
+    # subtitle naming only local time over a UTC axis is the same species of
+    # mislabelling this issue exists to remove. Local follows, with its zone
+    # designator, so the window is still readable in the terms the project is
+    # discussed in.
+    ulo, uhi = result.data.index[0], result.data.index[-1]
     subtitle = (f"{result.interval} {result.aggregation} \u00b7 "
-                f"{lo:%Y-%m-%d %H:%M} to {hi:%Y-%m-%d %H:%M} local \u00b7 "
+                f"{ulo:%Y-%m-%d %H:%M} to {uhi:%Y-%m-%d %H:%M} UTC "
+                f"({lo:%Y-%m-%d %H:%M %Z} to {hi:%Y-%m-%d %H:%M %Z}) \u00b7 "
                 f"{n:,} intervals \u00b7 {len(cols)} series \u00b7 "
                 f"{len(groups)} data type{'s' if len(groups) != 1 else ''}")
 
@@ -787,7 +871,7 @@ def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
     n = len(result.data)
     # Same window, same scale -- this panel has to line up with chart_raw's.
     width = _plot_width(_span_days(result.data.index), cm_per_day)
-    x_lo = _serial(result.data.index[0].tz_convert(LOCAL_TZ).replace(tzinfo=None))
+    x_lo = _utc_serial(result.data.index[0])
     frame = result.data[derived]
     idx = [3 + cols.index(c) for c in derived]
     # Same colours as everywhere else -- the index appears on chart_raw too.
@@ -809,6 +893,35 @@ def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
         "seabed logger and the pier sensors should be expected to track each "
         "other -- not a sensor reading in its own right.")).font = NOTE
     return ["chart_stratification"]
+
+
+def _transition_note(index) -> str:
+    """What a reader would otherwise have to work out for themselves.
+
+    The charts are drawn on UTC, so there is nothing on them to SHOW -- the
+    geometry is continuous and correct, and that is the whole point. The
+    transition is a fact about the local column instead, and prose is the
+    honest home for it. docs/adr/0003 rejected the invented chart devices
+    (a bracket, shading, a vertical rule) for the view; none of them would be
+    any better here, and on an axis that no longer distorts they would be
+    marking a discontinuity that the drawing does not have.
+    """
+    ts = sk.transitions_in(index)
+    if not ts:
+        return "none -- local time runs at one offset for this whole window"
+    out = []
+    for t in ts:
+        before, after = t.edges
+        kind = ("fall back, one wall time occurs twice" if t.repeats
+                else "spring forward, one wall hour does not occur")
+        # `Transition.edges` are plain aware datetimes, not pandas Timestamps,
+        # so this is astimezone rather than tz_convert.
+        out.append(
+            f"{t.instant:%Y-%m-%d %H:%M} UTC -- {kind}: "
+            f"{before.astimezone(LOCAL_TZ):%H:%M %Z} then "
+            f"{after.astimezone(LOCAL_TZ):%H:%M %Z}. "
+            f"The `zone` column on each data sheet resolves it.")
+    return "  |  ".join(out)
 
 
 def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None,
@@ -878,14 +991,30 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None,
         ("chart scale requested (cm/day)", round(cm_per_day, 2)),
         ("chart scale drawn (cm/day)", round(_drawn_cm_per_day(span, cm_per_day), 2)),
         ("chart plot width (cm)", _plot_width(span, cm_per_day)),
+        ("window start (UTC)",
+         result.data.index[0].strftime("%Y-%m-%d %H:%M")
+         if len(result.data) else "-"),
+        ("window end (UTC)",
+         result.data.index[-1].strftime("%Y-%m-%d %H:%M")
+         if len(result.data) else "-"),
+        # Designators unconditional here, unlike the `zone` column on the data
+        # sheets. These are two timestamps, not one per row, and an endpoint a
+        # reader quotes elsewhere should carry its zone without them having to
+        # check whether this particular window needed it.
         ("window start (local)",
-         result.data.index[0].tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+         result.data.index[0].tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
          if len(result.data) else "-"),
         ("window end (local)",
-         result.data.index[-1].tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+         result.data.index[-1].tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
          if len(result.data) else "-"),
         ("lag reference", lag_reference or "-"),
         ("timezone", "America/Los_Angeles via zoneinfo; stored UTC internally"),
+        ("chart time basis",
+         "UTC. Local time is not monotonic across a DST change, so charting "
+         "it would double the line back in November and stretch an hour in "
+         "March. Local time is on every data sheet beside the UTC column. "
+         "See docs/adr/0004."),
+        ("DST transitions in window", _transition_note(result.data.index)),
         ("series dropped",
          "; ".join(result.dropped) if result.dropped else "none"),
     ]
@@ -1050,3 +1179,265 @@ def default_output_name(cols, interval) -> str:
     short = "_".join(slug(c) for c in cols[:3])
     more = f"_plus{len(cols) - 3}" if len(cols) > 3 else ""
     return f"compare_{short}{more}_{interval}_{stamp}.xlsx"
+
+
+# ---------------------------------------------------------------------------
+# The gate
+#
+# Everything here reopens the SAVED FILE and asserts against what is in it.
+# Asserting against the objects still in memory would prove only that this
+# module did what it meant to -- and "it succeeded but wrote the previous
+# table" is a failure this repo has already paid for once, in the Power Query
+# refresh. A workbook is a deliverable; the deliverable is the thing to check.
+# ---------------------------------------------------------------------------
+
+def _axis_title_text(axis) -> str:
+    """The axis title as plain text, dug out of the reopened chart XML.
+
+    openpyxl stores a title as rich text: a list of paragraphs, each a list of
+    runs. Reading it back is fiddly enough that a gate tempted to skip it would
+    assert nothing about what the axis actually SAYS -- which is half of what
+    this issue is about.
+    """
+    title = getattr(axis, "title", None)
+    if title is None:
+        return ""
+    rich = getattr(getattr(title, "tx", None), "rich", None)
+    if rich is None:
+        return ""
+    return "".join(r.t or "" for p in rich.p for r in (p.r or []))
+
+
+def _fixture(start_utc: str, periods: int = 96, freq: str = "30min"):
+    """A minimal two-series BuildResult over a chosen window.
+
+    Deliberately synthetic. A fixture pinned to a real study would move when
+    the study is re-pulled, and the windows this gate needs -- ones that cross
+    a DST transition -- do not exist in any study on disk.
+    """
+    idx = pd.date_range(start_utc, periods=periods, freq=freq, tz="UTC")
+    n = len(idx)
+    data = pd.DataFrame(
+        {"A.sea_water_temperature": np.linspace(14.0, 18.0, n),
+         "B.air_temperature": np.linspace(19.0, 15.0, n)}, index=idx)
+    counts = pd.DataFrame({c: np.full(n, 2) for c in data.columns}, index=idx)
+    return sk.BuildResult(
+        data, counts,
+        units={"A.sea_water_temperature": "degC", "B.air_temperature": "degC"},
+        cadences={"A.sea_water_temperature": "10min",
+                  "B.air_temperature": "10min"},
+        sources={"A.sea_water_temperature": "fixture",
+                 "B.air_temperature": "fixture"},
+        interval="30min", aggregation="mean", overlap="intersection",
+        min_samples=1)
+
+
+def _check(root: Path) -> int:
+    import tempfile
+    from openpyxl import load_workbook
+
+    checks: list[tuple[str, bool, str]] = []
+
+    def record(label, ok, note=""):
+        checks.append((label, bool(ok), note))
+
+    # Windows chosen so each crosses a transition in the MIDDLE, not at an
+    # edge: a transition on the first or last sample would be invisible to a
+    # check that looks at consecutive pairs.
+    cases = [
+        ("summer, spans nothing", "2026-07-01 00:00"),
+        ("fall-back, 1 Nov", "2026-10-31 12:00"),
+        ("spring-forward, 8 Mar", "2026-03-07 12:00"),
+    ]
+
+    with tempfile.TemporaryDirectory() as td:
+        for label, start in cases:
+            res = _fixture(start)
+            try:
+                out = write_workbook(res, root, Path(td) / f"{start[:10]}.xlsx")
+            except Exception as e:
+                record(f"{label}: workbook writes", False, repr(e)[:200])
+                continue
+            record(f"{label}: workbook writes [{out.name}]", out.exists())
+
+            wb = load_workbook(out)
+            want = {"data", "counts", "normalized", "stats", "provenance",
+                    "chart_raw", "chart_zscore"}
+            record(f"{label}: every sheet is in the saved file",
+                   want <= set(wb.sheetnames),
+                   f"missing {sorted(want - set(wb.sheetnames))}"
+                   if not want <= set(wb.sheetnames) else "")
+
+            spans = bool(sk.transitions_in(res.data.index))
+            for sheet in ("data", "counts", "normalized"):
+                ws = wb[sheet]
+                headers = [ws.cell(row=1, column=c).value
+                           for c in range(1, ws.max_column + 1)]
+                want = ["time (UTC)", f"time (local, {LOCAL_TZ.key})"]
+                if spans:
+                    want.append("zone")
+                record(f"{label}: {sheet} leads with {want}",
+                       headers[:len(want)] == want, f"headers {headers[:4]}")
+
+                n = len(res.data)
+                utc = [ws.cell(row=r, column=1).value for r in range(2, n + 2)]
+                loc = [ws.cell(row=r, column=2).value for r in range(2, n + 2)]
+                record(f"{label}: {sheet} UTC column names {n} unique instants",
+                       len(set(utc)) == n and all(u is not None for u in utc),
+                       f"{len(set(utc))} unique of {n}")
+
+                if spans:
+                    zone = [ws.cell(row=r, column=3).value
+                            for r in range(2, n + 2)]
+                    pairs = list(zip(loc, zone))
+                    # These demonstrate the DEFECT, not a defect in the gate:
+                    # they prove the window really is one where local time
+                    # fails, so the resolution check below cannot pass on a
+                    # window where nothing was ever ambiguous. The two
+                    # transitions fail in OPPOSITE ways and asserting the same
+                    # thing of both would be vacuous for one of them.
+                    if "fall" in label:
+                        repeats = n - len(set(loc))
+                        record(f"{label}: {sheet} local column REPEATS a wall "
+                               f"time, so alone it cannot name an instant",
+                               repeats > 0, f"{repeats} repeated wall time(s)")
+                    else:
+                        gaps = [(loc[k] - loc[k - 1]).total_seconds() / 60
+                                for k in range(1, n)]
+                        record(f"{label}: {sheet} local column SKIPS an hour, "
+                               f"so a reader measuring against it is off",
+                               max(gaps) > 30,
+                               f"largest wall-clock step {max(gaps):.0f} min "
+                               f"where 30 min elapsed")
+                    record(f"{label}: {sheet} local+zone resolves every row",
+                           len(set(pairs)) == n,
+                           f"{len(set(pairs))} unique of {n}")
+                    record(f"{label}: {sheet} zone designators are real",
+                           set(zone) <= {"PST", "PDT"} and len(set(zone)) == 2,
+                           f"designators {sorted(set(zone))}")
+                else:
+                    record(f"{label}: {sheet} has NO zone column, since "
+                           f"nothing here is ambiguous",
+                           "zone" not in [str(h) for h in headers],
+                           f"headers {headers[:4]}")
+
+            # ---- the charts are drawn on real time ------------------------
+            n = len(res.data)
+            utc = list(res.data.index)
+            # Computed here from the epoch rather than through _utc_serial.
+            # Sharing the helper with the code under test makes the comparison
+            # self-consistent: patching the helper moved BOTH sides and the
+            # check stayed green against an axis that had gone back to local
+            # time. A gate that cannot fail is not a gate.
+            def expect(t):
+                return ((t.replace(tzinfo=None) - EXCEL_EPOCH)
+                        .total_seconds() / 86400.0)
+            want_lo, want_hi = expect(utc[0]), expect(utc[-1])
+            for cname in ("chart_raw", "chart_zscore"):
+                cws = wb[cname]
+                plots = [c for c in cws._charts
+                         if c.x_axis.scaling.min is not None
+                         and not c.x_axis.delete]
+                record(f"{label}: {cname} has a visible time axis",
+                       bool(plots), f"{len(cws._charts)} chart(s)")
+                for ch in plots[:1]:
+                    lo, hi = ch.x_axis.scaling.min, ch.x_axis.scaling.max
+                    # The bug this catches: reordering the sheet moved the
+                    # series' x values onto the UTC column while these bounds
+                    # were still computed from local time, leaving the frame
+                    # 7 h away from the data it framed.
+                    record(f"{label}: {cname} axis bounds ARE the data's UTC "
+                           f"span, not some other zone's",
+                           abs(lo - want_lo) < 1e-6 and abs(hi - want_hi) < 1e-6,
+                           f"axis [{lo}, {hi}] vs UTC [{round(want_lo, 6)}, "
+                           f"{round(want_hi, 6)}]")
+                    record(f"{label}: {cname} x axis is titled UTC",
+                           "UTC" in str(_axis_title_text(ch.x_axis)),
+                           f"title {_axis_title_text(ch.x_axis)!r}")
+                    src = ch.series[0].xVal.numRef.f
+                    record(f"{label}: {cname} plots against column A, which "
+                           f"is time (UTC)", "$A$" in src, f"xVal {src}")
+
+            # ---- the plotted x values never go backwards -----------------
+            for sheet in ("data", "normalized"):
+                ws = wb[sheet]
+                xs = [ws.cell(row=r, column=1).value for r in range(2, n + 2)]
+                back = [k for k in range(1, n) if xs[k] <= xs[k - 1]]
+                record(f"{label}: {sheet} column A never goes backwards, so "
+                       f"no line doubles back",
+                       not back, f"{len(back)} reversal(s)")
+                steps = {round((xs[k] - xs[k - 1]).total_seconds() / 60)
+                         for k in range(1, n)}
+                record(f"{label}: {sheet} every step is the same 30 min, so "
+                       f"no hour is drawn wider than it was",
+                       steps == {30}, f"steps seen {sorted(steps)} min")
+
+            # ---- the stats formulas point at data, not at the time block --
+            sws = wb["stats"]
+            formula = str(sws.cell(row=3, column=4).value or "")
+            want_col = get_column_letter(
+                len(_time_block(res.data.index)[0]) + 1)
+            record(f"{label}: stats formulas point at column {want_col}, the "
+                   f"first DATA column",
+                   f"${want_col}$" in formula, f"formula {formula}")
+
+            # ---- the workbook SAYS what a reader would have to infer -------
+            pws = wb["provenance"]
+            prov = {str(pws.cell(row=r, column=1).value):
+                    str(pws.cell(row=r, column=2).value)
+                    for r in range(1, pws.max_row + 1)}
+            note = prov.get("DST transitions in window", "")
+            if spans:
+                kind = "fall back" if "fall" in label else "spring forward"
+                record(f"{label}: provenance NAMES the transition and what it "
+                       f"does", kind in note and "UTC" in note, f"note {note[:110]}")
+                record(f"{label}: and points at the column that resolves it",
+                       "zone" in note, f"note {note[-80:]}")
+            else:
+                record(f"{label}: provenance says plainly that nothing is "
+                       f"spanned, rather than staying silent",
+                       "none" in note.lower(), f"note {note[:80]}")
+
+            record(f"{label}: provenance records the chart's time basis",
+                   "UTC" in prov.get("chart time basis", ""),
+                   f"{prov.get('chart time basis', '')[:60]}")
+            record(f"{label}: provenance endpoints carry a zone designator",
+                   any(d in prov.get("window start (local)", "")
+                       for d in ("PST", "PDT")),
+                   f"start (local) = {prov.get('window start (local)')}")
+
+            sub = str(wb["chart_raw"]["B2"].value or "")
+            record(f"{label}: the chart subtitle names UTC and local, not "
+                   f"local alone",
+                   "UTC" in sub and any(d in sub for d in ("PST", "PDT")),
+                   f"subtitle {sub[:110]}")
+            wb.close()
+
+    print("\nexporter gate:")
+    for label, ok, note in checks:
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+        if note:
+            print(f"          [{note}]")
+    passed = sum(1 for _l, ok, _n in checks if ok)
+    print(f"\n{passed}/{len(checks)} checks passed")
+    return 0 if passed == len(checks) else 1
+
+
+def _main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Write the comparison workbook. --check exports fixtures "
+                    "over DST-spanning windows and asserts against the SAVED "
+                    "file.")
+    ap.add_argument("--check", action="store_true",
+                    help="run the gate and exit non-zero on failure")
+    ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
+    args = ap.parse_args(argv)
+    if not args.check:
+        ap.print_help()
+        return 0
+    return _check(args.root)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
