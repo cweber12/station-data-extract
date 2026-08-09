@@ -266,9 +266,148 @@ def check_workbook(path, sheet, time_col: str, longitude_deg: float,
     return verdicts
 
 
+# ---------------------------------------------------------------------------
+# The repo gate
+#
+# CLAUDE.md names "clock check on sources/" as one of the checks to run before
+# committing anything that touches ingest or time handling. This is that check,
+# in the same shape as every other module gate here: `--check`, a table of
+# PASS/FAIL, exit non-zero on any failure.
+# ---------------------------------------------------------------------------
+
+REQUIRED_SENTENCE = "Do not ingest it as UTC. Establish the real zone first."
+
+# The corrupted fixture is GENERATED, not committed. AGENT_TASK.md 6.4 asks for
+# a time column shifted by +7 h; shifting the real 3 MB workbook in memory makes
+# "the corrupted fixture still fails" a command anyone can run, and avoids a
+# second near-identical binary in the repo that could drift from the first.
+FIXTURE_SHIFT_H = 7.0
+
+# A shift of a whole day moves every timestamp while leaving hour-of-day -- and
+# therefore the diurnal fit -- untouched. It must still PASS. Without it, a
+# generator that mangled the column outright would produce a FAIL at +7 h and
+# the gate would read that as success.
+CONTROL_SHIFT_H = 24.0
+
+
+def _anchor(root: Path) -> tuple[str, float]:
+    """The clock anchor station and its longitude, from config/stations.yaml.
+
+    Not a literal in this file. Geometry comes from the config -- and a gate
+    that hard-coded the longitude would keep passing after someone corrected
+    the station's position, while measuring against the old one.
+    """
+    from .config import load_config
+    cfg = load_config(root)
+    st = cfg.clock_anchor
+    if st is None or st.lon is None:
+        raise RuntimeError("no clock_anchor station with a longitude in "
+                           "config/stations.yaml")
+    return st.id, float(st.lon)
+
+
+def _check(root: Path) -> int:
+    checks: list[tuple[str, bool, str]] = []
+
+    def record(label, ok, note=""):
+        checks.append((label, bool(ok), note))
+
+    try:
+        anchor, lon = _anchor(root)
+        record(f"clock anchor is {anchor} at lon {lon:+.3f} (config/stations.yaml)",
+               True)
+    except Exception as e:
+        record(f"read the clock anchor from config/stations.yaml", False, str(e))
+        anchor, lon = "LJAC1", -117.257
+
+    wb = root / "sources" / "ja_jolla_sensors.xlsx"
+    quiet = lambda *_a, **_k: None
+
+    if not wb.exists():
+        record(f"{wb.relative_to(root)} is present to check", False,
+               "missing -- reported rather than skipped in silence")
+        clean = {}
+    else:
+        # --- the real sources verify as UTC -------------------------------
+        got = check_workbook(wb, f"src_{anchor}", "time_utc", lon, log=quiet)
+        clean = {v.signal: v for v in got}
+        record(f"sources/ja_jolla_sensors.xlsx [src_{anchor}] offers both "
+               f"clock-checkable signals", len(got) == 2,
+               f"found {sorted(clean)}" if len(got) != 2 else "")
+        for sig in EXPECTED:
+            v = clean.get(sig)
+            record(f"{sig:<34} verifies as UTC", bool(v and v.ok),
+                   str(v) if v else "signal not found")
+
+        # --- the +7 h fixture still fails ---------------------------------
+        got7 = check_workbook(wb, f"src_{anchor}", "time_utc", lon,
+                              signals=["air_temperature"],
+                              shift_hours=FIXTURE_SHIFT_H, log=quiet)
+        v7 = got7[0] if got7 else None
+        record(f"the +{FIXTURE_SHIFT_H:g} h corrupted fixture FAILS air_temperature",
+               bool(v7 and not v7.ok and not v7.inconclusive),
+               str(v7) if v7 else "fixture produced no verdict")
+
+        # A fixture that failed for being inconclusive would satisfy "not ok"
+        # while proving nothing. The offset has to be the one that was injected.
+        if v7 and clean.get("air_temperature"):
+            period = 24 / HARMONIC["air_temperature"]
+            base = clean["air_temperature"].offset_hours
+            want = (base + FIXTURE_SHIFT_H + period / 2) % period - period / 2
+            err = abs(v7.offset_hours - want)
+            record(f"and MEASURES the injected shift: {v7.offset_hours:+.2f} h "
+                   f"vs {want:+.2f} h expected from {base:+.2f} h + "
+                   f"{FIXTURE_SHIFT_H:g} h", err < 0.5, f"differs by {err:.2f} h")
+
+        # --- the required sentence, from assert_utc -----------------------
+        df = pd.read_excel(wb, sheet_name=f"src_{anchor}")
+        t, _ = read_time_column(df, "time_utc")
+        col = find_signal_column(df.columns, "air_temperature")
+        try:
+            assert_utc(t + pd.Timedelta(hours=FIXTURE_SHIFT_H), df[col],
+                       "air_temperature", lon)
+            raised = "<did not raise>"
+        except AssertionError as e:
+            raised = str(e)
+        record("assert_utc raises AssertionError carrying "
+               f"{REQUIRED_SENTENCE!r}",
+               REQUIRED_SENTENCE in raised,
+               raised.replace("\n", " ")[:160] if REQUIRED_SENTENCE not in raised
+               else "")
+
+        # --- control: the generator is not simply breaking the data -------
+        gotc = check_workbook(wb, f"src_{anchor}", "time_utc", lon,
+                              signals=["air_temperature"],
+                              shift_hours=CONTROL_SHIFT_H, log=quiet)
+        vc = gotc[0] if gotc else None
+        record(f"control: a +{CONTROL_SHIFT_H:g} h shift is invisible to a "
+               f"diurnal fit and still PASSES", bool(vc and vc.ok),
+               str(vc) if not (vc and vc.ok) else "")
+
+    # --- the second workbook, classified rather than skipped --------------
+    yb = root / "sources" / "yellow_buoy_temps.xlsx"
+    if not yb.exists():
+        record(f"{yb.name} is present to classify", False, "missing")
+    else:
+        gy = check_workbook(yb, "Data", "Date-Time (PDT)", lon, log=quiet)
+        record("sources/yellow_buoy_temps.xlsx carries NO signal with a known "
+               "solar phase, so it gets no verdict", not gy,
+               "it is a seabed Tidbit water temperature declared PDT; this "
+               "method needs air temperature or pressure"
+               if not gy else f"unexpectedly checkable: {[v.signal for v in gy]}")
+
+    print("\nclock check gate:")
+    for label, ok, note in checks:
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+        if note:
+            print(f"          [{note}]")
+    passed = sum(1 for _l, ok, _n in checks if ok)
+    print(f"\n{passed}/{len(checks)} checks passed")
+    return 0 if passed == len(checks) else 1
+
+
 def _main(argv=None):
     import argparse
-    import sys
 
     ap = argparse.ArgumentParser(
         prog="python -m ingest.clockcheck",
@@ -293,8 +432,20 @@ def _main(argv=None):
                          "with a single --signal")
     ap.add_argument("--tolerance-h", type=float, default=1.5)
     ap.add_argument("--min-days", type=int, default=10)
+    ap.add_argument("--corrupt-hours", type=float, default=0.0,
+                    help="shift the time column by N hours before checking, to "
+                         "reproduce the corrupted fixture by hand. "
+                         f"--corrupt-hours {FIXTURE_SHIFT_H:g} must FAIL")
+    ap.add_argument("--check", action="store_true",
+                    help="run the repo gate over sources/ and exit non-zero on "
+                         "any failure")
+    ap.add_argument("--root", type=Path,
+                    default=Path(__file__).resolve().parent.parent,
+                    help="repo root, for --check")
     args = ap.parse_args(argv)
 
+    if args.check:
+        return _check(args.root)
     if not args.workbook:
         ap.print_help()
         return 0
@@ -308,7 +459,8 @@ def _main(argv=None):
     print(f"\nclock check: {args.workbook}  [sheet {args.sheet!r}]")
     verdicts = check_workbook(args.workbook, args.sheet, args.time_col, args.lon,
                               signals=args.signal, value_col=args.value_col,
-                              tolerance_h=args.tolerance_h, min_days=args.min_days)
+                              tolerance_h=args.tolerance_h, min_days=args.min_days,
+                              shift_hours=args.corrupt_hours)
     if not verdicts:
         # The specific cause -- missing time column, unparseable times, no
         # recognised signal -- has already been logged above. Naming one of
