@@ -733,8 +733,15 @@ def _write_chart_sheets(wb, result, cols, data_ws, norm_ws,
     # identity from the raw panel to the z-score sheet to the legends.
     colors = identity.series_colors(cols)
 
+    # UTC first, because that is what the axis below is drawn on and a
+    # subtitle naming only local time over a UTC axis is the same species of
+    # mislabelling this issue exists to remove. Local follows, with its zone
+    # designator, so the window is still readable in the terms the project is
+    # discussed in.
+    ulo, uhi = result.data.index[0], result.data.index[-1]
     subtitle = (f"{result.interval} {result.aggregation} \u00b7 "
-                f"{lo:%Y-%m-%d %H:%M} to {hi:%Y-%m-%d %H:%M} local \u00b7 "
+                f"{ulo:%Y-%m-%d %H:%M} to {uhi:%Y-%m-%d %H:%M} UTC "
+                f"({lo:%Y-%m-%d %H:%M %Z} to {hi:%Y-%m-%d %H:%M %Z}) \u00b7 "
                 f"{n:,} intervals \u00b7 {len(cols)} series \u00b7 "
                 f"{len(groups)} data type{'s' if len(groups) != 1 else ''}")
 
@@ -888,6 +895,35 @@ def _write_stratification_sheet(wb, result, cols, data_ws, subtitle,
     return ["chart_stratification"]
 
 
+def _transition_note(index) -> str:
+    """What a reader would otherwise have to work out for themselves.
+
+    The charts are drawn on UTC, so there is nothing on them to SHOW -- the
+    geometry is continuous and correct, and that is the whole point. The
+    transition is a fact about the local column instead, and prose is the
+    honest home for it. docs/adr/0003 rejected the invented chart devices
+    (a bracket, shading, a vertical rule) for the view; none of them would be
+    any better here, and on an axis that no longer distorts they would be
+    marking a discontinuity that the drawing does not have.
+    """
+    ts = sk.transitions_in(index)
+    if not ts:
+        return "none -- local time runs at one offset for this whole window"
+    out = []
+    for t in ts:
+        before, after = t.edges
+        kind = ("fall back, one wall time occurs twice" if t.repeats
+                else "spring forward, one wall hour does not occur")
+        # `Transition.edges` are plain aware datetimes, not pandas Timestamps,
+        # so this is astimezone rather than tz_convert.
+        out.append(
+            f"{t.instant:%Y-%m-%d %H:%M} UTC -- {kind}: "
+            f"{before.astimezone(LOCAL_TZ):%H:%M %Z} then "
+            f"{after.astimezone(LOCAL_TZ):%H:%M %Z}. "
+            f"The `zone` column on each data sheet resolves it.")
+    return "  |  ".join(out)
+
+
 def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None,
                             cm_per_day: float = CM_PER_DAY):
     ws = wb.create_sheet("provenance")
@@ -955,14 +991,30 @@ def _write_provenance_sheet(wb, result, root, lag_reference=None, study=None,
         ("chart scale requested (cm/day)", round(cm_per_day, 2)),
         ("chart scale drawn (cm/day)", round(_drawn_cm_per_day(span, cm_per_day), 2)),
         ("chart plot width (cm)", _plot_width(span, cm_per_day)),
+        ("window start (UTC)",
+         result.data.index[0].strftime("%Y-%m-%d %H:%M")
+         if len(result.data) else "-"),
+        ("window end (UTC)",
+         result.data.index[-1].strftime("%Y-%m-%d %H:%M")
+         if len(result.data) else "-"),
+        # Designators unconditional here, unlike the `zone` column on the data
+        # sheets. These are two timestamps, not one per row, and an endpoint a
+        # reader quotes elsewhere should carry its zone without them having to
+        # check whether this particular window needed it.
         ("window start (local)",
-         result.data.index[0].tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+         result.data.index[0].tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
          if len(result.data) else "-"),
         ("window end (local)",
-         result.data.index[-1].tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
+         result.data.index[-1].tz_convert(LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
          if len(result.data) else "-"),
         ("lag reference", lag_reference or "-"),
         ("timezone", "America/Los_Angeles via zoneinfo; stored UTC internally"),
+        ("chart time basis",
+         "UTC. Local time is not monotonic across a DST change, so charting "
+         "it would double the line back in November and stretch an hour in "
+         "March. Local time is on every data sheet beside the UTC column. "
+         "See docs/adr/0004."),
+        ("DST transitions in window", _transition_note(result.data.index)),
         ("series dropped",
          "; ".join(result.dropped) if result.dropped else "none"),
     ]
@@ -1328,6 +1380,37 @@ def _check(root: Path) -> int:
             record(f"{label}: stats formulas point at column {want_col}, the "
                    f"first DATA column",
                    f"${want_col}$" in formula, f"formula {formula}")
+
+            # ---- the workbook SAYS what a reader would have to infer -------
+            pws = wb["provenance"]
+            prov = {str(pws.cell(row=r, column=1).value):
+                    str(pws.cell(row=r, column=2).value)
+                    for r in range(1, pws.max_row + 1)}
+            note = prov.get("DST transitions in window", "")
+            if spans:
+                kind = "fall back" if "fall" in label else "spring forward"
+                record(f"{label}: provenance NAMES the transition and what it "
+                       f"does", kind in note and "UTC" in note, f"note {note[:110]}")
+                record(f"{label}: and points at the column that resolves it",
+                       "zone" in note, f"note {note[-80:]}")
+            else:
+                record(f"{label}: provenance says plainly that nothing is "
+                       f"spanned, rather than staying silent",
+                       "none" in note.lower(), f"note {note[:80]}")
+
+            record(f"{label}: provenance records the chart's time basis",
+                   "UTC" in prov.get("chart time basis", ""),
+                   f"{prov.get('chart time basis', '')[:60]}")
+            record(f"{label}: provenance endpoints carry a zone designator",
+                   any(d in prov.get("window start (local)", "")
+                       for d in ("PST", "PDT")),
+                   f"start (local) = {prov.get('window start (local)')}")
+
+            sub = str(wb["chart_raw"]["B2"].value or "")
+            record(f"{label}: the chart subtitle names UTC and local, not "
+                   f"local alone",
+                   "UTC" in sub and any(d in sub for d in ("PST", "PDT")),
+                   f"subtitle {sub[:110]}")
             wb.close()
 
     print("\nexporter gate:")
