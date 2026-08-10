@@ -717,13 +717,233 @@ def create_study(repo_root: Path, label: str, *,
 
 
 # --------------------------------------------------------------------------
+# Gate. `python study.py --check` drives `validate()` with a frame built in
+# code -- no study directory, no network, no filesystem.
+#
+# WHY A SYNTHETIC FRAME AND NOT A FIXTURE STUDY
+#     `validate(df, cfg)` is already pure. It takes a DataFrame and a config
+#     and returns a dict, so the seam this gate needs is the one that exists,
+#     at the height CLAUDE.md asks for. Building a whole study directory on
+#     disk to feed a function that wants a DataFrame would also put a pretend
+#     Study inside this repo, blurring a boundary the repo is otherwise
+#     careful about.
+#
+# THE TAUTOLOGY RISK, AND ITS CONTROL
+#     Data built from the same spec the validator consults could mark its own
+#     homework. It does not: the spec supplies only WHICH station and WHICH
+#     variable, never the answer. The physics is independent -- the generator
+#     writes a solar-phased signal at a real longitude (deriving solar noon
+#     for itself; see `ingest/synthetic.py`) and the validator independently
+#     fits a harmonic to recover it.
+#
+#     The `+7 h` case IS the control. If this gate has gone tautological, the
+#     corrupted frame passes too, and that is how it gets caught.
+#
+# NOTHING BELOW NAMES A STATION OR A VARIABLE
+#     They are read from `cfg.comparisons`, so when the config changes the
+#     gate follows it instead of breaking against it.
+# --------------------------------------------------------------------------
+
+SYNTHETIC_START = "2026-06-01T00:00Z"
+
+# The corruption. Seven hours is not arbitrary: it is the exact error this
+# project shipped -- Pacific local time (UTC-7 in summer) carried in a column
+# labelled UTC -- and every downstream conclusion built on it was wrong.
+FIXTURE_SHIFT_H = 7.0
+
+
+def synthetic_frame(cfg: StationConfig, *, days: int = 14,
+                    shift_h: float = 0.0, omit: tuple = ()) -> pd.DataFrame:
+    """A canonical-columns frame the validators can be driven with.
+
+    `shift_h` moves every stamp, which is what a whole-frame clock error looks
+    like: the measurements are real and simultaneous, and the column lies
+    about which instant they happened at.
+
+    `omit` drops named stations, so the gate can prove a clean pass is not
+    vacuous.
+    """
+    from ingest.clockcheck import EXPECTED, HARMONIC
+    from ingest.synthetic import solar_series
+
+    fetched = "2026-06-15T00:00:00+00:00"
+    parts, seen = [], set()
+
+    def add(station, variable, times, values):
+        if not station or not variable or (station, variable) in seen:
+            return
+        if station in omit:
+            return
+        seen.add((station, variable))
+        parts.append(pd.DataFrame({
+            "time_utc": times, "station": station, "variable": variable,
+            "value": values,
+            # Cosmetic. Nothing in `validate()` reads the unit; saying
+            # "synthetic" is more honest than claiming degC for a number that
+            # is a phase to fit, not a temperature.
+            "unit": "synthetic", "qc_flag": 1,
+            "depth_m": float("nan"), "reference_frame": "unknown",
+            "source": "synthetic", "fetched_utc": fetched,
+        }))
+
+    clock = cfg.comparisons.get("clock_check") or {}
+    key = clock.get("station")
+    st = cfg.station(key) if key and key in cfg.stations else None
+    if st is not None and st.lon is not None:
+        for sig in clock.get("signals") or []:
+            var = sig.get("variable")
+            if var not in EXPECTED:            # a signal clockcheck cannot phase
+                continue
+            times, values = solar_series(
+                start=SYNTHETIC_START, days=days, longitude_deg=float(st.lon),
+                peak_hours_after_solar_noon=EXPECTED[var],
+                harmonic=HARMONIC[var], amplitude=3.0, mean=0.0,
+                shift_h=shift_h)
+            add(key, var, times, values)
+
+    # The cross-station pair. Both series are generated from ONE phase, so the
+    # true lag between them is exactly zero and any lag the validator reports
+    # is its own. Their longitudes are irrelevant here -- the check measures
+    # the pair against each other, not against the sun.
+    cross = cfg.comparisons.get("cross_station_sanity") or {}
+    a, b = cross.get("a") or {}, cross.get("b") or {}
+    ref_lon = st.lon if st is not None and st.lon is not None else -117.0
+    for spec, seed in ((a, 1), (b, 2)):
+        times, values = solar_series(
+            start=SYNTHETIC_START, days=days, longitude_deg=float(ref_lon),
+            peak_hours_after_solar_noon=2.0, harmonic=1, amplitude=2.0,
+            mean=17.0 if seed == 1 else 17.4, shift_h=shift_h,
+            noise=0.05, seed=seed)
+        add(spec.get("station"), spec.get("variable"), times, values)
+
+    if not parts:
+        from ingest.config import empty_frame
+        return empty_frame()
+
+    df = pd.concat(parts, ignore_index=True)
+    df = cfg.attach_geometry(df)
+    return (df[CANONICAL_COLUMNS]
+            .sort_values(["station", "variable", "time_utc"])
+            .reset_index(drop=True))
+
+
+def _check(root: Path) -> int:
+    cfg = load_config(root)
+    checks = []
+
+    def ok(what, cond, detail=""):
+        checks.append((what, bool(cond), detail))
+
+    clock_spec = cfg.comparisons.get("clock_check") or {}
+    cross_spec = cfg.comparisons.get("cross_station_sanity") or {}
+    signals = [s for s in (clock_spec.get("signals") or [])]
+    tol = float(clock_spec.get("tolerance_h", 1.5))
+
+    # ---- a correctly-phased frame ----------------------------------------
+    clean = synthetic_frame(cfg)
+    got = validate(clean, cfg)
+
+    ok("the synthetic frame conforms to the canonical schema",
+       got["schema"]["ok"], str(got["schema"]))
+    ok("and its time_utc is tz-aware, which is the whole point of the column",
+       got["schema"]["time_utc_is_tz_aware"])
+
+    wanted = {(clock_spec.get("station"), s.get("variable")) for s in signals}
+    wanted |= {(cross_spec.get(k, {}).get("station"),
+                cross_spec.get(k, {}).get("variable")) for k in ("a", "b")}
+    built = set(map(tuple, clean[["station", "variable"]].drop_duplicates()
+                    .itertuples(index=False, name=None)))
+    ok("the frame exercises exactly what stations.yaml names, so this gate "
+       "follows the config instead of hardcoding a station",
+       built == wanted, f"built {sorted(built)} wanted {sorted(wanted)}")
+
+    cc = got["clock_checks"]
+    ok(f"one clock check per configured signal [{len(signals)}]",
+       len(cc) == len(signals), f"{len(cc)} check(s)")
+    ok("every clock check passes on a correctly-phased frame",
+       cc and all(c.get("ok") for c in cc),
+       "; ".join(c.get("detail", "") for c in cc if not c.get("ok")))
+    worst = max((abs(c.get("offset_hours", 99.0)) for c in cc), default=99.0)
+    ok("and the MEASURED offset is near zero, not merely inside tolerance -- "
+       "a verifier that ignored the data could pass the line above",
+       worst < 0.5, f"largest |offset| {worst:.3f} h")
+
+    cross = got["cross_station_sanity"]
+    ok("the cross-station pair reports zero lag, as it was built to",
+       cross.get("ok") and abs(cross.get("best_lag_h", 99)) < 0.5, str(cross))
+    ok(f"so the study validates: {STATUS_OK}", got["status"] == STATUS_OK,
+       got["status"])
+
+    n_series = len(clean[["station", "variable"]].drop_duplicates())
+    ok("coverage is reported for every series", len(got["coverage"]) == n_series,
+       f"{len(got['coverage'])} of {n_series}")
+
+    # ---- the same frame, +7 h: MUST FAIL ---------------------------------
+    bad = validate(synthetic_frame(cfg, shift_h=FIXTURE_SHIFT_H), cfg)
+
+    ok(f"the SAME frame shifted +{FIXTURE_SHIFT_H:g} h fails validation -- if "
+       f"this ever passes, the gate above has gone tautological",
+       bad["status"] == STATUS_FAILED, bad["status"])
+
+    bad_cc = bad["clock_checks"]
+    primary = [c for c in bad_cc if c.get("role") == "primary"]
+    ok("and the primary signal MEASURES the shift rather than merely "
+       "objecting", primary and
+       abs(primary[0].get("offset_hours", 0.0) - FIXTURE_SHIFT_H) < 0.5,
+       f"offset {primary[0].get('offset_hours') if primary else None}")
+    ok("and it is a conclusive failure, not 'could not tell' -- only a "
+       "measured offset should ever fail a study",
+       bad_cc and any(not c.get("ok") and not c.get("inconclusive")
+                      for c in bad_cc),
+       str([(c.get("signal"), c.get("reason")) for c in bad_cc]))
+    ok("the corrupted frame still conforms to the schema, so the failure is "
+       "the clock and nothing else", bad["schema"]["ok"])
+    ok("and its cross-station lag is still zero: a whole-frame shift moves "
+       "both series together, which is exactly why the pair cannot catch it",
+       bad["cross_station_sanity"].get("ok"),
+       str(bad["cross_station_sanity"]))
+
+    # ---- controls --------------------------------------------------------
+    inside = validate(synthetic_frame(cfg, shift_h=tol / 2), cfg)
+    ok(f"a shift of {tol / 2:g} h, inside the {tol:g} h tolerance, still "
+       f"passes -- the tolerance is a threshold, not a trip-wire",
+       inside["status"] == STATUS_OK, inside["status"])
+
+    absent = validate(synthetic_frame(cfg, omit=(clock_spec.get("station"),)),
+                      cfg)
+    ok("removing the anchor station's rows FAILS the study, so the clean pass "
+       "above is not vacuous",
+       absent["status"] == STATUS_FAILED, absent["status"])
+
+    short = validate(synthetic_frame(cfg, days=3), cfg)
+    ok("a window too short to fit is INCONCLUSIVE and does not fail the "
+       "study: 'could not tell' is not 'the clock is wrong'",
+       short["status"] == STATUS_OK
+       and all(c.get("inconclusive") for c in short["clock_checks"]),
+       f"{short['status']}: "
+       f"{[c.get('reason') for c in short['clock_checks']]}")
+
+    print("\nstudy validation gate:")
+    for what, good, detail in checks:
+        print(f"  {'PASS' if good else 'FAIL'}  {what}")
+        if detail and not good:
+            print(f"          [{detail}]")
+    passed = sum(1 for _w, g, _d in checks if g)
+    print(f"\n{passed}/{len(checks)} checks passed")
+    return 0 if passed == len(checks) else 1
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
 def _main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description="Create and list study snapshots.")
-    ap.add_argument("command", choices=["create", "list", "show"])
+    ap.add_argument("command", nargs="?", choices=["create", "list", "show"])
+    ap.add_argument("--check", action="store_true",
+                    help="drive validate() with a synthetic frame and exit "
+                         "non-zero on failure. No study, no network.")
     ap.add_argument("--label", default="session")
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     ap.add_argument("--studies-root", type=Path, default=None)
@@ -732,6 +952,12 @@ def _main(argv=None):
                          "Use PATH::station to name the station it belongs to.")
     ap.add_argument("--days", type=int, default=None)
     args = ap.parse_args(argv)
+
+    if args.check:
+        return _check(args.root)
+    if args.command is None:
+        ap.print_help()
+        return 0
 
     proot = args.studies_root or default_studies_root(args.root)
 

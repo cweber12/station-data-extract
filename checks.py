@@ -86,6 +86,12 @@ GATES = [
          "fixture, which must stay red",
          ("-m", "ingest.clockcheck", "--check")),                       # 9
 
+    Gate("study validation",
+         "a solar-phased frame validates and the same frame shifted +7 h does "
+         "not; driven straight through `validate(df, cfg)`, so it needs no "
+         "study, no network and no filesystem",
+         ("study.py", "--check")),                                      # 17
+
     Gate("archive union",
          "merging study snapshots unions overlapping rows instead of summing "
          "them, and a second rebuild changes nothing",
@@ -122,7 +128,9 @@ GATES = [
 # The floor. Every commit must leave the runner green AND must not reduce
 # coverage: a slice that lowers the count is reporting a mistake, not tidying.
 # Raise this deliberately when a slice adds checks; never lower it to go green.
-FLOOR = 206
+#   206  the baseline the five original gates report
+#   +17  the study-validation gate
+FLOOR = 223
 
 
 # ---------------------------------------------------------------------------
