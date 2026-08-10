@@ -279,7 +279,25 @@ Assert the property that matters:
 - a study validates, not merely wrote files;
 - a parser produced the right value, not merely no exception.
 
-Before committing anything that touches ingest, the time handling or the study
-layout, run the gate checks: clock check on `sources/`, study validation, the
-`+7 h` corrupted fixture still failing, archive union-not-sum, and
-`sensorkit`/`exporter` importing with `tkinter` blocked.
+Before committing **any** slice, run the gate set:
+
+```powershell
+.venv\Scripts\python.exe checks.py --check
+```
+
+It runs every gate, prints one row each with the failing gate's own output,
+and exits non-zero if a gate fails, if a gate declared MUST FAIL passes, or if
+total coverage drops below the floor. Paste its output into the PR body — that
+is the evidence step 8 asks for.
+
+The set itself lives in `checks.py` as a table, not here. This paragraph used
+to *be* the set, and it had drifted in both directions: it named a `+7 h`
+fixture gate that is one case inside `ingest.clockcheck --check`, and a study
+validation that was not runnable, while omitting `exporter.py --check` and
+`annotations.py --check` — 84% of all the coverage in the repo. Prose cannot be
+run, so nothing noticed. Add a gate by adding a row; `checks.py --list` says
+what each one defends.
+
+`view.py --check` is in the table but is skipped by default: it opens a real Tk
+window and reads the latest study from `../studies/`, so it needs a display and
+machine state no clone has. Run it with `--all` on a machine that has both.
